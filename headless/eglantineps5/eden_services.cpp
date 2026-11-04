@@ -1098,10 +1098,13 @@ std::vector<pe::ui::Game> EdenServices::games() {
                 game.name = title;
                 SaveTitle(file, game.name);
             }
-            if ((metadata & EDEN_METADATA_COVER) && std::rename(staged.c_str(), cover.c_str()) == 0)
+            if ((metadata & EDEN_METADATA_COVER) && std::rename(staged.c_str(), cover.c_str()) == 0) {
                 game.cover = cover;
-            else
+            } else {
                 (void)std::remove(staged.c_str());
+                // A folder game has no control data to read: a cover put in covers/ by hand is used.
+                if (IsFolderGame(file) && Eden::FileExists(cover)) game.cover = cover;
+            }
             game.title_id = eden_game_title_id(path.c_str());
             // The game's own language (Library > Game settings > Language) or Settings > Language.
             const GameLanguage language = LanguageFor(path, game.title_id, Eden::PreferencesFor(game.title_id).language);
