@@ -80,6 +80,9 @@ if [[ -f $radv_release/lib/libvulkan_radeon.ps5.a ]]; then
         rm -f build/radv-isolated/libvulkan_radeon.ps5.a
     elif ! python3 -B tools/patch-radv-wsi.py --check "$radv_release/EDEN_WSI_SHA256"; then
         step "RADV: the display code's adaptation changed"
+        # A driver restored from the CI cache comes without its Mesa source tree (.deps/work), which the
+        # adaptation is written into: build the driver whole then.
+        [[ -d ../mihawk-vulkan-review/.deps/work/radv-src/src/vulkan/wsi ]] || rm -rf "$radv_release"
         bash tools/build-radv-dependencies.sh
         rm -f build/radv-isolated/libvulkan_radeon.ps5.a
     fi
