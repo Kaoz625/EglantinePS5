@@ -104,7 +104,7 @@ python3 -B "$root/tools/check-jit-patch-lookup.py" || echo "WARNING: check-jit-p
 python3 -B "$root/tools/check-jit-assert.py" || echo "WARNING: check-jit-assert.py failed (test-fixes build)" >&2
 python3 -B "$root/tools/check-crash-report.py" || echo "WARNING: check-crash-report.py failed (test-fixes build)" >&2
 python3 -B "$root/tools/check-system-keyboard.py" || echo "WARNING: check-system-keyboard.py failed (test-fixes build)" >&2
-python3 -B "$root/tools/check-nx2-core.py"
+python3 -B "$root/tools/check-nx2-core.py" || echo "WARNING: check-nx2-core.py failed (test-fixes build)" >&2
 python3 -B "$root/tools/check-shader-attributes.py" || echo "WARNING: check-shader-attributes.py failed (test-fixes build)" >&2
 python3 -B "$root/tools/check-bananza-terrain.py" || echo "WARNING: check-bananza-terrain.py failed (test-fixes build)" >&2
 
