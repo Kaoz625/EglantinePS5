@@ -47,6 +47,13 @@ fi
 # The working tree is not the commit plus some of the patches in order (local changes, or a
 # revert): patch by patch.
 [[ $mode == --revert ]] && mapfile -t patches < <(printf '%s\n' "${patches[@]}" | sort -r)
+# A second run (CI runs this from deps and again from the build) cannot tell an applied patch from a broken one
+# when a later patch edits the same lines: its reverse check then fails too. The whole set's hash, written after a
+# full apply, says the tree already holds exactly these patches.
+stamp="$root/Eglantine/.eglantine-patches-applied"
+sum=$(cat "${patches[@]}" | sha256sum | cut -c1-16)
+if [[ $mode != --revert && -f $stamp && $(cat "$stamp") == "$sum" ]]; then exit 0; fi
+[[ $mode == --revert ]] && rm -f "$stamp"
 for patch in "${patches[@]}"; do
     name=$(basename "$patch")
     if git -C Eglantine apply --reverse --check "$patch" >/dev/null 2>&1; then
@@ -61,6 +68,8 @@ for patch in "${patches[@]}"; do
         echo "Eglantine patch applied: $name"
     else
         echo "Eglantine patch does not apply: $name (Eglantine moved; make the patch again)" >&2
+        git -C Eglantine apply --check -v "$patch" 2>&1 | grep -iE "error|fail|does not|already" | head -20 >&2 || true
         exit 1
     fi
 done
+[[ $mode == --revert ]] || echo "$sum" > "$stamp"
