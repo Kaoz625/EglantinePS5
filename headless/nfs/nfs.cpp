@@ -460,7 +460,12 @@ int nfs_stat_path(const Where &w, struct stat *st)
     }
     if (rc < 0)
         return -rc;
-    fill_stat(st, (s.nfs_mode & S_IFMT) == S_IFDIR, s.nfs_size, s.nfs_mtime, s.nfs_mode, s.nfs_ino);
+    const bool dir = (s.nfs_mode & S_IFMT) == S_IFDIR;
+    fill_stat(st, dir, s.nfs_size, s.nfs_mtime, s.nfs_mode, s.nfs_ino);
+    // Kept like a listed entry: the library asks for the same files of every game again and again (exefs/main), and each
+    // answer is a lookup per folder of the path.
+    std::lock_guard<std::mutex> g(g_cache_mutex);
+    g_attrs[key] = {dir, dir ? 0 : s.nfs_size, s.nfs_mtime, s.nfs_mode, s.nfs_ino, now_ms()};
     return 0;
 }
 
