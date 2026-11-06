@@ -153,11 +153,25 @@ string(REPLACE "    // \"from\" might no longer be valid if the thread was kille
 if(PS5_NATIVE)
 # Native fibers keep their 2MiB usable stack, but reserve it in the CPU flexible pool.
 # ThreadToFiber needs only context bookkeeping and allocates no unused private stack.
+# Two core layouts: the older std::array member, and the newer core's (6051d36) heap array.
+# Neither found is fatal: a silent miss put every fiber's 2 MiB stack in the direct-memory heap
+# (~300 MiB for Mario Kart World's ~150 threads, 6 Nov).
 string(REPLACE "    std::array<u8, DEFAULT_STACK_SIZE> stack{};"
     "    ::Eden::FiberStack stack;" fiber_source "${fiber_source}")
 string(REPLACE "    impl->stack_limit = impl->stack.data();"
     "    impl->stack.Allocate(DEFAULT_STACK_SIZE);\n    impl->stack_limit = impl->stack.data();"
     fiber_source "${fiber_source}")
+string(REPLACE "    std::unique_ptr<u8[]> stack;"
+    "    ::Eden::FiberStack stack;" fiber_source "${fiber_source}")
+string(REPLACE "    impl->stack.reset(new u8[DEFAULT_STACK_SIZE]);\n    impl->stack_limit = impl->stack.get();"
+    "    impl->stack.Allocate(DEFAULT_STACK_SIZE);\n    impl->stack_limit = impl->stack.data();"
+    fiber_source "${fiber_source}")
+string(FIND "${fiber_source}" "::Eden::FiberStack stack;" fiber_member_at)
+string(FIND "${fiber_source}" "impl->stack.Allocate(DEFAULT_STACK_SIZE);" fiber_allocate_at)
+string(FIND "${fiber_source}" "impl->stack.get()" fiber_get_at)
+if(fiber_member_at LESS 0 OR fiber_allocate_at LESS 0 OR NOT fiber_get_at LESS 0)
+    message(FATAL_ERROR "Pinned fiber stack changed: fiber stacks would come from the direct-memory heap")
+endif()
 string(PREPEND fiber_source "#include \"${EDEN_PORT_DIR}/fiber_stack.h\"\n")
 endif()
 write_derived("${PORT_BUILD_DIR}/fiber.cpp" "${fiber_source}")
