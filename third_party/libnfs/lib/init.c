@@ -176,7 +176,20 @@ struct rpc_context *rpc_init_context(void)
          * to wake; elsewhere evfd stays -1 and we rely on the poll timeout.
          */
         rpc->evfd = -1;
-#ifdef LIBNFS_EVENTFD_WAKEUP
+        rpc->evfd_write = -1;
+#if defined(LIBNFS_EVENTFD_WAKEUP) && defined(LIBNFS_PIPE_WAKEUP)
+        {
+                int wake[2];
+                if (pipe(wake) == 0) {
+                        fcntl(wake[0], F_SETFL, fcntl(wake[0], F_GETFL, 0) | O_NONBLOCK);
+                        fcntl(wake[1], F_SETFL, fcntl(wake[1], F_GETFL, 0) | O_NONBLOCK);
+                        rpc->evfd = wake[0];
+                        rpc->evfd_write = wake[1];
+                } else {
+                        LOG("pipe() failed: %s, service thread wakeups disabled", strerror(errno));
+                }
+        }
+#elif defined(LIBNFS_EVENTFD_WAKEUP)
         rpc->evfd = eventfd(0, EFD_NONBLOCK);
         if (rpc->evfd == -1) {
                 /*
@@ -191,7 +204,8 @@ struct rpc_context *rpc_init_context(void)
 
  	rpc->auth = authunix_create_default();
 	if (rpc->auth == NULL) {
-	        close(rpc->evfd);
+	        if (rpc->evfd != -1) close(rpc->evfd);
+	        if (rpc->evfd_write != -1) close(rpc->evfd_write);
 		free(rpc->waitpdu);
 		free(rpc);
 		return NULL;
@@ -266,6 +280,7 @@ struct rpc_context *rpc_init_server_context(int s)
 	 * write wakeups into it and close it in rpc_destroy_context().
 	 */
 	rpc->evfd = -1;
+	rpc->evfd_write = -1;
 	rpc->is_connected = 1;
 
 	rpc->is_nonblocking = is_nonblocking(s);
@@ -648,6 +663,9 @@ void rpc_destroy_context(struct rpc_context *rpc)
 
 	if (rpc->evfd != -1) {
 		close(rpc->evfd);
+        }
+	if (rpc->evfd_write != -1) {
+		close(rpc->evfd_write);
         }
 
 	if (rpc->error_string && rpc->error_string != oom) {

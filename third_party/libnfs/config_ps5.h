@@ -18,6 +18,11 @@
 
 /* Whether pthread library is present */
 #define HAVE_PTHREAD
+/* EglantinePS5 (6 Nov 2026): several reads in flight on one connection. The service thread is
+ * woken through a pipe (no eventfd on the PS5), and threads are told apart by pthread_self(). */
+#define HAVE_MULTITHREADING 1
+#define LIBNFS_PIPE_WAKEUP 1
+#define LIBNFS_TID_PTHREAD_SELF 1
 
 /* Define to 1 if you have the <dlfcn.h> header file. */
 

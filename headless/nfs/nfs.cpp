@@ -34,6 +34,7 @@
 #include <limits.h>
 #include <iterator>
 #include <map>
+#include <set>
 #include <memory>
 #include <new>
 #include <mutex>
@@ -115,8 +116,27 @@ struct Share
     std::atomic<int> gen{0}; // goes up with each new connection: a file handle of an older one is not valid
     std::atomic<bool> stalled{false}; // the watchdog shut the socket of the read in flight
     std::atomic<bool> dead{false}; // a read failed: the server is gone, nothing more is asked of it until it is mounted again
+    bool mt = false; // libnfs's service thread runs this connection: reads go without the lock, several at once
+    std::atomic<int> reads_in_flight{0};
     std::mutex lock;
 };
+
+// Several reads in flight on one connection (libnfs multithreading): the server answers them back to back instead
+// of one round trip at a time. Without the service thread (it could not start) the connection works as before.
+void start_service_thread(Share *s)
+{
+    s->mt = s->ctx && nfs_mt_service_thread_start(s->ctx) == 0;
+    if (s->ctx && !s->mt)
+        nfs_log("nfs: %s: no service thread (%s): one read at a time", s->url.c_str(),
+                nfs_get_error(s->ctx) ? nfs_get_error(s->ctx) : "?");
+}
+
+void destroy_context(nfs_context *ctx, bool mt)
+{
+    if (mt)
+        nfs_mt_service_thread_stop(ctx);
+    nfs_destroy_context(ctx);
+}
 
 std::mutex g_mutex;
 std::vector<Share *> g_shares; // the ones set; the ones replaced are kept (a game may hold a file of one)
@@ -147,7 +167,8 @@ struct Cache
     size_t bytes = 0;
     uint64_t want = 0; // the block the game is at: it is read first, and the ones after it
     bool stop = false, failed = false, worker_on = false;
-    std::thread worker;
+    std::set<uint64_t> fetching; // blocks a worker is reading now (another worker takes the next one)
+    std::vector<std::thread> workers;
 };
 
 struct File
@@ -514,7 +535,8 @@ void free_cache(File *f)
             c->stop = true;
             c->cv.notify_all();
         }
-        c->worker.join(); // (a read that hangs is cut by the watchdog)
+        for (std::thread &worker : c->workers)
+            worker.join(); // (a read that hangs is cut by the watchdog)
         --g_workers;
     }
     for (auto &entry : c->blocks)
@@ -691,9 +713,15 @@ bool reconnect(Share *s)
         return false;
     }
     if (s->ctx)
-        nfs_destroy_context(s->ctx);
+    {
+        // Reads in flight on the old connection (cut by the watchdog, or failing) return first.
+        for (int waited = 0; s->reads_in_flight.load() > 0 && waited < 5000; waited += 20)
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        destroy_context(s->ctx, s->mt);
+    }
     s->ctx = ctx;
     ++s->gen;
+    start_service_thread(s);
     return true;
 }
 
@@ -717,6 +745,7 @@ Block fetch_block(File *f, uint64_t number)
     while (done < want)
     {
         int rc = -EIO, seen;
+        bool ready = false, unlocked = false;
         {
             std::lock_guard<std::mutex> g(f->share->lock);
             seen = f->share->gen;
@@ -729,7 +758,9 @@ Block fetch_block(File *f, uint64_t number)
                     f->gen = seen;
                 }
             }
-            if (f->share->ctx && f->gen == seen && f->fh)
+            ready = f->share->ctx && f->gen == seen && f->fh;
+            unlocked = ready && f->share->mt;
+            if (ready && !unlocked)
             {
                 f->share->read_since = now_ms();
                 rc = nfs_pread(f->share->ctx, f->fh, data + done, want - done, start + done);
@@ -740,7 +771,21 @@ Block fetch_block(File *f, uint64_t number)
                 }
                 f->share->read_since = 0;
             }
+            if (unlocked && f->share->reads_in_flight.fetch_add(1) == 0)
+                f->share->read_since = now_ms(); // the watchdog times the oldest group of reads in flight
             f->share->stalled = false;
+        }
+        if (unlocked)
+        {
+            Share *s = f->share;
+            rc = nfs_pread(s->ctx, f->fh, data + done, want - done, start + done);
+            if (rc > 0)
+            {
+                ++g_n_read;
+                g_n_bytes += static_cast<uint64_t>(rc);
+            }
+            if (s->reads_in_flight.fetch_sub(1) == 1)
+                s->read_since = 0;
         }
         if (rc > 0)
         {
@@ -808,11 +853,12 @@ void read_ahead(File *f)
         const size_t cap = cache_cap();
         const uint64_t ahead = (cap / kBlock) * 7 / 8; // what would be dropped at once is not read
         uint64_t target = ~0ull;
-        if (!c->blocks.count(at) && at < blocks)
+        const auto wanted = [&](uint64_t k) { return !c->blocks.count(k) && !c->fetching.count(k); };
+        if (at < blocks && wanted(at))
             target = at;
         else
             for (uint64_t k = at + 1; k < blocks && k < at + ahead; ++k)
-                if (!c->blocks.count(k))
+                if (wanted(k))
                 {
                     target = k;
                     break;
@@ -820,12 +866,14 @@ void read_ahead(File *f)
         if (target == ~0ull)
         {
             trim(c, at, cap);
-            c->cv.wait_for(lk, std::chrono::milliseconds(200));
+            c->cv.wait_for(lk, std::chrono::milliseconds(c->fetching.empty() ? 200 : 20));
             continue;
         }
+        c->fetching.insert(target);
         lk.unlock();
         Block b = fetch_block(f, target);
         lk.lock();
+        c->fetching.erase(target);
         if (!b.data)
         {
             c->failed = true;
@@ -873,7 +921,10 @@ size_t block_bytes(File *f, uint64_t number, size_t offset, uint8_t *dst, size_t
         {
             c->worker_on = true;
             ++g_workers;
-            c->worker = std::thread(read_ahead, f);
+            // With the service thread, four reads in flight (each a 512 KB block); one otherwise.
+            const int count = f->share->mt ? 4 : 1;
+            for (int i = 0; i < count; ++i)
+                c->workers.emplace_back(read_ahead, f);
         }
         if (c->worker_on)
         {
@@ -1044,8 +1095,9 @@ void drop_share(Share *s)
     {
         std::lock_guard<std::mutex> g(s->lock);
         if (s->ctx)
-            nfs_destroy_context(s->ctx);
+            destroy_context(s->ctx, s->mt);
         s->ctx = nullptr;
+        s->mt = false;
     }
     std::lock_guard<std::mutex> g(g_mutex);
     s->mounted = false;
@@ -1327,6 +1379,7 @@ extern "C" int nfs_mount_all(int timeout_ms)
         else if (p.job->ok)
         {
             p.share->ctx = p.job->ctx;
+            start_service_thread(p.share);
             p.share->base = p.job->base;
             p.share->folder = p.job->folder;
             p.share->mounted = true;
