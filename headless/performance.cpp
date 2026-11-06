@@ -39,6 +39,8 @@ namespace Common {
 void GuestMemoryUsage(std::size_t* span, std::size_t* held) noexcept;
 // Address space Eden's sparse tables span and the memory they hold (src/memory_pages.cpp).
 void SparseUsage(std::size_t* reserved, std::size_t* committed) noexcept;
+// Address space the JIT code caches span and the memory they hold (src/memory_pages.cpp).
+void CodeRangeUsage(std::size_t* reserved, std::size_t* committed) noexcept;
 } // namespace Common
 
 #ifdef PS5_NATIVE
@@ -427,10 +429,27 @@ static void RefreshFreeMemory() {
         std::size_t guest_span = 0, guest_held = 0;
         ::Common::GuestMemoryUsage(&guest_span, &guest_held);
         const auto kernel_memory = guest_kernel_memory.load(std::memory_order_relaxed);
+        // All that is free against the largest block (holes between allocations), and the holders
+        // the crash reports never named: the guest's idle reserve, the JIT code caches, the tables.
+        std::int64_t taken = 0, offset = 0;
+        unsigned regions = 0;
+        DirectMemoryRegion region{};
+        while (offset < total && regions < 8192 &&
+               sceKernelDirectMemoryQuery(offset, 1, &region, sizeof(region)) == 0 && region.end > offset) {
+            taken += region.end - region.start;
+            offset = region.end;
+            ++regions;
+        }
+        std::size_t code_span = 0, code_held = 0, table_span = 0, table_held = 0;
+        ::Common::CodeRangeUsage(&code_span, &code_held);
+        ::Common::SparseUsage(&table_span, &table_held);
         std::fprintf(stderr, "EDEN_MEMORY pool largest free block %zu MiB, short=%d; the guest's memory holds %zu MiB"
-                     " (the kernel maps %llu MiB)\n",
+                     " (the kernel maps %llu MiB); free %lld MiB in %u regions, reserve %zu of %zu MiB,"
+                     " jit %zu of %zu MiB, tables %zu of %zu MiB\n",
                      largest >> 20, int(view.short_memory), guest_held >> 20,
-                     kernel_memory ? kernel_memory() >> 20 : 0ULL);
+                     kernel_memory ? kernel_memory() >> 20 : 0ULL,
+                     regions != 0 ? static_cast<long long>((total - taken) >> 20) : -1LL, regions,
+                     held >> 20, target >> 20, code_held >> 20, code_span >> 20, table_held >> 20, table_span >> 20);
         ReportHeap("every 20 s");
     }
     // The heap's empty spaces go back to the pool while it is short (every 2 s at most).

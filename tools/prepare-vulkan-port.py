@@ -399,6 +399,16 @@ adapt('src/video_core/renderer_vulkan/vk_swapchain.cpp', 'vulkan_swapchain.cpp',
 # Preserve upstream ABI, including consumers whose quoted includes resolve to
 # the original header. Display/capture purpose belongs to the draw call.
 adapt('src/video_core/present.h', 'include/video_core/present.h', [])
+# The descriptor payload ring: 8 frames in flight x (512 KiB guest + 128 KiB compute) = 5 MiB per
+# queue, 96 MiB of heap at Mario Kart World's crash (UpdateDescriptorQueue site, 6 Nov). A frame
+# of this title fills a fraction of it; the queue flushes when a frame's payload is full.
+adapt('src/video_core/renderer_vulkan/vk_update_descriptor.h',
+      'include/video_core/renderer_vulkan/vk_update_descriptor.h', [
+    ('    static constexpr size_t GUEST_FRAME_PAYLOAD_SIZE = 0x80000;',
+     '    static constexpr size_t GUEST_FRAME_PAYLOAD_SIZE = 0x20000;'),
+    ('    static constexpr size_t COMPUTE_FRAME_PAYLOAD_SIZE = 0x20000;',
+     '    static constexpr size_t COMPUTE_FRAME_PAYLOAD_SIZE = 0x8000;'),
+])
 adapt('src/video_core/renderer_vulkan/vk_present_manager.h',
       'include/video_core/renderer_vulkan/vk_present_manager.h', [
     ('#include <mutex>', '#include <mutex>\n#include <exception>'),
