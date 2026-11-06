@@ -27,4 +27,12 @@ if [[ -n ${EDEN_DEV_CHECKOUT:-} ]]; then
         fi
     fi
 fi
-make release
+# EDEN_CI_DEV_TITLE (release.yml input dev_title): a development build that boots that one title, with
+# the profiling counters and the compat-input.txt scripted pad, packed like a release.
+if [[ -n ${EDEN_CI_DEV_TITLE:-} ]]; then
+    make prepare
+    bash tools/build-package.sh dev "$EDEN_CI_DEV_TITLE"
+    python3 -B tools/ci/make-dist.py build/dev/PPSA98515
+else
+    make release
+fi
