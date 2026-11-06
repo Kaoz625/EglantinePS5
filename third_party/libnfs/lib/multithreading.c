@@ -190,7 +190,9 @@ int nfs_mt_sem_wait(libnfs_sem_t* sem)
 
 nfs_tid_t nfs_mt_get_tid(void)
 {
-#ifdef HAVE_PTHREAD_THREADID_NP
+#if defined(LIBNFS_TID_PTHREAD_SELF)
+        return (nfs_tid_t)(uintptr_t)pthread_self();
+#elif defined(HAVE_PTHREAD_THREADID_NP)
         nfs_tid_t tid;
         pthread_threadid_np(NULL, &tid);
         return tid;

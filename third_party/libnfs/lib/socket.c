@@ -318,8 +318,14 @@ rpc_wakeup_service_thread(struct rpc_context *rpc)
                 return;
         }
 
+#ifdef LIBNFS_PIPE_WAKEUP
+        /* One byte down the pipe; a full pipe (EAGAIN) already holds a wakeup. */
+        cnt = write(rpc->evfd_write, &val, 1);
+        if (cnt != 1 && errno != EAGAIN) {
+#else
         cnt = write(rpc->evfd, &val, sizeof(val));
         if (cnt != (ssize_t)sizeof(val)) {
+#endif
                 /*
                  * Losing a wakeup only costs us up to rpc->poll_timeout of
                  * latency, so log it and carry on rather than failing the
