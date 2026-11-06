@@ -33,6 +33,10 @@ on:
         description: "Also publish this run's ccache as the build-cache snapshot (run it on main)"
         type: boolean
         default: false
+      dev_title:
+        description: "Development build that boots this 16-digit title ID (empty = release build)"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -168,7 +172,7 @@ jobs:
         timeout-minutes: 315
         run: |
           ccache --zero-stats
-          bash tools/ci/build-release.sh
+          EDEN_CI_DEV_TITLE="${{ inputs.dev_title }}" bash tools/ci/build-release.sh
 
       - name: Report disk, ccache and the linker
         if: always()
