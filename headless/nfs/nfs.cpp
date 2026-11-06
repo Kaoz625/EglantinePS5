@@ -650,12 +650,16 @@ File *open_file(const char *path, int *error)
 }
 
 // A new connection to a share, in place of one that went silent (called with the lock of the share held). The file
-// handles of the old one are not valid on it: each file opens its own again (fetch_block).
-bool reconnect(Share *s)
+// handles of the old one are not valid on it: each file opens its own again (fetch_block). When it cannot be made,
+// `why` says what libnfs answered.
+bool reconnect(Share *s, std::string &why)
 {
     nfs_context *ctx = nfs_init_context();
     if (!ctx)
+    {
+        why = "no memory for a new connection";
         return false;
+    }
     nfs_set_timeout(ctx, std::max(g_timeout_ms.load() / 2, 3000));
     nfs_set_autoreconnect(ctx, 2);
     nfs_set_readdir_max_buffer_size(ctx, kReaddirBytes, kReaddirBytes);
@@ -669,6 +673,8 @@ bool reconnect(Share *s)
     }
     if (rc != 0)
     {
+        const char *e = nfs_get_error(ctx);
+        why = e && *e ? e : strerror(-rc);
         nfs_destroy_context(ctx);
         return false;
     }
@@ -679,14 +685,23 @@ bool reconnect(Share *s)
     return true;
 }
 
-// One block from the server (no lock of the cache held). A read that fails or stalls is tried again on a new connection
-// a few times before the server is given up.
+// The file is being closed: its read-ahead thread stops retrying (free_cache waits for it).
+bool closing(File *f)
+{
+    Cache *c = f->cache;
+    if (!c)
+        return false;
+    std::lock_guard<std::mutex> g(c->m);
+    return c->stop;
+}
+
+// One block from the server (no lock of the cache held). A read that fails or stalls is tried again on a new
+// connection until it works, waiting a little longer each time (0.5 s, 1, 2, 4, 8, then every 10 s): a blip of the
+// network or of the server never freezes the game (it used to give the server up after 3 tries, and every read after
+// that failed, so the game hung on its loading screen). Only closing the file stops it.
 Block fetch_block(File *f, uint64_t number)
 {
-    constexpr int kTries = 3;
     Block b;
-    if (f->share->dead)
-        return b;
     const uint64_t start = number * kBlock;
     if (start >= f->size)
         return b;
@@ -696,9 +711,11 @@ Block fetch_block(File *f, uint64_t number)
         return b;
     size_t done = 0;
     int failures = 0;
+    int64_t failing_since = 0;
     while (done < want)
     {
         int rc = -EIO, seen;
+        std::string why;
         {
             std::lock_guard<std::mutex> g(f->share->lock);
             seen = f->share->gen;
@@ -710,6 +727,11 @@ Block fetch_block(File *f, uint64_t number)
                     f->fh = fresh;
                     f->gen = seen;
                 }
+                else
+                {
+                    const char *e = nfs_get_error(f->share->ctx);
+                    why = std::string("opening the file again: ") + (e ? e : "?");
+                }
             }
             if (f->share->ctx && f->gen == seen && f->fh)
             {
@@ -720,12 +742,25 @@ Block fetch_block(File *f, uint64_t number)
                     ++g_n_read;
                     g_n_bytes += static_cast<uint64_t>(rc);
                 }
+                else if (rc < 0)
+                {
+                    const char *e = nfs_get_error(f->share->ctx);
+                    why = e && *e ? e : strerror(-rc);
+                }
                 f->share->read_since = 0;
             }
+            else if (why.empty())
+                why = "no connection";
             f->share->stalled = false;
         }
         if (rc > 0)
         {
+            if (failures)
+            {
+                nfs_log("nfs: %s: reads work again after %d tries (%.1f s)", f->share->url.c_str(), failures,
+                        (now_ms() - failing_since) / 1000.0);
+                g_reconnecting = false;
+            }
             done += static_cast<size_t>(rc);
             failures = 0;
             continue;
@@ -735,23 +770,32 @@ Block fetch_block(File *f, uint64_t number)
             free(data);
             return b;
         }
-        if (f->share->dead || ++failures > kTries)
-        {
-            f->share->dead = true;
-            g_lost = true;
-            g_reconnecting = false;
-            free(data);
-            return b;
-        }
+        if (!failures)
+            failing_since = now_ms();
+        ++failures;
         g_reconnecting = true;
-        nfs_log("nfs: %s: a read failed, trying again on a new connection (%d of %d)", f->share->url.c_str(),
-                           failures, kTries);
-        std::this_thread::sleep_for(std::chrono::milliseconds(500 * failures));
+        const int wait_ms = failures > 5 ? 10000 : 500 << (failures - 1);
+        if (failures <= 10 || failures % 30 == 0)
+            nfs_log("nfs: %s: a read of %s failed (%s), trying again on a new connection in %.1f s (try %d, failing %.0f s)",
+                    f->share->url.c_str(), f->rel.c_str(), why.c_str(), wait_ms / 1000.0, failures,
+                    (now_ms() - failing_since) / 1000.0);
+        for (int waited = 0; waited < wait_ms; waited += 100)
+        {
+            if (closing(f))
+            {
+                free(data);
+                return b;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
         std::lock_guard<std::mutex> g(f->share->lock);
         if (f->share->gen == seen)
-            reconnect(f->share);
+        {
+            std::string no;
+            if (!reconnect(f->share, no) && (failures <= 10 || failures % 30 == 0))
+                nfs_log("nfs: %s: no new connection yet (%s)", f->share->url.c_str(), no.c_str());
+        }
     }
-    g_reconnecting = false;
     b.data = data;
     b.len = want;
     return b;
