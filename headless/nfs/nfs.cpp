@@ -357,6 +357,10 @@ std::atomic<uint64_t> g_n_open{0}, g_n_stat_hit{0}, g_n_stat_miss{0}, g_n_list{0
 std::mutex g_cache_mutex;
 std::map<std::string, Attr> g_attrs;
 std::map<std::string, Listing> g_listings;
+// Paths the server said do not exist. The library asks for the same missing files on every check (every 2 s while the
+// menu is open), and each one was a round trip to the server on the menu's thread. Emptied with the other caches when
+// the library is read again, so a game that is added appears then.
+std::map<std::string, int64_t> g_missing;
 
 std::string cache_key(const Share *s, const std::string &rel)
 {
@@ -368,6 +372,7 @@ void cache_clear()
     std::lock_guard<std::mutex> g(g_cache_mutex);
     g_attrs.clear();
     g_listings.clear();
+    g_missing.clear();
 }
 
 // A big folder's listing (the textures of a game: tens of thousands of files, a server answering a few dozen entries at a
@@ -450,6 +455,12 @@ int nfs_stat_path(const Where &w, struct stat *st)
             fill_stat(st, it->second.dir, it->second.size, it->second.mtime, it->second.mode, it->second.ino);
             return 0;
         }
+        const auto gone = g_missing.find(key);
+        if (gone != g_missing.end() && now_ms() - gone->second < kCacheMs)
+        {
+            ++g_n_stat_hit;
+            return ENOENT;
+        }
     }
     ++g_n_stat_miss;
     nfs_stat_64 s;
@@ -459,7 +470,14 @@ int nfs_stat_path(const Where &w, struct stat *st)
         rc = nfs_stat64(w.share->ctx, w.rel.c_str(), &s);
     }
     if (rc < 0)
+    {
+        if (-rc == ENOENT)
+        {
+            std::lock_guard<std::mutex> g(g_cache_mutex);
+            g_missing[key] = now_ms();
+        }
         return -rc;
+    }
     const bool dir = (s.nfs_mode & S_IFMT) == S_IFDIR;
     fill_stat(st, dir, s.nfs_size, s.nfs_mtime, s.nfs_mode, s.nfs_ino);
     // Kept like a listed entry: the library asks for the same files of every game again and again (exefs/main), and each
