@@ -838,6 +838,12 @@ int main(int argc, char** argv) {
         // every frame (20-25 FPS). Eden's larger integrated budget (6 GiB) holds it at 30 FPS
         // with ~0.9 GB of direct memory to spare.
         Settings::values.vram_usage_mode.SetValue(Settings::VramUsageMode::Aggressive);
+        // vram-conservative.txt in the app's folder: Eden's 4 GiB budget, for games whose own memory
+        // leaves the pool short (Mario Kart World ran out of device memory with 6 GiB, 6 Nov).
+        if (std::ifstream(Eden::AppFile("vram-conservative.txt")).good()) {
+            Settings::values.vram_usage_mode.SetValue(Settings::VramUsageMode::Conservative);
+            std::fprintf(stderr, "[EglantinePS5] vram: conservative (vram-conservative.txt)\n");
+        }
 #else
         Settings::values.renderer_backend = Settings::RendererBackend::Null;
 #endif
