@@ -215,6 +215,8 @@ std::map<std::string, DiskGame> g_disk_games; // by folder name
 uint64_t g_disk_total = 0;
 std::atomic<uint64_t> g_n_disk_hit{0}, g_n_disk_put{0};
 std::atomic<uint64_t> g_n_asked{0}, g_n_asked_bytes{0}; // what the game asked of the shares (read_at)
+// Time spent inside read_at: tells a loader blocked on reads from one busy computing (7 Nov, Hyrule).
+std::atomic<uint64_t> g_asked_ns{0}, g_asked_max_ns{0};
 std::atomic<bool> g_disk_evicting{false};
 
 std::string disk_key(const std::string &url, const std::string &rel, uint64_t size, uint64_t mtime)
@@ -838,6 +840,16 @@ void watch_reads()
                                     static_cast<unsigned long long>(g_disk_budget >> 20),
                                     static_cast<unsigned long long>(g_n_asked.load()),
                                     static_cast<unsigned long long>(g_n_asked_bytes.load() >> 20));
+                        {
+                            static uint64_t last_ns = 0, last_n = 0;
+                            const uint64_t ns = g_asked_ns.load(), cnt = g_n_asked.load();
+                            const uint64_t dn = cnt - last_n, dns = ns - last_ns;
+                            nfs_log("read time: %llu ms in the game's last %llu reads (avg %.1f ms, longest so far %llu ms)",
+                                    static_cast<unsigned long long>(dns / 1000000), static_cast<unsigned long long>(dn),
+                                    dn ? dns / 1e6 / dn : 0.0, static_cast<unsigned long long>(g_asked_max_ns.exchange(0) / 1000000));
+                            last_ns = ns;
+                            last_n = cnt;
+                        }
                         nfs_log("stats: opens %llu, stat %llu (+%llu asked), lists %llu (+%llu cached), reads %llu (%llu MB)",
                                 static_cast<unsigned long long>(g_n_open), static_cast<unsigned long long>(g_n_stat_hit),
                                 static_cast<unsigned long long>(g_n_stat_miss), static_cast<unsigned long long>(g_n_list),
@@ -1250,7 +1262,22 @@ size_t block_bytes(File *f, uint64_t number, size_t offset, uint8_t *dst, size_t
     }
 }
 
+size_t read_at_untimed(File *f, uint64_t pos, void *dst, size_t n);
+
 size_t read_at(File *f, uint64_t pos, void *dst, size_t n)
+{
+    const auto start = std::chrono::steady_clock::now();
+    const size_t got = read_at_untimed(f, pos, dst, n);
+    const uint64_t ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    g_asked_ns += ns;
+    uint64_t prev = g_asked_max_ns.load();
+    while (ns > prev && !g_asked_max_ns.compare_exchange_weak(prev, ns)) {
+    }
+    return got;
+}
+
+size_t read_at_untimed(File *f, uint64_t pos, void *dst, size_t n)
 {
     ++g_n_asked;
     g_n_asked_bytes += n;
