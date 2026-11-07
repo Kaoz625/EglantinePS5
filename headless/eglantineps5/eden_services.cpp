@@ -598,6 +598,9 @@ bool EdenServices::prepare_game(const std::string& file, const std::atomic<bool>
     }
     if (std::filesystem::path(root).filename() == "base")
         root = std::filesystem::path(root).parent_path().string();
+    // A folder game that boots its newest update (extracted_game.h): <game>/updates/<version>.
+    else if (std::filesystem::path(root).parent_path().filename() == "updates")
+        root = std::filesystem::path(root).parent_path().parent_path().string();
     // A game that brings its index (made on the PC) needs no reading at all.
     if (const int indexed = nfs_load_index(root.c_str()); indexed >= 0) {
         files = static_cast<unsigned>(indexed);
