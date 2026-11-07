@@ -214,6 +214,7 @@ struct DiskGame
 std::map<std::string, DiskGame> g_disk_games; // by folder name
 uint64_t g_disk_total = 0;
 std::atomic<uint64_t> g_n_disk_hit{0}, g_n_disk_put{0};
+std::atomic<uint64_t> g_n_asked{0}, g_n_asked_bytes{0}; // what the game asked of the shares (read_at)
 std::atomic<bool> g_disk_evicting{false};
 
 std::string disk_key(const std::string &url, const std::string &rel, uint64_t size, uint64_t mtime)
@@ -349,6 +350,47 @@ void disk_put(File *f, uint64_t number, const Block &b)
     }
     if (over)
         disk_evict(f->disk_key);
+}
+
+// `n` bytes from `offset` of block `number`, read straight from its file in the disk cache: no 512 KB copy and no
+// churn in the memory cache, for the small reads games make all over a big file (6 Nov: Mario Kart World's loads
+// fetched 48 GB of blocks for 566 MB of distinct data). 0 when the block is not on the drive.
+std::atomic<uint64_t> g_n_disk_range{0};
+size_t disk_read_range(File *f, uint64_t number, size_t offset, uint8_t *dst, size_t n)
+{
+    if (!g_disk_on || f->disk_key.empty())
+        return 0;
+    const uint64_t start = number * kBlock;
+    if (start >= f->size)
+        return 0;
+    const size_t len = static_cast<size_t>(std::min<uint64_t>(kBlock, f->size - start));
+    if (offset >= len)
+        return 0;
+    const int fd = __real_open(disk_block_path(f->disk_key, number).c_str(), O_RDONLY);
+    if (fd < 0)
+        return 0;
+    const size_t want = std::min(n, len - offset);
+    size_t done = 0;
+    while (done < want)
+    {
+        const ssize_t got = __real_pread(fd, dst + done, want - done, static_cast<off_t>(offset + done));
+        if (got <= 0)
+            break;
+        done += static_cast<size_t>(got);
+    }
+    __real_close(fd);
+    if (done != want)
+        return 0;
+    ++g_n_disk_range;
+    return done;
+}
+
+bool disk_has(const File *f, uint64_t number)
+{
+    if (!g_disk_on || f->disk_key.empty())
+        return false;
+    struct stat st;
+    return __real_stat(disk_block_path(f->disk_key, number).c_str(), &st) == 0;
 }
 
 // A file of a game opens: its folder counts as used now (kept on the drive as the folder's date).
@@ -787,11 +829,15 @@ void watch_reads()
                     {
                         last_sum = sum;
                         if (g_disk_on)
-                            nfs_log("disk cache: %llu blocks read from the drive, %llu written, %llu of %llu MB used",
+                            nfs_log("disk cache: %llu ranges and %llu blocks read from the drive, %llu written, %llu of %llu MB used;"
+                                    " the game asked %llu reads, %llu MB",
+                                    static_cast<unsigned long long>(g_n_disk_range.load()),
                                     static_cast<unsigned long long>(g_n_disk_hit.load()),
                                     static_cast<unsigned long long>(g_n_disk_put.load()),
                                     static_cast<unsigned long long>(g_disk_total >> 20),
-                                    static_cast<unsigned long long>(g_disk_budget >> 20));
+                                    static_cast<unsigned long long>(g_disk_budget >> 20),
+                                    static_cast<unsigned long long>(g_n_asked.load()),
+                                    static_cast<unsigned long long>(g_n_asked_bytes.load() >> 20));
                         nfs_log("stats: opens %llu, stat %llu (+%llu asked), lists %llu (+%llu cached), reads %llu (%llu MB)",
                                 static_cast<unsigned long long>(g_n_open), static_cast<unsigned long long>(g_n_stat_hit),
                                 static_cast<unsigned long long>(g_n_stat_miss), static_cast<unsigned long long>(g_n_list),
@@ -1097,7 +1143,7 @@ void read_ahead(File *f)
         // What would be dropped at once is not read, and no further than the game's reading pattern asks for.
         const uint64_t ahead = std::min<uint64_t>((cap / kBlock) * 7 / 8, c->window + 1);
         uint64_t target = ~0ull;
-        const auto wanted = [&](uint64_t k) { return !c->blocks.count(k) && !c->fetching.count(k); };
+        const auto wanted = [&](uint64_t k) { return !c->blocks.count(k) && !c->fetching.count(k) && !disk_has(f, k); };
         if (at < blocks && wanted(at))
             target = at;
         else
@@ -1164,6 +1210,13 @@ size_t block_bytes(File *f, uint64_t number, size_t offset, uint8_t *dst, size_t
             return 0;
         if (c->want != number)
             note_position(c, number);
+        {
+            lk.unlock();
+            const size_t from_drive = disk_read_range(f, number, offset, dst, n);
+            lk.lock();
+            if (from_drive)
+                return from_drive;
+        }
         if (!c->worker_on && f->size > kReadAhead && !c->stop)
         {
             c->worker_on = true;
@@ -1199,6 +1252,8 @@ size_t block_bytes(File *f, uint64_t number, size_t offset, uint8_t *dst, size_t
 
 size_t read_at(File *f, uint64_t pos, void *dst, size_t n)
 {
+    ++g_n_asked;
+    g_n_asked_bytes += n;
     if (f->nt)
     {
         const size_t read = pos < f->size ? ntfsfs_pread(f->nt, dst, static_cast<size_t>(std::min<uint64_t>(n, f->size - pos)), pos) : 0;
