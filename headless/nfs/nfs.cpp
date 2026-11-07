@@ -190,6 +190,26 @@ struct File
 
 File g_files[kMaxFiles];
 
+// Which file the reads go to, for the 5 s stats line: blocks fetched and how many of them were new. A game that reads
+// the same blocks again shows fetched >> distinct (6 Nov: Star Fox read 19 GB from a 15 GB archive at 98%).
+struct ReadDiag
+{
+    uint64_t size = 0, fetched = 0, fetched_since = 0;
+    std::set<uint64_t> distinct;
+};
+std::mutex g_diag_mutex;
+std::map<std::string, ReadDiag> g_diag;
+
+void note_fetch(const File *f, uint64_t number)
+{
+    std::lock_guard<std::mutex> g(g_diag_mutex);
+    ReadDiag &d = g_diag[f->rel];
+    d.size = f->size;
+    ++d.fetched;
+    ++d.fetched_since;
+    d.distinct.insert(number);
+}
+
 bool own_file(const FILE *f)
 {
     const uintptr_t p = reinterpret_cast<uintptr_t>(f), lo = reinterpret_cast<uintptr_t>(&g_files[0]);
@@ -595,6 +615,22 @@ void watch_reads()
                                 static_cast<unsigned long long>(g_n_stat_miss), static_cast<unsigned long long>(g_n_list),
                                 static_cast<unsigned long long>(g_n_list_hit), static_cast<unsigned long long>(g_n_read),
                                 static_cast<unsigned long long>(g_n_bytes >> 20));
+                        std::lock_guard<std::mutex> g(g_diag_mutex);
+                        auto top = g_diag.end();
+                        for (auto it = g_diag.begin(); it != g_diag.end(); ++it)
+                            if (it->second.fetched_since && (top == g_diag.end() || it->second.fetched_since > top->second.fetched_since))
+                                top = it;
+                        if (top != g_diag.end())
+                        {
+                            const ReadDiag &d = top->second;
+                            nfs_log("reads: %s: %llu MB in 5 s; %llu MB fetched in all, %llu MB of it distinct, of %llu MB",
+                                    top->first.c_str(), static_cast<unsigned long long>((d.fetched_since * kBlock) >> 20),
+                                    static_cast<unsigned long long>((d.fetched * kBlock) >> 20),
+                                    static_cast<unsigned long long>((d.distinct.size() * kBlock) >> 20),
+                                    static_cast<unsigned long long>(d.size >> 20));
+                        }
+                        for (auto &entry : g_diag)
+                            entry.second.fetched_since = 0;
                     }
                 }
                 std::vector<Share *> list;
@@ -890,6 +926,8 @@ void read_ahead(File *f)
         c->fetching.insert(target);
         lk.unlock();
         Block b = fetch_block(f, target);
+        if (b.data)
+            note_fetch(f, target);
         lk.lock();
         c->fetching.erase(target);
         if (!b.data)
@@ -953,6 +991,8 @@ size_t block_bytes(File *f, uint64_t number, size_t offset, uint8_t *dst, size_t
         }
         lk.unlock();
         Block b = fetch_block(f, number);
+        if (b.data)
+            note_fetch(f, number);
         lk.lock();
         if (!b.data)
             return 0;
