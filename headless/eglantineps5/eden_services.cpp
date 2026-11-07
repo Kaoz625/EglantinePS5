@@ -923,6 +923,17 @@ static std::string ReadNfsText() {
 
 static void StartNfs() {
     nfs_set_index_dir((Eden::ConfigDir() + "/nfs-index").c_str());
+    {
+        // The disk cache of streamed games (headless/nfs/nfs.cpp): 75 GB unless nfs-cache-gb.txt in the config
+        // folder says otherwise (0 turns it off). Markus 6 Nov: 75 GB on DIGI5's drive.
+        unsigned long long gb = 75;
+        if (FILE* setting = std::fopen((Eden::ConfigDir() + "/nfs-cache-gb.txt").c_str(), "r")) {
+            unsigned long long value = 0;
+            if (std::fscanf(setting, "%llu", &value) == 1) gb = value;
+            std::fclose(setting);
+        }
+        nfs_set_disk_cache((Eden::ConfigDir() + "/nfs-cache").c_str(), gb << 30);
+    }
     const std::string text = ReadNfsText();
     if (text.empty()) return;
     char error[512]{};

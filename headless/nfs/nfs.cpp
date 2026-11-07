@@ -42,6 +42,9 @@
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <climits>
+#include <ctime>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <thread>
 #include <unistd.h>
@@ -186,9 +189,182 @@ struct File
     Cache *cache = nullptr;
     int gen = 0;
     NtfsFile *nt = nullptr; // a file on an NTFS disk (ntfs/ntfsfs.h)
+    std::string disk_key; // its folder in the disk cache (empty: not cached)
 };
 
 File g_files[kMaxFiles];
+
+// ---- The disk cache: blocks read from the shares, kept on the console's own drive ----
+// A game streamed from a share reads the same blocks again (in one launch, when its 512 KB blocks have left the
+// 128 MiB memory cache, and at every launch). Each block read from the server is also written to a file of its own
+// under the cache folder, and read from there next time: the console's drive answers in milliseconds where a share
+// over Wi-Fi gave 12-20 MB/s (6 Nov: packed Star Fox read 19 GB at "98%" in 17 min). A file's folder is named after
+// its share, path, size and date, so a changed file is never served old blocks. When the cache holds more than its
+// budget, the game used longest ago goes, whole. The shares stay the only copy that counts: the cache can be deleted
+// at any time.
+std::string g_disk_dir;
+uint64_t g_disk_budget = 0;
+std::atomic<bool> g_disk_on{false};
+std::mutex g_disk_mutex;
+struct DiskGame
+{
+    uint64_t bytes = 0;
+    int64_t used = 0;
+};
+std::map<std::string, DiskGame> g_disk_games; // by folder name
+uint64_t g_disk_total = 0;
+std::atomic<uint64_t> g_n_disk_hit{0}, g_n_disk_put{0};
+std::atomic<bool> g_disk_evicting{false};
+
+std::string disk_key(const std::string &url, const std::string &rel, uint64_t size, uint64_t mtime)
+{
+    uint64_t h = 1469598103934665603ull;
+    const std::string id = url + "|" + rel + "|" + std::to_string(size) + "|" + std::to_string(mtime);
+    for (const unsigned char c : id)
+        h = (h ^ c) * 1099511628211ull;
+    char out[17];
+    snprintf(out, sizeof(out), "%016llx", static_cast<unsigned long long>(h));
+    return out;
+}
+
+std::string disk_block_path(const std::string &key, uint64_t number)
+{
+    char name[24];
+    snprintf(name, sizeof(name), "/%llx", static_cast<unsigned long long>(number));
+    return g_disk_dir + "/" + key + name;
+}
+
+int64_t wall_s()
+{
+    return static_cast<int64_t>(time(nullptr));
+}
+
+// The whole folder of a game: its blocks, then the folder.
+uint64_t disk_remove_game(const std::string &key)
+{
+    const std::string dir = g_disk_dir + "/" + key;
+    uint64_t freed = 0;
+    if (DIR *d = opendir(dir.c_str()))
+    {
+        while (dirent *e = readdir(d))
+        {
+            if (e->d_name[0] == '.')
+                continue;
+            const std::string path = dir + "/" + e->d_name;
+            struct stat st;
+            if (__real_stat(path.c_str(), &st) == 0)
+                freed += static_cast<uint64_t>(st.st_size);
+            unlink(path.c_str());
+        }
+        closedir(d);
+    }
+    rmdir(dir.c_str());
+    return freed;
+}
+
+// Over budget: the games used longest ago go until it fits again, never the one being read now.
+void disk_evict(const std::string &keep)
+{
+    if (g_disk_evicting.exchange(true))
+        return;
+    for (;;)
+    {
+        std::string victim;
+        {
+            std::lock_guard<std::mutex> g(g_disk_mutex);
+            if (g_disk_total <= g_disk_budget)
+                break;
+            int64_t oldest = INT64_MAX;
+            for (const auto &entry : g_disk_games)
+                if (entry.first != keep && entry.second.used < oldest)
+                {
+                    oldest = entry.second.used;
+                    victim = entry.first;
+                }
+            if (victim.empty())
+                break;
+            const uint64_t bytes = g_disk_games[victim].bytes;
+            g_disk_total -= std::min(g_disk_total, bytes);
+            g_disk_games.erase(victim);
+        }
+        nfs_log("nfs: disk cache: over its budget, the game used longest ago goes (%s)", victim.c_str());
+        disk_remove_game(victim);
+    }
+    g_disk_evicting = false;
+}
+
+bool disk_get(File *f, uint64_t number, size_t want, Block &b)
+{
+    if (!g_disk_on || f->disk_key.empty())
+        return false;
+    const int fd = __real_open(disk_block_path(f->disk_key, number).c_str(), O_RDONLY);
+    if (fd < 0)
+        return false;
+    uint8_t *data = static_cast<uint8_t *>(malloc(want));
+    size_t done = 0;
+    while (data && done < want)
+    {
+        const ssize_t got = __real_read(fd, data + done, want - done);
+        if (got <= 0)
+            break;
+        done += static_cast<size_t>(got);
+    }
+    __real_close(fd);
+    if (!data || done != want)
+    {
+        free(data);
+        return false;
+    }
+    b.data = data;
+    b.len = want;
+    ++g_n_disk_hit;
+    return true;
+}
+
+void disk_put(File *f, uint64_t number, const Block &b)
+{
+    if (!g_disk_on || f->disk_key.empty() || !b.data)
+        return;
+    const std::string dir = g_disk_dir + "/" + f->disk_key;
+    mkdir(dir.c_str(), 0777);
+    const std::string path = disk_block_path(f->disk_key, number), staged = path + ".tmp";
+    FILE *out = __real_fopen(staged.c_str(), "wb");
+    if (!out)
+        return;
+    const bool ok = fwrite(b.data, 1, b.len, out) == b.len;
+    if (__real_fclose(out) != 0 || !ok || rename(staged.c_str(), path.c_str()) != 0)
+    {
+        unlink(staged.c_str());
+        return;
+    }
+    ++g_n_disk_put;
+    bool over;
+    {
+        std::lock_guard<std::mutex> g(g_disk_mutex);
+        DiskGame &game = g_disk_games[f->disk_key];
+        game.bytes += b.len;
+        game.used = wall_s();
+        g_disk_total += b.len;
+        over = g_disk_total > g_disk_budget;
+    }
+    if (over)
+        disk_evict(f->disk_key);
+}
+
+// A file of a game opens: its folder counts as used now (kept on the drive as the folder's date).
+void disk_touch(const std::string &key)
+{
+    if (!g_disk_on || key.empty())
+        return;
+    {
+        std::lock_guard<std::mutex> g(g_disk_mutex);
+        auto it = g_disk_games.find(key);
+        if (it == g_disk_games.end())
+            return;
+        it->second.used = wall_s();
+    }
+    utimes((g_disk_dir + "/" + key).c_str(), nullptr);
+}
 
 // Which file the reads go to, for the 5 s stats line: blocks fetched and how many of them were new. A game that reads
 // the same blocks again shows fetched >> distinct (6 Nov: Star Fox read 19 GB from a 15 GB archive at 98%).
@@ -610,6 +786,12 @@ void watch_reads()
                     if (sum != last_sum)
                     {
                         last_sum = sum;
+                        if (g_disk_on)
+                            nfs_log("disk cache: %llu blocks read from the drive, %llu written, %llu of %llu MB used",
+                                    static_cast<unsigned long long>(g_n_disk_hit.load()),
+                                    static_cast<unsigned long long>(g_n_disk_put.load()),
+                                    static_cast<unsigned long long>(g_disk_total >> 20),
+                                    static_cast<unsigned long long>(g_disk_budget >> 20));
                         nfs_log("stats: opens %llu, stat %llu (+%llu asked), lists %llu (+%llu cached), reads %llu (%llu MB)",
                                 static_cast<unsigned long long>(g_n_open), static_cast<unsigned long long>(g_n_stat_hit),
                                 static_cast<unsigned long long>(g_n_stat_miss), static_cast<unsigned long long>(g_n_list),
@@ -704,6 +886,11 @@ File *open_file(const char *path, int *error)
     f->share = w.share;
     f->rel = w.rel;
     f->size = static_cast<uint64_t>(st.st_size);
+    if (g_disk_on && f->size > kBlock)
+    {
+        f->disk_key = disk_key(w.share->url, w.rel, f->size, static_cast<uint64_t>(st.st_mtime));
+        disk_touch(f->disk_key);
+    }
     int rc;
     {
         std::lock_guard<std::mutex> g(w.share->lock);
@@ -777,6 +964,8 @@ Block fetch_block(File *f, uint64_t number)
     if (start >= f->size)
         return b;
     const size_t want = static_cast<size_t>(std::min<uint64_t>(kBlock, f->size - start));
+    if (disk_get(f, number, want, b))
+        return b;
     uint8_t *data = static_cast<uint8_t *>(malloc(want));
     if (!data)
         return b;
@@ -857,6 +1046,7 @@ Block fetch_block(File *f, uint64_t number)
     g_reconnecting = false;
     b.data = data;
     b.len = want;
+    disk_put(f, number, b);
     return b;
 }
 
@@ -1635,6 +1825,62 @@ extern "C" unsigned long long nfs_entries_seen(void)
 extern "C" void nfs_set_index_dir(const char *dir)
 {
     g_index_dir = dir ? dir : "";
+}
+
+extern "C" void nfs_set_disk_cache(const char *dir, unsigned long long bytes)
+{
+    if (!dir || !*dir || bytes == 0 || g_disk_on)
+        return;
+    g_disk_dir = dir;
+    g_disk_budget = bytes;
+    mkdir(g_disk_dir.c_str(), 0777);
+    // What a previous run left: each game's size (its blocks) and when it was used (its folder's date).
+    uint64_t total = 0;
+    std::map<std::string, DiskGame> games;
+    if (DIR *d = opendir(g_disk_dir.c_str()))
+    {
+        while (dirent *e = readdir(d))
+        {
+            if (e->d_name[0] == '.')
+                continue;
+            const std::string game = g_disk_dir + "/" + e->d_name;
+            struct stat gs;
+            if (__real_stat(game.c_str(), &gs) != 0 || !S_ISDIR(gs.st_mode))
+                continue;
+            DiskGame entry;
+            entry.used = static_cast<int64_t>(gs.st_mtime);
+            if (DIR *blocks = opendir(game.c_str()))
+            {
+                while (dirent *b = readdir(blocks))
+                {
+                    if (b->d_name[0] == '.')
+                        continue;
+                    const size_t length = strlen(b->d_name);
+                    if (length > 4 && strcmp(b->d_name + length - 4, ".tmp") == 0)
+                    {
+                        unlink((game + "/" + b->d_name).c_str());
+                        continue;
+                    }
+                    entry.bytes += kBlock; // a game's last block may be shorter: close enough for the budget
+                }
+                closedir(blocks);
+            }
+            total += entry.bytes;
+            games[e->d_name] = entry;
+        }
+        closedir(d);
+    }
+    {
+        std::lock_guard<std::mutex> g(g_disk_mutex);
+        g_disk_games = std::move(games);
+        g_disk_total = total;
+    }
+    g_disk_on = true;
+    nfs_log("nfs: disk cache %s: %llu MB of %llu MB in %zu games", g_disk_dir.c_str(),
+            static_cast<unsigned long long>(total >> 20), static_cast<unsigned long long>(bytes >> 20),
+            g_disk_games.size());
+    if (total > bytes)
+        disk_evict(std::string{});
 }
 
 extern "C" bool nfs_is_path(const char *path)
