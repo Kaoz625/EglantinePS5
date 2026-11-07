@@ -445,6 +445,11 @@ int main(int argc, char** argv) {
         bool forwarded_session = false;
         if (!forwarded.rom.empty() && last_crash.report.empty()) {
             std::string path = Eden::ResolveForwardedRom(forwarded.rom, Eden::AssetsPath("roms"));
+            // A game on an NFS share (Blazing Shelf: --rom /nfs/<host>/<share>/<game>): mount the shares first.
+            if (path.rfind("/nfs/", 0) == 0) {
+                MountNfsSharesNow();
+                Eden::BootTrace::Line("forwarded game on a share: shares mounted");
+            }
             if (const auto main = Eden::ExtractedGameMain(path); !main.empty()) path = main;
             if (!path.empty() && Eden::FileExists(path)) forwarded_game = path;
             else launch_error = "Forwarded game not found: " + (path.empty() ? forwarded.rom : path);

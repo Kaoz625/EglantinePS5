@@ -931,6 +931,14 @@ static void StartNfs() {
     nfs_mount_begin(8000);
 }
 
+// A game started by its path (--rom /nfs/<host>/<share>/..., Blazing Shelf): the shares of config/nfs.txt are
+// mounted now, before the launcher would mount them, so the path can be found and opened. Waits at most 20 s.
+void MountNfsSharesNow() {
+    StartNfs();
+    for (int waited = 0; (waited < 5 || nfs_mount_running()) && waited < 200; ++waited)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+}
+
 static std::vector<std::string> NfsGames(const std::set<std::string>& local) {
     for (int waited = 0; nfs_mount_running() && waited < 300; ++waited)
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
