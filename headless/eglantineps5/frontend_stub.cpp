@@ -8,3 +8,5 @@ std::string SelectEglantinePS5Game(const std::string&) {
     Eden::Report("menu", "This build has no launcher (it needs the PS5 OpenGL SDK)");
     return {};
 }
+
+void MountNfsSharesNow() {}
