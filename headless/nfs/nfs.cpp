@@ -324,17 +324,73 @@ bool disk_get(File *f, uint64_t number, size_t want, Block &b)
     return true;
 }
 
+// Writing a fetched block to the drive (mkdir, create, 512 KB write, close, rename) ran on the game's read path and
+// cost tens of ms a block on the PS5's drive: Hyrule Warriors' loader waited 3-4.5 s of every 5 s on reads (7 Nov).
+// disk_put now hands a copy to one writer thread; past 64 MB waiting, a block is simply not cached.
+std::atomic<uint64_t> g_disk_put_ns{0}, g_disk_put_dropped{0};
+void disk_put_now(const std::string &key, uint64_t number, const uint8_t *data, size_t len);
+
+struct DiskJob
+{
+    std::string key;
+    uint64_t number;
+    std::vector<uint8_t> bytes;
+};
+std::mutex g_disk_q_mutex;
+std::condition_variable g_disk_q_cv;
+std::vector<DiskJob> g_disk_q;
+size_t g_disk_q_bytes = 0;
+bool g_disk_writer_started = false;
+constexpr size_t kDiskQueueCap = 64u << 20;
+
+void disk_writer()
+{
+    for (;;)
+    {
+        DiskJob job;
+        {
+            std::unique_lock<std::mutex> lk(g_disk_q_mutex);
+            g_disk_q_cv.wait(lk, [] { return !g_disk_q.empty(); });
+            job = std::move(g_disk_q.front());
+            g_disk_q.erase(g_disk_q.begin());
+            g_disk_q_bytes -= job.bytes.size();
+        }
+        const auto start = std::chrono::steady_clock::now();
+        disk_put_now(job.key, job.number, job.bytes.data(), job.bytes.size());
+        g_disk_put_ns += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    }
+}
+
 void disk_put(File *f, uint64_t number, const Block &b)
 {
     if (!g_disk_on || f->disk_key.empty() || !b.data)
         return;
-    const std::string dir = g_disk_dir + "/" + f->disk_key;
+    std::lock_guard<std::mutex> lk(g_disk_q_mutex);
+    if (g_disk_q_bytes + b.len > kDiskQueueCap)
+    {
+        ++g_disk_put_dropped;
+        return;
+    }
+    if (!g_disk_writer_started)
+    {
+        std::thread(disk_writer).detach();
+        g_disk_writer_started = true;
+    }
+    g_disk_q.push_back(DiskJob{f->disk_key, number, std::vector<uint8_t>(b.data, b.data + b.len)});
+    g_disk_q_bytes += b.len;
+    g_disk_q_cv.notify_one();
+}
+
+void disk_put_now(const std::string &disk_key, uint64_t number, const uint8_t *data, size_t len)
+{
+    const std::string dir = g_disk_dir + "/" + disk_key;
     mkdir(dir.c_str(), 0777);
-    const std::string path = disk_block_path(f->disk_key, number), staged = path + ".tmp";
+    const std::string path = disk_block_path(disk_key, number), staged = path + ".tmp";
     FILE *out = __real_fopen(staged.c_str(), "wb");
     if (!out)
         return;
-    const bool ok = fwrite(b.data, 1, b.len, out) == b.len;
+    const bool ok = fwrite(data, 1, len, out) == len;
     if (__real_fclose(out) != 0 || !ok || rename(staged.c_str(), path.c_str()) != 0)
     {
         unlink(staged.c_str());
@@ -344,14 +400,14 @@ void disk_put(File *f, uint64_t number, const Block &b)
     bool over;
     {
         std::lock_guard<std::mutex> g(g_disk_mutex);
-        DiskGame &game = g_disk_games[f->disk_key];
-        game.bytes += b.len;
+        DiskGame &game = g_disk_games[disk_key];
+        game.bytes += len;
         game.used = wall_s();
-        g_disk_total += b.len;
+        g_disk_total += len;
         over = g_disk_total > g_disk_budget;
     }
     if (over)
-        disk_evict(f->disk_key);
+        disk_evict(disk_key);
 }
 
 // `n` bytes from `offset` of block `number`, read straight from its file in the disk cache: no 512 KB copy and no
@@ -844,6 +900,9 @@ void watch_reads()
                             static uint64_t last_ns = 0, last_n = 0;
                             const uint64_t ns = g_asked_ns.load(), cnt = g_n_asked.load();
                             const uint64_t dn = cnt - last_n, dns = ns - last_ns;
+                            nfs_log("drive writes: %llu ms in all off the game's path, %llu blocks skipped (queue full)",
+                                    static_cast<unsigned long long>(g_disk_put_ns.load() / 1000000),
+                                    static_cast<unsigned long long>(g_disk_put_dropped.load()));
                             nfs_log("read time: %llu ms in the game's last %llu reads (avg %.1f ms, longest so far %llu ms)",
                                     static_cast<unsigned long long>(dns / 1000000), static_cast<unsigned long long>(dn),
                                     dn ? dns / 1e6 / dn : 0.0, static_cast<unsigned long long>(g_asked_max_ns.exchange(0) / 1000000));
