@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include <array>
 #include "devices.h"
 #include <algorithm>
 #include <cmath>
@@ -248,12 +249,25 @@ bool Pad::Poll() {
         }
         const int count = scePadRead(handle, samples.data(), samples.size());
         if (player == 0) last_result = count;
+        // A Remote Play controller that drops and comes back is a new pad: the old handle only fails from
+        // then on and the game sat paused with no input (Hyrule Warriors on DIGI5, 7 Nov). After about a
+        // second of failed reads, open the user's pad again.
+        static std::array<int, kMaxPlayers> failed_reads{};
         if (count < 0 || count > static_cast<int>(samples.size())) {
             ++read_errors;
             const auto neutral = ps5::pad::neutral_data();
             Consume(player, {&neutral, 1});
+            if (count < 0 && ++failed_reads[player] >= 60) {
+                failed_reads[player] = 0;
+                const int user = slots[player].user;
+                LOG_INFO(Input, "EDEN_PAD_REOPEN player={} user={} after result={:#x}", player + 1, user,
+                         static_cast<unsigned>(count));
+                CloseSlot(player);
+                OpenSlot(player, user);
+            }
             continue;
         }
+        failed_reads[player] = 0;
         for (int i = 0; i < count; ++i) {
             ++samples_read;
             usable_samples += ps5::pad::is_usable(samples[i]);
