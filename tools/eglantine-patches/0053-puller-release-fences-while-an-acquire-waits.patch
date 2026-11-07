@@ -40,7 +40,7 @@ index e1c2ef4fd..5b428e139 100644
 +    if (const auto now = std::chrono::steady_clock::now();
 +        delayed && now - pending_acquire->last_fences >= std::chrono::milliseconds{1}) {
 +        pending_acquire->last_fences = now;
-+        ReleaseFences(dma_pusher);
++        ReleaseFencesOnBack(dma_pusher); // upstream ReleaseFences(); our 0049 names it ReleaseFencesOnBack
 +        if (Nx2SemaphoreWaiters::Get().Latched(this) ||
 +            pending_acquire->Matches(ReadSemaphoreWord(dma_pusher, pending_acquire->address))) {
 +            return true;
