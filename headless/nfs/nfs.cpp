@@ -146,6 +146,10 @@ struct Cache
     std::map<uint64_t, Block> blocks; // by block number
     size_t bytes = 0;
     uint64_t want = 0; // the block the game is at: it is read first, and the ones after it
+    // How far ahead to read, in blocks: it doubles while the game reads block after block and falls back to
+    // kWindowLeast when it jumps (Star Fox reads one 14 GB archive here and there: reading ~112 MB ahead of every
+    // jump made it read 16 GB in 15 minutes at "98%", 6 Nov).
+    uint64_t window = 2;
     bool stop = false, failed = false, worker_on = false;
     std::thread worker;
 };
@@ -796,6 +800,19 @@ size_t cache_cap()
     return std::max<size_t>(kCacheTotal / static_cast<size_t>(n), kCacheLeast);
 }
 
+constexpr uint64_t kWindowLeast = 2; // blocks read ahead after a jump (1 MB)
+
+// The game is at `number` now (called with c->m): a step to the next block (or the same) widens the read-ahead, a jump
+// narrows it again.
+void note_position(Cache *c, uint64_t number)
+{
+    if (number == c->want || number == c->want + 1)
+        c->window = std::min<uint64_t>(c->window * 2, 1u << 16);
+    else
+        c->window = kWindowLeast;
+    c->want = number;
+}
+
 // The thread of a big file: the block the game wants first, then the ones after it, as far as its share of memory goes.
 void read_ahead(File *f)
 {
@@ -806,7 +823,8 @@ void read_ahead(File *f)
     {
         const uint64_t at = c->want;
         const size_t cap = cache_cap();
-        const uint64_t ahead = (cap / kBlock) * 7 / 8; // what would be dropped at once is not read
+        // What would be dropped at once is not read, and no further than the game's reading pattern asks for.
+        const uint64_t ahead = std::min<uint64_t>((cap / kBlock) * 7 / 8, c->window + 1);
         uint64_t target = ~0ull;
         if (!c->blocks.count(at) && at < blocks)
             target = at;
@@ -861,14 +879,15 @@ size_t block_bytes(File *f, uint64_t number, size_t offset, uint8_t *dst, size_t
             memcpy(dst, b.data + offset, take);
             if (c->want != number)
             {
-                c->want = number;
+                note_position(c, number);
                 c->cv.notify_all();
             }
             return take;
         }
         if (f->share->dead || c->failed)
             return 0;
-        c->want = number;
+        if (c->want != number)
+            note_position(c, number);
         if (!c->worker_on && f->size > kReadAhead && !c->stop)
         {
             c->worker_on = true;
