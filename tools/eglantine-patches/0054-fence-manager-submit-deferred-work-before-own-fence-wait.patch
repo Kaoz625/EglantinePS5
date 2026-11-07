@@ -1,0 +1,79 @@
+From 1b594aa6b69b7d3facbd0d2c3b5c8eebb7144ba5 Mon Sep 17 00:00:00 2001
+From: kraibse <33869366+kraibse@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 16:02:57 +0100
+Subject: [PATCH] fence_manager: submit deferred work before waiting on our own
+ fence
+
+With Balanced GPU fences Ocarina of Time froze loading a save (0 fps):
+the fencing thread waited forever for a tick ("Waited N s for the GPU
+thread to submit tick ...").
+
+The puller's fence acquire and syncpoint waits run ReleaseFences on the
+GPU split's back: WaitPendingFences(true) signals a fence and blocks until
+the fencing thread has run its callback. With delayed fence operations
+(Balanced, Accurate, or accurate GPU) the callback waits for the fence's
+tick, but the back deferred that tick's submission (DeferFlush) to its
+idle hook, which it never reached while blocked. With Default fences the
+callback ran inside SignalFence, so the wait never blocked.
+
+The waiter now submits deferred work before it blocks. Balanced fences
+load the save and run; fence behaviour Default is unchanged.
+
+Assisted-by: Claude
+---
+ src/video_core/fence_manager.h                      | 5 +++++
+ src/video_core/renderer_vulkan/vk_fence_manager.cpp | 4 ++++
+ src/video_core/renderer_vulkan/vk_fence_manager.h   | 1 +
+ 3 files changed, 10 insertions(+)
+
+diff --git a/src/video_core/fence_manager.h b/src/video_core/fence_manager.h
+index d9f0ac283..068ecbfbf 100644
+--- a/src/video_core/fence_manager.h
++++ b/src/video_core/fence_manager.h
+@@ -152,6 +152,9 @@ public:
+                 wait_cv.notify_all();
+             });
+             SignalFence(std::move(func));
++            // With delayed fence operations the callback waits for this fence's tick, whose
++            // submission may be deferred to the waiting thread itself (the GPU split's back).
++            SubmitDeferred();
+             std::unique_lock lk(wait_mutex);
+             wait_cv.wait(
+                 lk, [&wait_finished] { return wait_finished.load(std::memory_order_relaxed); });
+@@ -187,6 +190,8 @@ protected:
+     virtual bool IsFenceSignaled(TFence& fence) const = 0;
+     /// Waits until a fence has been signalled by the host GPU.
+     virtual void WaitFence(TFence& fence) = 0;
++    /// Submits command work whose submission was deferred (Vulkan: Scheduler::DeferFlush).
++    virtual void SubmitDeferred() {}
+ 
+     VideoCore::RasterizerInterface& rasterizer;
+     Tegra::GPU& gpu;
+diff --git a/src/video_core/renderer_vulkan/vk_fence_manager.cpp b/src/video_core/renderer_vulkan/vk_fence_manager.cpp
+index b22bc32e9..10083ae8d 100644
+--- a/src/video_core/renderer_vulkan/vk_fence_manager.cpp
++++ b/src/video_core/renderer_vulkan/vk_fence_manager.cpp
+@@ -74,4 +74,8 @@ void FenceManager::WaitFence(Fence& fence) {
+     fence->Wait();
+ }
+ 
++void FenceManager::SubmitDeferred() {
++    scheduler.FlushDeferred();
++}
++
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_fence_manager.h b/src/video_core/renderer_vulkan/vk_fence_manager.h
+index 336573574..0a2ef5fdf 100644
+--- a/src/video_core/renderer_vulkan/vk_fence_manager.h
++++ b/src/video_core/renderer_vulkan/vk_fence_manager.h
+@@ -62,6 +62,7 @@ protected:
+     void QueueFence(Fence& fence) override;
+     bool IsFenceSignaled(Fence& fence) const override;
+     void WaitFence(Fence& fence) override;
++    void SubmitDeferred() override;
+ 
+ private:
+     Scheduler& scheduler;
+-- 
+2.54.0 (Apple Git-157)
+

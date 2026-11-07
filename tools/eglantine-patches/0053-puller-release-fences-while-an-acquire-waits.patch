@@ -1,0 +1,74 @@
+From 90ff431884ddb875882ed084f4e76538bfb2df68 Mon Sep 17 00:00:00 2001
+From: kraibse <33869366+kraibse@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 16:14:48 +0100
+Subject: [PATCH] puller: release fences again while an acquire waits with
+ delayed fence operations
+
+With Balanced GPU fences Ocarina of Time froze after a while: channel 2
+waited on a semaphore 0x13 releases behind ("waits on semaphore ...
+(0xdc19, now 0xdc06)") and no channel moved again.
+
+A semaphore release is a payload query, which delayed fence operations
+(Balanced or Accurate fences, accurate GPU) keep in the query cache until
+the next fence. An acquire releases the fences once and then suspends the
+channel, and the recheck only read the semaphore: a release queued after
+that waited for a fence nobody made, with every channel suspended. The
+recheck now releases the fences again, at most once a millisecond, while
+operations are delayed. Default fences are unchanged.
+
+Assisted-by: Claude
+---
+ src/video_core/engines/puller.cpp | 17 +++++++++++++++++
+ src/video_core/engines/puller.h   |  1 +
+ 2 files changed, 18 insertions(+)
+
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+index e1c2ef4fd..5b428e139 100644
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -103,6 +103,22 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
+     if (pending_acquire->Matches(current)) {
+         return true;
+     }
++    // With delayed fence operations (Balanced or Accurate fences, accurate GPU), a release
++    // queued after the acquire released the fences waits in the caches for the next fence. With
++    // every channel waiting none comes: release them again now and then while waiting.
++    const bool delayed = Settings::IsGPUFenceBehaviorDefault()
++                             ? Settings::IsGPULevelHigh()
++                             : Settings::IsGPUFenceBehaviorBalanced() ||
++                                   Settings::IsGPUFenceBehaviorAccurate();
++    if (const auto now = std::chrono::steady_clock::now();
++        delayed && now - pending_acquire->last_fences >= std::chrono::milliseconds{1}) {
++        pending_acquire->last_fences = now;
++        ReleaseFences(dma_pusher);
++        if (Nx2SemaphoreWaiters::Get().Latched(this) ||
++            pending_acquire->Matches(ReadSemaphoreWord(dma_pusher, pending_acquire->address))) {
++            return true;
++        }
++    }
+     if (!pending_acquire->reported &&
+         std::chrono::steady_clock::now() - pending_acquire->since > std::chrono::seconds{2}) {
+         pending_acquire->reported = true;
+@@ -251,6 +267,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+             .value = regs.semaphore_sequence,
+             .operation = static_cast<u32>(op),
+             .since = std::chrono::steady_clock::now(),
++            .last_fences = std::chrono::steady_clock::now(),
+             .reported = false,
+         };
+         if (op != GpuSemaphoreOperation::AcquireEqual && op != GpuSemaphoreOperation::AcquireGequal &&
+diff --git a/src/video_core/engines/puller.h b/src/video_core/engines/puller.h
+index 2b9e2c5df..a8d96c278 100644
+--- a/src/video_core/engines/puller.h
++++ b/src/video_core/engines/puller.h
+@@ -78,6 +78,7 @@ public:
+         u32 value;
+         u32 operation;
+         std::chrono::steady_clock::time_point since;
++        std::chrono::steady_clock::time_point last_fences; ///< When it last released fences
+         bool reported;
+ 
+         [[nodiscard]] bool Matches(u32 current) const;
+-- 
+2.54.0 (Apple Git-157)
+
