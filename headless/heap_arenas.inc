@@ -73,9 +73,13 @@
 /* Every arena, with those made because a thread's were full: at most 2 GiB of the heap's 6 GiB. An
  * arena stays with its thread's record when its blocks are freed (the next thread on the record
  * uses it), so this is also the most the heap keeps for small blocks alone. */
-#define EDEN_HEAP_MAX_ARENAS 1024u
+/* 7 Nov: 1024 let Hyrule Warriors' loading make 421 arenas (842 MiB). They emptied when the loading
+ * ended but stay with their threads, and each pins the 32 MiB piece it sits in: the heap held 3.3 GB
+ * for 1.1 GB in use, and the first battle ran the console out. 192 (384 MiB) now. */
+#define EDEN_HEAP_MAX_ARENAS 192u
 /* One thread's arenas: at most 256 MiB of small blocks before they go to the heap's spaces. */
-#define EDEN_HEAP_THREAD_ARENAS 128u
+/* 16 (32 MiB): a thread past it spills to the heap's spaces, which can be given back (was 128). */
+#define EDEN_HEAP_THREAD_ARENAS 16u
 /* A request this large or larger that finds no room in the thread's arenas makes no new one. */
 #define EDEN_HEAP_ARENA_GROW_REQUEST (64u * 1024u)
 /* After a thread found all its arenas full and could make no other, the requests it makes before
