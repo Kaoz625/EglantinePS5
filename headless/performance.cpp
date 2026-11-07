@@ -386,6 +386,8 @@ extern "C" unsigned eden_heap_arenas_created(void) __attribute__((weak));
 extern "C" std::size_t eden_heap_committed(void) __attribute__((weak));
 extern "C" std::size_t eden_heap_large_held(unsigned* blocks) __attribute__((weak));
 extern "C" std::size_t eden_heap_trim(void) __attribute__((weak));
+extern "C" std::size_t eden_heap_cached_bytes(void) __attribute__((weak));
+extern "C" unsigned eden_heap_arenas_created(void) __attribute__((weak));
 extern "C" void eden_heap_sites_report(void) __attribute__((weak));
 extern "C" void eden_heap_usage(std::size_t* held, std::size_t* in_use, std::size_t* returned) __attribute__((weak));
 extern "C" unsigned eden_guest_memory_wanted(void) __attribute__((weak));
@@ -482,6 +484,13 @@ void ReportHeap(const char* why) {
     std::fprintf(stderr, "[EglantinePS5] heap: holds %zu MiB (%zu MiB of pieces, %zu MiB in %u large blocks), "
                          "%zu MiB of it in use; %zu MiB given back so far (%s)\n",
                  held >> 20, (held - large) >> 20, large >> 20, large_blocks, in_use >> 20, returned >> 20, why);
+    // Where held-but-unused memory sits: 2 MiB arenas (kept for their threads) and the threads'
+    // caches of freed small blocks.
+    if (eden_heap_arenas_created || eden_heap_cached_bytes)
+        std::fprintf(stderr, "[EglantinePS5] heap parts: %u arenas (%u MiB), %zu MiB of freed blocks in thread caches\n",
+                     eden_heap_arenas_created ? eden_heap_arenas_created() : 0u,
+                     eden_heap_arenas_created ? eden_heap_arenas_created() * 2u : 0u,
+                     eden_heap_cached_bytes ? eden_heap_cached_bytes() >> 20 : std::size_t{0});
     if (eden_heap_sites_report) eden_heap_sites_report();
 }
 

@@ -288,6 +288,21 @@ static void eden_heap_thread_exit(void *value) {
   atomic_store_explicit(&eden_heap_thread_used[self - eden_heap_threads], 0, memory_order_release);
 }
 
+/* Freed small blocks the threads keep in their caches (counted out of `in use`, still held), from
+ * the bin counts: a block in bin b is 16 * b to 16 * b + 15 bytes, so this is a floor. Read without
+ * the threads' locks: a measurement for the heap line (7 Nov: Hyrule Warriors' heap held 3.3 GB
+ * with 1.6 GB in use when the console ran out). */
+size_t eden_heap_cached_bytes(void) {
+  size_t bytes = 0;
+  for (unsigned t = 0; t < EDEN_HEAP_THREADS; ++t) {
+    if (!atomic_load_explicit(&eden_heap_thread_used[t], memory_order_relaxed))
+      continue;
+    for (unsigned bin = 0; bin < EDEN_TCACHE_BINS; ++bin)
+      bytes += (size_t)eden_heap_threads[t].counts[bin] * 16u * bin;
+  }
+  return bytes;
+}
+
 unsigned eden_heap_arenas_created(void) {
   return atomic_load_explicit(&eden_heap_arena_count, memory_order_relaxed);
 }
