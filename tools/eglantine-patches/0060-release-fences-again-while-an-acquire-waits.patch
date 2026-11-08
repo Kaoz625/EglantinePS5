@@ -1,29 +1,5 @@
-From 90ff431884ddb875882ed084f4e76538bfb2df68 Mon Sep 17 00:00:00 2001
-From: kraibse <33869366+kraibse@users.noreply.github.com>
-Date: Thu, 5 Nov 2026 16:14:48 +0100
-Subject: [PATCH] puller: release fences again while an acquire waits with
- delayed fence operations
-
-With Balanced GPU fences Ocarina of Time froze after a while: channel 2
-waited on a semaphore 0x13 releases behind ("waits on semaphore ...
-(0xdc19, now 0xdc06)") and no channel moved again.
-
-A semaphore release is a payload query, which delayed fence operations
-(Balanced or Accurate fences, accurate GPU) keep in the query cache until
-the next fence. An acquire releases the fences once and then suspends the
-channel, and the recheck only read the semaphore: a release queued after
-that waited for a fence nobody made, with every channel suspended. The
-recheck now releases the fences again, at most once a millisecond, while
-operations are delayed. Default fences are unchanged.
-
-Assisted-by: Claude
----
- src/video_core/engines/puller.cpp | 17 +++++++++++++++++
- src/video_core/engines/puller.h   |  1 +
- 2 files changed, 18 insertions(+)
-
 diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
-index e1c2ef4fd..5b428e139 100644
+index 4f2c4ee3c0..6da774c369 100644
 --- a/src/video_core/engines/puller.cpp
 +++ b/src/video_core/engines/puller.cpp
 @@ -103,6 +103,22 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
@@ -40,7 +16,7 @@ index e1c2ef4fd..5b428e139 100644
 +    if (const auto now = std::chrono::steady_clock::now();
 +        delayed && now - pending_acquire->last_fences >= std::chrono::milliseconds{1}) {
 +        pending_acquire->last_fences = now;
-+        ReleaseFencesOnBack(dma_pusher); // upstream ReleaseFences(); our 0049 names it ReleaseFencesOnBack
++        ReleaseFencesOnBack(dma_pusher);
 +        if (Nx2SemaphoreWaiters::Get().Latched(this) ||
 +            pending_acquire->Matches(ReadSemaphoreWord(dma_pusher, pending_acquire->address))) {
 +            return true;
@@ -58,7 +34,7 @@ index e1c2ef4fd..5b428e139 100644
          };
          if (op != GpuSemaphoreOperation::AcquireEqual && op != GpuSemaphoreOperation::AcquireGequal &&
 diff --git a/src/video_core/engines/puller.h b/src/video_core/engines/puller.h
-index 2b9e2c5df..a8d96c278 100644
+index 2b9e2c5df3..a8d96c2788 100644
 --- a/src/video_core/engines/puller.h
 +++ b/src/video_core/engines/puller.h
 @@ -78,6 +78,7 @@ public:
@@ -69,6 +45,3 @@ index 2b9e2c5df..a8d96c278 100644
          bool reported;
  
          [[nodiscard]] bool Matches(u32 current) const;
--- 
-2.54.0 (Apple Git-157)
-

@@ -390,6 +390,8 @@ extern "C" std::size_t eden_heap_cached_bytes(void) __attribute__((weak));
 extern "C" unsigned eden_heap_arenas_created(void) __attribute__((weak));
 extern "C" void eden_heap_sites_report(void) __attribute__((weak));
 extern "C" void eden_heap_usage(std::size_t* held, std::size_t* in_use, std::size_t* returned) __attribute__((weak));
+extern "C" void eden_heap_page_usage(std::size_t* free_pages, std::size_t* idle_arenas, std::size_t* live)
+    __attribute__((weak));
 extern "C" unsigned eden_guest_memory_wanted(void) __attribute__((weak));
 extern "C" void eden_guest_memory_reserve(std::size_t* held, std::size_t* target) __attribute__((weak));
 #ifdef PS5_NATIVE
@@ -491,6 +493,14 @@ void ReportHeap(const char* why) {
                      eden_heap_arenas_created ? eden_heap_arenas_created() : 0u,
                      eden_heap_arenas_created ? eden_heap_arenas_created() * 2u : 0u,
                      eden_heap_cached_bytes ? eden_heap_cached_bytes() >> 20 : std::size_t{0});
+    // What a heap that gives whole free 2 MiB pages back could return now (heap_arenas.inc).
+    if (eden_heap_page_usage) {
+        std::size_t free_pages = 0, idle_arenas = 0, live = 0;
+        eden_heap_page_usage(&free_pages, &idle_arenas, &live);
+        std::fprintf(stderr, "EDEN_HEAP_PAGES %zu MiB of the pieces are whole 2 MiB pages with no block in use "
+                             "(%zu MiB of them idle arenas); the blocks in use hold %zu MiB\n",
+                     free_pages >> 20, idle_arenas >> 20, live >> 20);
+    }
     if (eden_heap_sites_report) eden_heap_sites_report();
 }
 
