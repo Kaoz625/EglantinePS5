@@ -1,0 +1,27 @@
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+index 36f418c7..9bec2470 100644
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -119,6 +119,22 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
+             return true;
+         }
+     }
++    // An AcquireEqual whose value the semaphore already went past: a channel the emulator ran
++    // ahead released it and more, before this one began to wait (no latch was set for it), so it
++    // would wait forever. Ocarina of Time (Switch 2), DIGI5 8 Nov 2026: three channels waited on
++    // 0x4cc with the word at 0x4f0 and the frame never came. After 200 ms with the word a little
++    // past the value (wrapping), take the acquire as met.
++    if (static_cast<GpuSemaphoreOperation>(pending_acquire->operation) ==
++            GpuSemaphoreOperation::AcquireEqual &&
++        static_cast<u32>(current - pending_acquire->value) - 1U < 0x10000U &&
++        std::chrono::steady_clock::now() - pending_acquire->since > std::chrono::milliseconds{200}) {
++        if (static std::atomic<u32> passed{}; passed.fetch_add(1) < 64) {
++            LOG_WARNING(HW_GPU, "Channel {} took semaphore {:#x} value {:#x} as met: the word went past it to {:#x}",
++                        dma_pusher.channel_state.bind_id, pending_acquire->address,
++                        pending_acquire->value, current);
++        }
++        return true;
++    }
+     if (!pending_acquire->reported &&
+         std::chrono::steady_clock::now() - pending_acquire->since > std::chrono::seconds{2}) {
+         pending_acquire->reported = true;
