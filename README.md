@@ -38,6 +38,8 @@ Current core pin: **Eglantine `0ca2032`** (`nx2`, `build-219` + 35 commits, 2026
 | Item | State |
 |---|---|
 | Console tested | PS5 firmware **13.60**, jailbroken, launched with ShadowMountPlus; other users run it on **11.40** and **11.60**. |
+| v1.219.028 | Built 2026-11-08 from v1.219.020 (same core) with one fix: memory given back to the system is reserved in one step (a race that crashed an experimental build). |
+| Memory and CPU experiments (builds 021-027, not released) | Swapping the game's memory to the SSD and mimalloc as the app heap did not help; drawing task and mesh shaders through compute did. Measurements and conclusions: [docs/MEMORY-CPU-EXPERIMENTS.md](docs/MEMORY-CPU-EXPERIMENTS.md). |
 | Donkey Kong Bananza (Switch 2, `.nup` with update 3.2.0 + DLC) | Runs on the current build (core `3081c8e`) with its update and DLC: **Docked, 1x resolution, 10-25 fps depending on the zone, about 15 in large open areas, 30 fps in cutscenes**. A new zone can show purple the first time it is entered; in one test the game's own "reset terrain" option cleared it. |
 | Handheld mode, 0.5x resolution | Not yet confirmed. Earlier failures were caused by a stale shader cache (see below), so they have to be retested. |
 | Update and DLC inside a NUP | Both load, and the Library shows them. Checked with Bananza: the game mounts its DLC (log: `NUP add-on 040074A01BF13001 mounted`) and its DLC menu shows 3.2.0 and DLC 1.0.0. The DLC's levels have not been played through yet. |
@@ -51,6 +53,11 @@ Current core pin: **Eglantine `0ca2032`** (`nx2`, `build-219` + 35 commits, 2026
 ### Known issue that is fixed here: "stuck at 98% on every launch after the first"
 
 On the console, the Vulkan driver hung a Switch 2 game when it started from the pipeline cache saved by an earlier run. This build neither loads nor saves that global cache (`tools/eglantine-patches/0010-…`); per-game caches still work. If you ever see a hang at 98%, delete `/data/eglantineps5/user/cache/shader/` and tell us (attach `eden_log.txt`).
+
+## Changes in v1.219.028
+
+- **Memory given back in one step** (`src/memory_pages.cpp`, `src/host_memory.cpp`): memory went back to the system by unmapping its range and then reserving the range again. In between, a mapping the system placed there (the zeroing view of the game's memory reserve) could be overwritten by the reservation, and the app crashed in `FillReserve`. Now a fixed reservation replaces the mapping in one call (`ReserveOver`). This build gives memory back rarely, so the crash was seen only in an experimental build that did it often.
+- **Measurements and conclusions of the memory and CPU experiments** (builds 021-027, never released): [docs/MEMORY-CPU-EXPERIMENTS.md](docs/MEMORY-CPU-EXPERIMENTS.md). Their code is on branch `experiment/memoria-cpu`.
 
 ## Install
 
@@ -197,6 +204,8 @@ A game can have its own values: in its settings, **Performance** (see [Settings 
 | Punto | Estado |
 |---|---|
 | Probado en consola | PS5 con firmware **13.60**, con jailbreak y ShadowMountPlus; otros usuarios la usan en **11.40** y **11.60**. |
+| v1.219.028 | Compilada el 8-11-2026 a partir de la v1.219.020 (mismo core) con un arreglo: la memoria que se devuelve al sistema queda reservada en un solo paso (una carrera que cerraba una build experimental). |
+| Pruebas de memoria y CPU (builds 021-027, no publicadas) | Llevar la memoria del juego al SSD y mimalloc como heap de la app no ayudaron; dibujar los task y mesh shaders con compute sí. Mediciones y conclusiones (en inglés, con resumen en español): [docs/MEMORY-CPU-EXPERIMENTS.md](docs/MEMORY-CPU-EXPERIMENTS.md). |
 | Donkey Kong Bananza (Switch 2, `.nup` con update 3.2.0 + DLC) | Funciona con la build actual (core `3081c8e`) con su update y su DLC: **modo TV, resolución 1x, 10-25 fps según la zona, unos 15 en zonas abiertas grandes, 30 fps en cinemáticas**. Una zona nueva puede verse morada la primera vez que se entra; en una prueba, la opción del juego «resetear terreno» lo arregló. |
 | Modo portátil, resolución 0,5x | Sin confirmar. Los fallos anteriores venían de una caché de shaders antigua (ver abajo), así que hay que repetir la prueba. |
 | Update y DLC dentro de un NUP | Se cargan los dos y la biblioteca los muestra. Comprobado con Bananza: el juego monta su DLC (log: `NUP add-on 040074A01BF13001 mounted`) y su menú de DLC muestra 3.2.0 y DLC 1.0.0. Los niveles del DLC aún no se han jugado a fondo. |
