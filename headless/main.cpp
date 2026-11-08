@@ -516,12 +516,17 @@ int main(int argc, char** argv) {
         {
             // Development: env.txt in the app folder sets core switches (NAME=VALUE per line,
             // e.g. EDEN_NX2_GPU_PROFILE=1) before the core reads them. Absent in a release.
-            std::ifstream environment(Eden::AppFile("env.txt"));
-            for (std::string entry; std::getline(environment, entry);) {
-                const auto split = entry.find('=');
-                if (entry.empty() || entry[0] == '#' || split == std::string::npos || split == 0) continue;
-                setenv(entry.substr(0, split).c_str(), entry.c_str() + split + 1, 1);
-                std::printf("EDEN_ENV %s\n", entry.c_str());
+            // Also /data/eglantineps5/env.txt: the running app's /app0 does not show files added
+            // to its install folder after it was mounted.
+            for (const std::string path : {Eden::AppFile("env.txt"), std::string{Eden::kDataDir} + "/env.txt"}) {
+                std::ifstream environment(path);
+                for (std::string entry; std::getline(environment, entry);) {
+                    if (!entry.empty() && entry.back() == '\r') entry.pop_back();
+                    const auto split = entry.find('=');
+                    if (entry.empty() || entry[0] == '#' || split == std::string::npos || split == 0) continue;
+                    setenv(entry.substr(0, split).c_str(), entry.c_str() + split + 1, 1);
+                    std::fprintf(stderr, "EDEN_ENV %s (%s)\n", entry.c_str(), path.c_str());
+                }
             }
         }
         // The console's defaults for the core's switches (env.txt above wins). Without a fastmem
