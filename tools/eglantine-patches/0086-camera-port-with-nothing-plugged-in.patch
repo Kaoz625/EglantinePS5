@@ -1,0 +1,56 @@
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+index 504441d8..6441335a 100644
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -1574,11 +1574,21 @@ class INx2CameraSession final : public ServiceFramework<INx2CameraSession> {
+ public:
+     explicit INx2CameraSession(Core::System& system_)
+         : ServiceFramework{system_, "nx2:camera"}, m_context{system_, "nx2:camera"} {
++        // A console whose camera port has nothing plugged in (seedds/nxnative services.md, "The
++        // camera commands of SDK 21's own camera module"): 3 and 4 succeed, 21 gives an event that
++        // never fires, every other command answers 2452-0003 (0x7c4, no camera connected). Star
++        // Fox ships its own camera module (subsdk3): answered success to 29 it went on to 25/28/4
++        // and then wrote through a null object; Mario Kart World tolerates 2452-0003 from 29.
+         RegisterHandlers({
+             {3, &INx2CameraSession::OpenCamera, "OpenCamera"},
++            {4, &INx2CameraSession::Succeed, "Command4"},
+             {21, &INx2CameraSession::GetCameraEvent, "GetCameraEvent"},
+             {29, &INx2CameraSession::CheckImagePreference, "CheckImagePreference"},
+         });
++        for (u32 command = 0; command < 64; ++command) {
++            if (command == 3 || command == 4 || command == 21 || command == 29) continue;
++            RegisterHandlers({{command, &INx2CameraSession::NotConnected, "NotConnected"}});
++        }
+         m_event = m_context.CreateEvent("nx2:camera:Event");
+     }
+ 
+@@ -1609,13 +1619,28 @@ private:
+     void CheckImagePreference(HLERequestContext& ctx) {
+         if (!m_logged_29) {
+             m_logged_29 = true;
+-            LOG_WARNING(Service, "(STUBBED) nx2:camera 29 [8]={:#x}, returning success",
++            LOG_WARNING(Service, "(STUBBED) nx2:camera 29 [8]={:#x}, returning no camera (2452-0003)",
+                         ctx.CommandBuffer()[8]);
+         }
+         IPC::ResponseBuilder rb{ctx, 2};
++        rb.Push(ResultNoCamera);
++    }
++
++    void Succeed(HLERequestContext& ctx) {
++        LOG_WARNING(Service, "(STUBBED) nx2:camera {}, returning success", ctx.GetCommand());
++        IPC::ResponseBuilder rb{ctx, 2};
+         rb.Push(ResultSuccess);
+     }
+ 
++    void NotConnected(HLERequestContext& ctx) {
++        LOG_WARNING(Service, "(STUBBED) nx2:camera {}, returning no camera (2452-0003)",
++                    ctx.GetCommand());
++        IPC::ResponseBuilder rb{ctx, 2};
++        rb.Push(ResultNoCamera);
++    }
++
++    static constexpr Result ResultNoCamera{static_cast<ErrorModule>(452), 3}; // 0x7c4
++
+     KernelHelpers::ServiceContext m_context;
+     Kernel::KEvent* m_event;
+     bool m_logged_29 = false;
