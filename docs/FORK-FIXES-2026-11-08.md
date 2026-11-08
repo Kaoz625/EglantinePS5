@@ -7,7 +7,7 @@ for fixes our build (viejunerd v1.219.028 + core 0ca2032 + patches) lacks. Statu
 | Patch | Source | Fix |
 |---|---|---|
 | 0085 | Lichii aa0acb3e #311, 2e69168a #432, 12fc47e8 #609, f99fb8ab #185, 57a6334e #444 | clear-skip coverage, NaN-defined min/max, dma_increment_once race, deferred clears before writes, multi-range buffer leak |
-| 0086 | nxnative services.md "camera commands of SDK 21's own camera module" | nx2:camera = empty camera port (Star Fox null object) |
+| (0086 dropped) | nxnative camera rule | reverted 8 Nov: Star Fox title ignored A with it; the null writes stayed, so the camera was not their cause |
 | 0087 | Swordpdf/ProsperoEden e34338dd | NaN pixel colour stored as 0 |
 
 ## Next (Lichii)
