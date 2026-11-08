@@ -518,7 +518,7 @@ int main(int argc, char** argv) {
             // e.g. EDEN_NX2_GPU_PROFILE=1) before the core reads them. Absent in a release.
             // Also /data/eglantineps5/env.txt: the running app's /app0 does not show files added
             // to its install folder after it was mounted.
-            for (const std::string path : {Eden::AppFile("env.txt"), std::string{Eden::kDataDir} + "/env.txt"}) {
+            for (const std::string& path : {Eden::AppFile("env.txt"), std::string{Eden::kDataDir} + "/env.txt"}) {
                 std::ifstream environment(path);
                 for (std::string entry; std::getline(environment, entry);) {
                     if (!entry.empty() && entry.back() == '\r') entry.pop_back();
