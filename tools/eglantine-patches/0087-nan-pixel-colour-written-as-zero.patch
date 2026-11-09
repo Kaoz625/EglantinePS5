@@ -1,5 +1,5 @@
 diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
-index 28f9869e..93863902 100644
+index 28f9869e22..938639022f 100644
 --- a/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
 +++ b/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
 @@ -491,7 +491,9 @@ void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, Id value) {

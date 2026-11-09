@@ -1,8 +1,8 @@
 diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
-index 7f97d06668..a3ea81f1e8 100644
+index aaa9424991..d92cbfba77 100644
 --- a/src/core/hle/service/nx2_gsv.h
 +++ b/src/core/hle/service/nx2_gsv.h
-@@ -1033,13 +1033,15 @@ private:
+@@ -1039,13 +1039,15 @@ private:
          return lazy;
      }
  

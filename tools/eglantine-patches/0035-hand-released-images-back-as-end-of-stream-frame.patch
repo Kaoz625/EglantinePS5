@@ -1,8 +1,8 @@
 diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
-index 1a0e88d7a7..d8fa5b0bbe 100644
+index 32c04f36ee..6951bbe368 100644
 --- a/src/core/hle/service/nx2_gsv.h
 +++ b/src/core/hle/service/nx2_gsv.h
-@@ -2504,6 +2504,7 @@ private:
+@@ -2612,6 +2612,7 @@ private:
          u32 height;
          u64 pts;
          bool end;
@@ -10,7 +10,7 @@ index 1a0e88d7a7..d8fa5b0bbe 100644
      };
      struct Fence {
          u32 syncpoint;
-@@ -2635,26 +2636,26 @@ private:
+@@ -2751,26 +2752,26 @@ private:
          u32 value;
          {
              std::scoped_lock lk{m_mutex};
@@ -55,7 +55,7 @@ index 1a0e88d7a7..d8fa5b0bbe 100644
                  value = m_sync_base + ++m_handed;
              }
          }
-@@ -2717,6 +2718,8 @@ private:
+@@ -2833,6 +2834,8 @@ private:
          {
              std::scoped_lock lk{m_mutex};
              m_inputs.clear();
@@ -63,11 +63,11 @@ index 1a0e88d7a7..d8fa5b0bbe 100644
 +            std::erase_if(m_outputs, [](const Output& output) { return output.after_end; });
              m_flush = true;
              m_stream_ended = false;
-             m_ready->room.store(true, std::memory_order_relaxed);
-@@ -2819,7 +2822,9 @@ private:
-                 const auto [width, height] = WriteImage(decoder.get(), image, frame, bytes);
-                 lk.lock();
-                 // Even an image written during a flush counts: the client waits for its value.
+             m_clock_offset.reset();
+@@ -3019,7 +3022,9 @@ private:
+                     MkwMovieActivity::IsLargeMovie(m_movie_program_id, frame.picture->width)) {
+                     m_objects->mkw_movie_activity.RecordFrame(std::chrono::steady_clock::now());
+                 }
 -                m_outputs.push_back({image, width, height, frame.pts, frame.end});
 +                m_outputs.push_back({image, width, height, frame.pts, frame.end, false});
 +                m_out_width = width;
@@ -75,12 +75,12 @@ index 1a0e88d7a7..d8fa5b0bbe 100644
                  if (frame.end) {
                      m_stream_ended = true;
                      m_ready->room.store(false, std::memory_order_relaxed);
-@@ -2991,6 +2996,8 @@ private:
-     std::string m_codec;
+@@ -3202,6 +3207,8 @@ private:
      u32 m_width{};
      u32 m_height{};
+     u64 m_movie_program_id{};
 +    u32 m_out_width{};  ///< Size of the last frame written
 +    u32 m_out_height{};
      u32 m_handed{}; ///< Output images handed out (registered or released) so far
      u64 m_frames_out{};
-     std::deque<Input> m_inputs;
+     u64 m_frames_dropped{};

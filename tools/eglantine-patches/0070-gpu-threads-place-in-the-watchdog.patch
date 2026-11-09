@@ -1,16 +1,16 @@
 diff --git a/src/core/core.cpp b/src/core/core.cpp
-index 927d225d62..3b5aa6e3fc 100644
+index 0196c5b4fa..d7982855b5 100644
 --- a/src/core/core.cpp
 +++ b/src/core/core.cpp
-@@ -72,6 +72,7 @@
- #include "hid_core/hid_core.h"
+@@ -74,6 +74,7 @@
  #include "network/network.h"
  #include "video_core/host1x/host1x.h"
+ #include "video_core/nx2_diag.h"
 +#include "video_core/nx2_profile.h"
  #include "video_core/renderer_base.h"
  #include "video_core/video_core.h"
  
-@@ -292,6 +293,11 @@ struct System::Impl {
+@@ -294,6 +295,11 @@ struct System::Impl {
                      }
                      auto processes = kernel.GetProcessList();
                      LOG_WARNING(Core, "guest threads t={}s processes={}", tick * 15, processes.size());

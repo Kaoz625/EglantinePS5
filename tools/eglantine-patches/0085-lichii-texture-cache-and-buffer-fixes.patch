@@ -1,5 +1,5 @@
 diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
-index 6c09843b..94b6c2d8 100644
+index 6c09843b15..94b6c2d821 100644
 --- a/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
 +++ b/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
 @@ -17,12 +17,10 @@ Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
@@ -43,10 +43,10 @@ index 6c09843b..94b6c2d8 100644
  
  Id EmitFPMul16(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
 diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
-index 2b8f2aaf..9979fbd2 100644
+index 8747261416..51c1f917e6 100644
 --- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
 +++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
-@@ -361,10 +361,10 @@ Id CasFunction(EmitContext& ctx, Operation operation, Id value_type) {
+@@ -366,10 +366,10 @@ Id CasFunction(EmitContext& ctx, Operation operation, Id value_type) {
          result = ctx.OpFAdd(value_type, op_a, op_b);
          break;
      case Operation::FPMin:
@@ -60,7 +60,7 @@ index 2b8f2aaf..9979fbd2 100644
      default:
          break;
 diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
-index e7c91f58..7dc04054 100644
+index b0c8b8c555..d2ac409365 100644
 --- a/src/video_core/dma_pusher.cpp
 +++ b/src/video_core/dma_pusher.cpp
 @@ -144,7 +144,7 @@ bool DmaPusher::Step() {
@@ -73,7 +73,7 @@ index e7c91f58..7dc04054 100644
          synced = false;
      }
 diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
-index 7b9320d3..f16c6783 100644
+index 7b9320d3b9..f16c678388 100644
 --- a/src/video_core/dma_pusher.h
 +++ b/src/video_core/dma_pusher.h
 @@ -292,10 +292,12 @@ public:
@@ -94,7 +94,7 @@ index 7b9320d3..f16c6783 100644
  
  } // namespace Tegra
 diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
-index 4963ae37..93f9c5bd 100644
+index 4963ae3764..93f9c5bdd8 100644
 --- a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
 +++ b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
 @@ -438,6 +438,7 @@ u32 BufferCacheRuntime::GetStorageBufferAlignment() const {
@@ -106,7 +106,7 @@ index 4963ae37..93f9c5bd 100644
          if (scheduler.IsFree(it->LastUsageTick())) {
              it->ResetUsageTracking();
 diff --git a/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp b/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp
-index 4d843900..536ed614 100644
+index 4d84390002..536ed61477 100644
 --- a/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp
 +++ b/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp
 @@ -206,6 +206,10 @@ void MultiRangeBufferCache::DrainRetired(Scheduler& scheduler) {
@@ -140,7 +140,7 @@ index 4d843900..536ed614 100644
      if (!entry.sparse_handle) {
          VkBufferUsageFlags flags = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
 diff --git a/src/video_core/renderer_vulkan/vk_multi_range_buffer.h b/src/video_core/renderer_vulkan/vk_multi_range_buffer.h
-index f40d3aa1..56eabbe7 100644
+index f40d3aa1f8..56eabbe75f 100644
 --- a/src/video_core/renderer_vulkan/vk_multi_range_buffer.h
 +++ b/src/video_core/renderer_vulkan/vk_multi_range_buffer.h
 @@ -59,6 +59,8 @@ public:
@@ -153,10 +153,10 @@ index f40d3aa1..56eabbe7 100644
      bool use_sparse{};
  
 diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
-index d747ad55..49493897 100644
+index 95e8a6f7cd..9a4ee79bc1 100644
 --- a/src/video_core/texture_cache/texture_cache.h
 +++ b/src/video_core/texture_cache/texture_cache.h
-@@ -1093,10 +1093,20 @@ template <class P>
+@@ -1126,10 +1126,20 @@ template <class P>
  bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
                                  const Tegra::Engines::Fermi2D::Surface& src,
                                  const Tegra::Engines::Fermi2D::Config& copy) {
@@ -177,7 +177,7 @@ index d747ad55..49493897 100644
      const BlitImages images = *result;
      const ImageId dst_id = images.dst_id;
      const ImageId src_id = images.src_id;
-@@ -2744,12 +2754,8 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+@@ -2777,12 +2787,8 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
          }
          const u32 width = new_info.size.width;
          const u32 height = new_info.size.height;
@@ -192,7 +192,7 @@ index d747ad55..49493897 100644
          }
          // The clear covers the framebuffer's render area, the smallest bound target.
          for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
-@@ -2767,9 +2773,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+@@ -2800,9 +2806,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
          const bool full_stencil = surface.S && regs.stencil_front_mask == 0xFF;
          switch (VideoCore::Surface::GetFormatType(new_info.format)) {
          case VideoCore::Surface::SurfaceType::ColorTexture: {
@@ -205,7 +205,7 @@ index d747ad55..49493897 100644
          }
          case VideoCore::Surface::SurfaceType::Depth:
              return is_depth_target && surface.Z;
-@@ -3018,6 +3026,11 @@ ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr)
+@@ -3051,6 +3059,11 @@ ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr)
  template <class P>
  std::pair<u32, u32> TextureCache<P>::PrepareDmaImage(ImageId dst_id, GPUVAddr base_addr,
                                                       bool mark_as_modified) {
@@ -217,7 +217,7 @@ index d747ad55..49493897 100644
      const auto& image = slot_images[dst_id];
      const auto base = image.TryFindBase(base_addr);
      PrepareImage(dst_id, mark_as_modified, false);
-@@ -3755,6 +3768,8 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
+@@ -3788,6 +3801,8 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
          // same guest data, which is uploaded from guest memory instead.
          return;
      }
@@ -226,7 +226,7 @@ index d747ad55..49493897 100644
      const bool is_rescaled = True(src.flags & ImageFlagBits::Rescaled);
      if (is_rescaled) {
          ASSERT(True(dst.flags & ImageFlagBits::Rescaled));
-@@ -3891,19 +3906,36 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
+@@ -3924,19 +3939,36 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
      const ImageViewBase& image_view = slot_image_views[id];
      const ImageBase& image = slot_images[image_view.image_id];
      const Extent3D size = image_view.size;
@@ -270,10 +270,10 @@ index d747ad55..49493897 100644
  
  template <class P>
 diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
-index ec981f3a..0f169706 100644
+index 6c5a75e904..346b1139a2 100644
 --- a/src/video_core/texture_cache/texture_cache_base.h
 +++ b/src/video_core/texture_cache/texture_cache_base.h
-@@ -506,6 +506,9 @@ private:
+@@ -513,6 +513,9 @@ private:
      /// Returns true if the current clear parameters clear the whole image of a given image view
      [[nodiscard]] bool IsFullClear(ImageViewId id);
  

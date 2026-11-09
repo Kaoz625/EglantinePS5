@@ -1,5 +1,5 @@
 diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
-index 26081a4c72..df3d3d79eb 100644
+index 8ac0a1bfa3..06b72d43e9 100644
 --- a/src/video_core/renderer_vulkan/vk_texture_cache.h
 +++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
 @@ -478,6 +478,18 @@ public:
@@ -22,10 +22,10 @@ index 26081a4c72..df3d3d79eb 100644
      /// levels in it) device memory where they have none yet. False if that failed.
      bool BindTiles(std::span<const VideoCommon::LevelRect> rects);
 diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
-index 1af960e1c6..768284775b 100644
+index 260c5edeab..b38d511924 100644
 --- a/src/video_core/texture_cache/texture_cache.h
 +++ b/src/video_core/texture_cache/texture_cache.h
-@@ -390,7 +390,7 @@ void TextureCache<P>::TickFrame() {
+@@ -399,7 +399,7 @@ void TextureCache<P>::TickFrame() {
          std::vector<std::pair<u64, const Image*>> largest;
          std::map<u32, std::pair<u64, u32>> by_format;
          for (const auto [image_id, image] : slot_images) {
@@ -34,7 +34,7 @@ index 1af960e1c6..768284775b 100644
              image_bytes += bytes;
              ++images;
              if (debug_stats) {
-@@ -2281,6 +2281,15 @@ u64 TextureCache<P>::ImageMemoryBytes(const Image& image) const {
+@@ -2329,6 +2329,15 @@ u64 TextureCache<P>::ImageMemoryBytes(const Image& image) const {
          }
          return 0;
      }
