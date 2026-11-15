@@ -49,6 +49,7 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#include <unordered_map>
 
 namespace
 {
@@ -2211,6 +2212,53 @@ extern "C" void nfs_alias_commit(void)
     g_alias_any.store(!g_alias.empty(), std::memory_order_release);
 }
 
+// ---- which paths hold the process's descriptors (EDEN_FD_PATHS in stderr.log, every 20 s):
+// the console allows ~267, far fewer than RLIMIT_NOFILE says.
+namespace
+{
+    std::mutex g_fd_paths_mutex;
+    std::unordered_map<int, std::string> &fd_paths()
+    {
+        static std::unordered_map<int, std::string> paths;
+        return paths;
+    }
+    void remember_fd(int fd, const char *path)
+    {
+        if (fd < 0 || path == nullptr)
+            return;
+        std::lock_guard lock{g_fd_paths_mutex};
+        fd_paths()[fd] = path;
+    }
+    void forget_fd(int fd)
+    {
+        std::lock_guard lock{g_fd_paths_mutex};
+        fd_paths().erase(fd);
+    }
+}
+
+extern "C" void eden_fd_paths_report(FILE *out)
+{
+    std::map<std::string, int> folders;
+    size_t total = 0;
+    {
+        std::lock_guard lock{g_fd_paths_mutex};
+        total = fd_paths().size();
+        for (const auto &[fd, path] : fd_paths())
+        {
+            const auto slash = path.find_last_of('/');
+            ++folders[slash == std::string::npos ? path : path.substr(0, slash)];
+        }
+    }
+    std::vector<std::pair<int, std::string>> largest;
+    for (auto &[folder, count] : folders)
+        largest.emplace_back(count, folder);
+    std::sort(largest.rbegin(), largest.rend());
+    std::fprintf(out, "EDEN_FD_PATHS tracked=%zu folders=%zu", total, folders.size());
+    for (size_t i = 0; i < largest.size() && i < 10; ++i)
+        std::fprintf(out, " | %d %s", largest[i].first, largest[i].second.c_str());
+    std::fprintf(out, "\n");
+}
+
 // ---- the C library's calls
 
 extern "C"
@@ -2219,7 +2267,12 @@ extern "C"
     {
         std::string nfs_path;
         if (!redirect(path, nfs_path))
-            return __real_fopen(path, mode);
+        {
+            FILE *stream = __real_fopen(path, mode);
+            if (stream != nullptr)
+                remember_fd(__real_fileno(stream), path);
+            return stream;
+        }
         path = nfs_path.c_str();
         if (!read_mode(mode))
         {
@@ -2240,7 +2293,11 @@ extern "C"
     {
         File *n = file_of(f);
         if (!n)
+        {
+            if (f != nullptr)
+                forget_fd(__real_fileno(f));
             return ps5_memstream_fclose(f);
+        }
         free_file(n);
         return 0;
     }
@@ -2374,7 +2431,11 @@ extern "C"
         }
         std::string nfs_path;
         if (!redirect(path, nfs_path))
-            return __real_open(path, flags, mode);
+        {
+            const int fd = __real_open(path, flags, mode);
+            remember_fd(fd, path);
+            return fd;
+        }
         if ((flags & O_ACCMODE) != O_RDONLY || (flags & (O_CREAT | O_TRUNC)))
         {
             errno = EROFS;
@@ -2394,7 +2455,10 @@ extern "C"
     {
         File *f = file_of_fd(fd);
         if (!f)
+        {
+            forget_fd(fd);
             return __real_close(fd);
+        }
         free_file(f);
         return 0;
     }
