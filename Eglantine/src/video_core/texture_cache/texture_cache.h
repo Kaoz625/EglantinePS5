@@ -4128,8 +4128,10 @@ template <class P>
 void TextureCache<P>::TrackImage(ImageBase& image, ImageId image_id) {
     ASSERT(False(image.flags & ImageFlagBits::Tracked));
     image.flags |= ImageFlagBits::Tracked;
+    // Mark before the pages trap: a new image can be tracked before RegisterImage marks it.
     if (False(image.flags & ImageFlagBits::Sparse)) {
         if (image.cpu_addr < ~(1ULL << 40)) {
+            page_filter.Mark(image.cpu_addr, image.guest_size_bytes);
             device_memory.UpdatePagesCachedCount(image.cpu_addr, image.guest_size_bytes, 1);
         }
         return;
@@ -4142,12 +4144,14 @@ void TextureCache<P>::TrackImage(ImageBase& image, ImageId image_id) {
             const auto& map = slot_map_views[map_view_id];
             const DAddr cpu_addr = map.cpu_addr;
             const std::size_t size = map.size;
+            page_filter.Mark(cpu_addr, size);
             device_memory.UpdatePagesCachedCount(cpu_addr, size, 1);
         }
         return;
     }
     ForEachSparseSegment(image,
                          [this]([[maybe_unused]] GPUVAddr gpu_addr, DAddr cpu_addr, size_t size) {
+                             page_filter.Mark(cpu_addr, size);
                              device_memory.UpdatePagesCachedCount(cpu_addr, size, 1);
                          });
 }
@@ -4335,8 +4339,37 @@ void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_vi
 
 template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
+    if (False(image.flags & ImageFlagBits::GpuModified)) {
+        ArmImageReadTraps(image);
+    }
     image.flags |= ImageFlagBits::GpuModified;
     SetModificationTick(slot_images, image, ++modification_tick);
+}
+
+template <class P>
+void TextureCache<P>::ArmImageReadTraps(ImageBase& image) noexcept {
+    // Read traps (core/memory.cpp, with a fastmem arena) take read permission away only from pages
+    // the buffer cache's GPU writes arm. A guest read of an image's memory went straight to guest
+    // memory, as it was before the GPU drew there: GetFlushArea, which downloads the image, was
+    // never asked. Pokemon Pokopia draws a 256x3 RGBA32F image and reads it back on the CPU for its
+    // sky colours, and its sky was black. Armed when an image becomes GPU modified: once while it
+    // stays so, and again after a download (DownloadMemory) or an invalidation cleared the flag.
+    // Switch 2 titles only. EDEN_NX2_IMAGE_READ_TRAPS=0 leaves images out (for comparisons).
+    static const bool disabled = [] {
+        const char* value = std::getenv("EDEN_NX2_IMAGE_READ_TRAPS");
+        return value != nullptr && value[0] == '0';
+    }();
+    if (disabled || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+        image.guest_size_bytes == 0 || True(image.flags & ImageFlagBits::Unbacked)) {
+        return;
+    }
+    if (True(image.flags & ImageFlagBits::Sparse)) {
+        ForEachSparseSegment(image, [this](GPUVAddr, DAddr cpu_addr, size_t size) {
+            device_memory.ArmReadTraps(cpu_addr, size);
+        });
+    } else if (image.cpu_addr != 0) {
+        device_memory.ArmReadTraps(image.cpu_addr, image.guest_size_bytes);
+    }
 }
 
 template <class P>
