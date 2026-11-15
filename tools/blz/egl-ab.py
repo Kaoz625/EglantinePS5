@@ -41,13 +41,33 @@ def ftp(ip):
 
 
 def web_get(ip, path, timeout=120):
-    with urllib.request.urlopen(f"http://{ip}:8080/fs{urllib.request.quote(path)}", timeout=timeout) as r:
+    with urllib.request.urlopen(f"http://{ip}:8080/fs{urllib.request.quote(path, safe='/?=&')}", timeout=timeout) as r:
         return r.read()
 
 
 def eboot_pids(ip):
     with urllib.request.urlopen(f"http://{ip}:8084/processes_list", timeout=10) as r:
         return [p["pid"] for p in json.loads(r.read())["processes"] if p["name"] == "eboot.bin"]
+
+
+def idle(ip):
+    """No eboot.bin and no game sandbox (what ps5-status calls idle)."""
+    try:
+        if eboot_pids(ip):
+            return False
+        names = [e["name"] for e in json.loads(web_get(ip, "/mnt/sandbox/?fmt=json", timeout=10))]
+        return not any(re.match(r"[A-Z]{4}\d{5}_\d{3}$", n) and not n.startswith("NPXS") for n in names)
+    except Exception:
+        return False
+
+
+def new_crashes(ip):
+    try:
+        names = [e["name"] for e in json.loads(web_get(ip, "/data/eglantineps5/logs/?fmt=json"))]
+    except Exception:
+        return []
+    return sorted(n for n in names if n.startswith("crash-") and n.endswith(".txt") and n != "crash-index.txt" and "eden_log" not in n
+                  and n not in SEEN_CRASHES)
 
 
 def kill_app(ip):
@@ -144,6 +164,8 @@ def put_text(ip, name, text):
 
 
 SEEN_CRASHES = set()
+STOP = [False]
+LAST_KILL = os.path.join(OUT, "last-kill")
 
 
 def run(ip, tag, game, seconds, script=None):
@@ -152,10 +174,30 @@ def run(ip, tag, game, seconds, script=None):
         SEEN_CRASHES.update(e["name"] for e in json.loads(web_get(ip, "/data/eglantineps5/logs/?fmt=json")))
     except Exception:
         pass
-    if eboot_pids(ip):
-        sys.exit("an eboot.bin already runs - refusing to launch")
+    # Rules (15 Nov): launch only from idle, at least 60 s after the last kill (LAST_KILL file)
+    try:
+        since = time.time() - os.path.getmtime(LAST_KILL)
+        if since < 60:
+            time.sleep(60 - since)
+    except OSError:
+        pass
+    for _ in range(30):
+        if idle(ip):
+            break
+        time.sleep(10)
+    else:
+        sys.exit("console not idle after 5 min - refusing to launch")
     rom = urllib.parse.quote(NFS + GAMES.get(game, game), safe="/")
     put_text(ip, "compat-input.txt", "")
+    # After a crash the next start shows the crash notice and IGNORES --rom (it lands in the launcher, where we
+    # must not kill it). The notice comes from logs/crash-note.txt; the report files themselves stay.
+    try:
+        f = ftp(ip)
+        f.delete("/data/eglantineps5/logs/crash-note.txt")
+        f.quit()
+        log("removed logs/crash-note.txt (a previous crash) so --rom is honoured")
+    except Exception:
+        pass
     time.sleep(15)   # 15 Nov: DIGI5 dropped off the LAN when a launch followed a kill too closely (cause unproven)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     path = os.path.join(OUT, f"{tag}-{game}-{stamp}.klog")
@@ -164,8 +206,11 @@ def run(ip, tag, game, seconds, script=None):
     th.start()
     time.sleep(1)
     out = subprocess.run([RUN, APPMOVE, "launch", "PPSA98515", "--rom=" + rom], capture_output=True, text=True,
-                         env=dict(os.environ, PS5=ip, WAIT="12")).stdout
+                         env=dict(os.environ, PS5=ip, WAIT="12", HTTP_PORT=os.environ.get("EGL_HTTP_PORT", "8139"))).stdout
     log("launch: " + " | ".join(l.split("[appmove] ", 1)[1] for l in out.splitlines() if "[appmove] " in l))
+    if "[appmove] launch arg" not in out:
+        stop.set()
+        sys.exit("the launch did not happen (payload server :8123 on mac1 down? appmove refused?): " + out[-300:])
     t0 = time.time()
     time.sleep(20)
     log(f"/system_ex/app/PPSA98515/eboot.bin = {mounted_eboot_size(ip)} B")
@@ -176,6 +221,8 @@ def run(ip, tag, game, seconds, script=None):
             if p:
                 steps.append((float(p[0]), " ".join(p[1:])))
     seq = int(time.time() * 1000)
+    crashed = False
+    in_launcher_now = False
     next_shot = 30
     while time.time() - t0 < seconds:
         el = time.time() - t0
@@ -189,16 +236,23 @@ def run(ip, tag, game, seconds, script=None):
                 open(os.path.join(OUT, f"{tag}-{game}-{stamp}-{int(el):04d}.ppm"), "wb").write(data)
             except Exception:
                 pass
+        if el > 60 and int(el) % 10 == 0:
+            try:
+                tail = web_get(ip, "/data/eglantineps5/logs/stderr.log", timeout=30)[-20000:]
+            except Exception:
+                tail = b""
+            if b"session failed" in tail or b"shutdown: Game stopped" in tail:
+                log(f"game session ended at {el:.0f} s: " + tail.decode("utf-8", "replace").split("session failed")[-1][:160].strip())
+                in_launcher_now = True
+                break
+        if el > 60 and int(el) % 10 == 0 and new_crashes(ip):
+            log(f"crash report at {el:.0f} s: the app restarts into its launcher - NOT killing it there")
+            crashed = True
+            break
         if el > 60 and not eboot_pids(ip):
             log(f"app ended by itself at {el:.0f} s")
             break
         time.sleep(0.5)
-    if eboot_pids(ip):
-        # TouchPad+L1 = the app's "back to the menu" chord: the game session ends normally and its logs are
-        # written out (a kill lost the last ~4 min of heap.log on 15 Nov)
-        seq += 1
-        put_text(ip, "compat-input.txt", f"{seq} {0x100400} 600\n")
-        time.sleep(15)
     time.sleep(20)   # a crash report is written a few seconds after the process is gone
     # stdout (EDEN_VULKAN_FRAME fps, MKW_MEMORY) goes to logs/heap.log; a crash renames it crash-<time>-heap.log
     logs = "/data/eglantineps5/logs"
@@ -206,7 +260,7 @@ def run(ip, tag, game, seconds, script=None):
         names = [e["name"] for e in json.loads(web_get(ip, logs + "/?fmt=json"))]
     except Exception:
         names = []
-    crashes = sorted(n for n in names if n.startswith("crash-") and n.endswith(".txt") and n != "crash-index.txt"
+    crashes = sorted(n for n in names if n.startswith("crash-") and n.endswith(".txt") and n != "crash-index.txt" and "eden_log" not in n
                      and n not in SEEN_CRASHES)
     pulled = []
     for n in ["heap.log", "stderr.log"] + [c[:-4] + suffix for c in crashes for suffix in ("-heap.log", "-stderr.log", ".txt")]:
@@ -217,8 +271,21 @@ def run(ip, tag, game, seconds, script=None):
         dest = path[:-5] + "." + n
         open(dest, "wb").write(data)
         pulled.append(dest)
-    if eboot_pids(ip):
-        kill_app(ip)
+    crashes = crashes or new_crashes(ip)
+    in_game = False
+    if eboot_pids(ip) and not crashes and not in_launcher_now:
+        # heap.log is written in chunks (it can lag minutes), so judge by stderr.log: the launcher announces
+        # itself (EDEN_LAUNCHER / "launcher:"); a game session says "Game loaded" after its last launcher line.
+        err = open(path[:-5] + ".stderr.log", "rb").read() if os.path.exists(path[:-5] + ".stderr.log") else b""
+        last_launcher = max(err.rfind(b"EDEN_LAUNCHER"), err.rfind(b"[EglantinePS5] launcher:"))
+        in_game = err.rfind(b"loader: Game loaded") > last_launcher and b"session failed" not in err[last_launcher:]
+    if in_game:
+        kill_app(ip)          # killed during the game (safe 5 times on 15 Nov); never in the launcher
+        open(LAST_KILL, "w").write(time.ctime())
+    elif eboot_pids(ip):
+        log("STOP: EglantinePS5 is up but not in a game (launcher, likely after a crash) - not killing it; "
+            "close it by hand before the next run")
+        STOP[0] = True
     time.sleep(3)
     stop.set()
     log(f"klog: {path}; crash reports: {crashes or 'none'}")
@@ -265,5 +332,6 @@ if __name__ == "__main__":
     elif a[0] == "run":
         scr = a[a.index("--script") + 1] if "--script" in a else None
         run(a[1], a[2], a[3], int(a[4]), scr)
+        sys.exit(3 if STOP[0] else 0)
     elif a[0] == "summary":
         summary(a[1])
