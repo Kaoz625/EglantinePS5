@@ -71,6 +71,7 @@ std::atomic<bool> game_started{false};
 
 bool installed = false;
 bool restarted_process = false;
+bool no_crash_restart = false;   // logs/no-crash-restart.txt, read once at Install
 std::time_t started_at = 0;
 long utc_offset = 0;
 char logs[200];
@@ -440,7 +441,11 @@ void WriteReport(const Kind* kind, int code, std::uint64_t address, const Regist
                  const char* reason) noexcept {
     // Right after a restart, with no game started since: the crash comes with starting the app,
     // and starting it again would only repeat it.
-    const bool restart = !(restarted_process && !game_started.load(std::memory_order_relaxed) &&
+    // logs/no-crash-restart.txt (Blazing test runs): close after the report instead of restarting into the
+    // launcher, so a scripted run never leaves the app sitting there (15 Nov: consoles dropped when an app in
+    // its launcher was killed and another launch followed).
+    const bool restart = !no_crash_restart &&
+                         !(restarted_process && !game_started.load(std::memory_order_relaxed) &&
                            std::time(nullptr) - started_at < 60);
     leave.store(!restart, std::memory_order_release);
     const Stamp stamp = LocalNow();
@@ -542,6 +547,10 @@ void Install(const std::string& logs_folder, const char* app_version, bool resta
     CopyText(version, sizeof(version), app_version);
     CopyText(sessions[0], sizeof(sessions[0]), "starting");
     restarted_process = restarted;
+    if (std::FILE* flag = std::fopen((logs_folder + "/no-crash-restart.txt").c_str(), "r")) {
+        no_crash_restart = true;
+        std::fclose(flag);
+    }
     started_at = std::time(nullptr);
     if (const std::tm* local = std::localtime(&started_at)) {
         const long long seconds = DaysFromCivil(local->tm_year + 1900, static_cast<unsigned>(local->tm_mon + 1),
