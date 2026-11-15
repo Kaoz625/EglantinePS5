@@ -1,4 +1,3 @@
-#include <unordered_map>
 /*
  * EglantinePS5 - games on NFS servers (from SwanStationPS5): the shares, and the C library's file calls passed through them.
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -35,6 +34,7 @@
 #include <limits.h>
 #include <iterator>
 #include <map>
+#include <set>
 #include <memory>
 #include <new>
 #include <mutex>
@@ -42,6 +42,9 @@
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <climits>
+#include <ctime>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <thread>
 #include <unistd.h>
@@ -116,8 +119,27 @@ struct Share
     std::atomic<int> gen{0}; // goes up with each new connection: a file handle of an older one is not valid
     std::atomic<bool> stalled{false}; // the watchdog shut the socket of the read in flight
     std::atomic<bool> dead{false}; // a read failed: the server is gone, nothing more is asked of it until it is mounted again
+    bool mt = false; // libnfs's service thread runs this connection: reads go without the lock, several at once
+    std::atomic<int> reads_in_flight{0};
     std::mutex lock;
 };
+
+// Several reads in flight on one connection (libnfs multithreading): the server answers them back to back instead
+// of one round trip at a time. Without the service thread (it could not start) the connection works as before.
+void start_service_thread(Share *s)
+{
+    s->mt = s->ctx && nfs_mt_service_thread_start(s->ctx) == 0;
+    if (s->ctx && !s->mt)
+        nfs_log("nfs: %s: no service thread (%s): one read at a time", s->url.c_str(),
+                nfs_get_error(s->ctx) ? nfs_get_error(s->ctx) : "?");
+}
+
+void destroy_context(nfs_context *ctx, bool mt)
+{
+    if (mt)
+        nfs_mt_service_thread_stop(ctx);
+    nfs_destroy_context(ctx);
+}
 
 std::mutex g_mutex;
 std::vector<Share *> g_shares; // the ones set; the ones replaced are kept (a game may hold a file of one)
@@ -147,8 +169,13 @@ struct Cache
     std::map<uint64_t, Block> blocks; // by block number
     size_t bytes = 0;
     uint64_t want = 0; // the block the game is at: it is read first, and the ones after it
+    // How far ahead to read, in blocks: it doubles while the game reads block after block and falls back to
+    // kWindowLeast when it jumps (Star Fox reads one 14 GB archive here and there: reading ~112 MB ahead of every
+    // jump made it read 16 GB in 15 minutes at "98%", 6 Nov).
+    uint64_t window = 2;
     bool stop = false, failed = false, worker_on = false;
-    std::thread worker;
+    std::set<uint64_t> fetching; // blocks a worker is reading now (another worker takes the next one)
+    std::vector<std::thread> workers;
 };
 
 struct File
@@ -162,9 +189,302 @@ struct File
     Cache *cache = nullptr;
     int gen = 0;
     NtfsFile *nt = nullptr; // a file on an NTFS disk (ntfs/ntfsfs.h)
+    std::string disk_key; // its folder in the disk cache (empty: not cached)
 };
 
 File g_files[kMaxFiles];
+
+// ---- The disk cache: blocks read from the shares, kept on the console's own drive ----
+// A game streamed from a share reads the same blocks again (in one launch, when its 512 KB blocks have left the
+// 128 MiB memory cache, and at every launch). Each block read from the server is also written to a file of its own
+// under the cache folder, and read from there next time: the console's drive answers in milliseconds where a share
+// over Wi-Fi gave 12-20 MB/s (6 Nov: packed Star Fox read 19 GB at "98%" in 17 min). A file's folder is named after
+// its share, path, size and date, so a changed file is never served old blocks. When the cache holds more than its
+// budget, the game used longest ago goes, whole. The shares stay the only copy that counts: the cache can be deleted
+// at any time.
+std::string g_disk_dir;
+uint64_t g_disk_budget = 0;
+std::atomic<bool> g_disk_on{false};
+std::mutex g_disk_mutex;
+struct DiskGame
+{
+    uint64_t bytes = 0;
+    int64_t used = 0;
+};
+std::map<std::string, DiskGame> g_disk_games; // by folder name
+uint64_t g_disk_total = 0;
+std::atomic<uint64_t> g_n_disk_hit{0}, g_n_disk_put{0};
+std::atomic<uint64_t> g_n_asked{0}, g_n_asked_bytes{0}; // what the game asked of the shares (read_at)
+// Time spent inside read_at: tells a loader blocked on reads from one busy computing (7 Nov, Hyrule).
+std::atomic<uint64_t> g_asked_ns{0}, g_asked_max_ns{0};
+std::atomic<bool> g_disk_evicting{false};
+
+std::string disk_key(const std::string &url, const std::string &rel, uint64_t size, uint64_t mtime)
+{
+    uint64_t h = 1469598103934665603ull;
+    const std::string id = url + "|" + rel + "|" + std::to_string(size) + "|" + std::to_string(mtime);
+    for (const unsigned char c : id)
+        h = (h ^ c) * 1099511628211ull;
+    char out[17];
+    snprintf(out, sizeof(out), "%016llx", static_cast<unsigned long long>(h));
+    return out;
+}
+
+std::string disk_block_path(const std::string &key, uint64_t number)
+{
+    char name[24];
+    snprintf(name, sizeof(name), "/%llx", static_cast<unsigned long long>(number));
+    return g_disk_dir + "/" + key + name;
+}
+
+int64_t wall_s()
+{
+    return static_cast<int64_t>(time(nullptr));
+}
+
+// The whole folder of a game: its blocks, then the folder.
+uint64_t disk_remove_game(const std::string &key)
+{
+    const std::string dir = g_disk_dir + "/" + key;
+    uint64_t freed = 0;
+    if (DIR *d = opendir(dir.c_str()))
+    {
+        while (dirent *e = readdir(d))
+        {
+            if (e->d_name[0] == '.')
+                continue;
+            const std::string path = dir + "/" + e->d_name;
+            struct stat st;
+            if (__real_stat(path.c_str(), &st) == 0)
+                freed += static_cast<uint64_t>(st.st_size);
+            unlink(path.c_str());
+        }
+        closedir(d);
+    }
+    rmdir(dir.c_str());
+    return freed;
+}
+
+// Over budget: the games used longest ago go until it fits again, never the one being read now.
+void disk_evict(const std::string &keep)
+{
+    if (g_disk_evicting.exchange(true))
+        return;
+    for (;;)
+    {
+        std::string victim;
+        {
+            std::lock_guard<std::mutex> g(g_disk_mutex);
+            if (g_disk_total <= g_disk_budget)
+                break;
+            int64_t oldest = INT64_MAX;
+            for (const auto &entry : g_disk_games)
+                if (entry.first != keep && entry.second.used < oldest)
+                {
+                    oldest = entry.second.used;
+                    victim = entry.first;
+                }
+            if (victim.empty())
+                break;
+            const uint64_t bytes = g_disk_games[victim].bytes;
+            g_disk_total -= std::min(g_disk_total, bytes);
+            g_disk_games.erase(victim);
+        }
+        nfs_log("nfs: disk cache: over its budget, the game used longest ago goes (%s)", victim.c_str());
+        disk_remove_game(victim);
+    }
+    g_disk_evicting = false;
+}
+
+bool disk_get(File *f, uint64_t number, size_t want, Block &b)
+{
+    if (!g_disk_on || f->disk_key.empty())
+        return false;
+    const int fd = __real_open(disk_block_path(f->disk_key, number).c_str(), O_RDONLY);
+    if (fd < 0)
+        return false;
+    uint8_t *data = static_cast<uint8_t *>(malloc(want));
+    size_t done = 0;
+    while (data && done < want)
+    {
+        const ssize_t got = __real_read(fd, data + done, want - done);
+        if (got <= 0)
+            break;
+        done += static_cast<size_t>(got);
+    }
+    __real_close(fd);
+    if (!data || done != want)
+    {
+        free(data);
+        return false;
+    }
+    b.data = data;
+    b.len = want;
+    ++g_n_disk_hit;
+    return true;
+}
+
+// Writing a fetched block to the drive (mkdir, create, 512 KB write, close, rename) ran on the game's read path and
+// cost tens of ms a block on the PS5's drive: Hyrule Warriors' loader waited 3-4.5 s of every 5 s on reads (7 Nov).
+// disk_put now hands a copy to one writer thread; past 64 MB waiting, a block is simply not cached.
+std::atomic<uint64_t> g_disk_put_ns{0}, g_disk_put_dropped{0};
+void disk_put_now(const std::string &key, uint64_t number, const uint8_t *data, size_t len);
+
+struct DiskJob
+{
+    std::string key;
+    uint64_t number;
+    std::vector<uint8_t> bytes;
+};
+std::mutex g_disk_q_mutex;
+std::condition_variable g_disk_q_cv;
+std::vector<DiskJob> g_disk_q;
+size_t g_disk_q_bytes = 0;
+bool g_disk_writer_started = false;
+constexpr size_t kDiskQueueCap = 64u << 20;
+
+void disk_writer()
+{
+    for (;;)
+    {
+        DiskJob job;
+        {
+            std::unique_lock<std::mutex> lk(g_disk_q_mutex);
+            g_disk_q_cv.wait(lk, [] { return !g_disk_q.empty(); });
+            job = std::move(g_disk_q.front());
+            g_disk_q.erase(g_disk_q.begin());
+            g_disk_q_bytes -= job.bytes.size();
+        }
+        const auto start = std::chrono::steady_clock::now();
+        disk_put_now(job.key, job.number, job.bytes.data(), job.bytes.size());
+        g_disk_put_ns += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    }
+}
+
+void disk_put(File *f, uint64_t number, const Block &b)
+{
+    if (!g_disk_on || f->disk_key.empty() || !b.data)
+        return;
+    std::lock_guard<std::mutex> lk(g_disk_q_mutex);
+    if (g_disk_q_bytes + b.len > kDiskQueueCap)
+    {
+        ++g_disk_put_dropped;
+        return;
+    }
+    if (!g_disk_writer_started)
+    {
+        std::thread(disk_writer).detach();
+        g_disk_writer_started = true;
+    }
+    g_disk_q.push_back(DiskJob{f->disk_key, number, std::vector<uint8_t>(b.data, b.data + b.len)});
+    g_disk_q_bytes += b.len;
+    g_disk_q_cv.notify_one();
+}
+
+void disk_put_now(const std::string &disk_key, uint64_t number, const uint8_t *data, size_t len)
+{
+    const std::string dir = g_disk_dir + "/" + disk_key;
+    mkdir(dir.c_str(), 0777);
+    const std::string path = disk_block_path(disk_key, number), staged = path + ".tmp";
+    FILE *out = __real_fopen(staged.c_str(), "wb");
+    if (!out)
+        return;
+    const bool ok = fwrite(data, 1, len, out) == len;
+    if (__real_fclose(out) != 0 || !ok || rename(staged.c_str(), path.c_str()) != 0)
+    {
+        unlink(staged.c_str());
+        return;
+    }
+    ++g_n_disk_put;
+    bool over;
+    {
+        std::lock_guard<std::mutex> g(g_disk_mutex);
+        DiskGame &game = g_disk_games[disk_key];
+        game.bytes += len;
+        game.used = wall_s();
+        g_disk_total += len;
+        over = g_disk_total > g_disk_budget;
+    }
+    if (over)
+        disk_evict(disk_key);
+}
+
+// `n` bytes from `offset` of block `number`, read straight from its file in the disk cache: no 512 KB copy and no
+// churn in the memory cache, for the small reads games make all over a big file (6 Nov: Mario Kart World's loads
+// fetched 48 GB of blocks for 566 MB of distinct data). 0 when the block is not on the drive.
+std::atomic<uint64_t> g_n_disk_range{0};
+size_t disk_read_range(File *f, uint64_t number, size_t offset, uint8_t *dst, size_t n)
+{
+    if (!g_disk_on || f->disk_key.empty())
+        return 0;
+    const uint64_t start = number * kBlock;
+    if (start >= f->size)
+        return 0;
+    const size_t len = static_cast<size_t>(std::min<uint64_t>(kBlock, f->size - start));
+    if (offset >= len)
+        return 0;
+    const int fd = __real_open(disk_block_path(f->disk_key, number).c_str(), O_RDONLY);
+    if (fd < 0)
+        return 0;
+    const size_t want = std::min(n, len - offset);
+    size_t done = 0;
+    while (done < want)
+    {
+        const ssize_t got = __real_pread(fd, dst + done, want - done, static_cast<off_t>(offset + done));
+        if (got <= 0)
+            break;
+        done += static_cast<size_t>(got);
+    }
+    __real_close(fd);
+    if (done != want)
+        return 0;
+    ++g_n_disk_range;
+    return done;
+}
+
+bool disk_has(const File *f, uint64_t number)
+{
+    if (!g_disk_on || f->disk_key.empty())
+        return false;
+    struct stat st;
+    return __real_stat(disk_block_path(f->disk_key, number).c_str(), &st) == 0;
+}
+
+// A file of a game opens: its folder counts as used now (kept on the drive as the folder's date).
+void disk_touch(const std::string &key)
+{
+    if (!g_disk_on || key.empty())
+        return;
+    {
+        std::lock_guard<std::mutex> g(g_disk_mutex);
+        auto it = g_disk_games.find(key);
+        if (it == g_disk_games.end())
+            return;
+        it->second.used = wall_s();
+    }
+    utimes((g_disk_dir + "/" + key).c_str(), nullptr);
+}
+
+// Which file the reads go to, for the 5 s stats line: blocks fetched and how many of them were new. A game that reads
+// the same blocks again shows fetched >> distinct (6 Nov: Star Fox read 19 GB from a 15 GB archive at 98%).
+struct ReadDiag
+{
+    uint64_t size = 0, fetched = 0, fetched_since = 0;
+    std::set<uint64_t> distinct;
+};
+std::mutex g_diag_mutex;
+std::map<std::string, ReadDiag> g_diag;
+
+void note_fetch(const File *f, uint64_t number)
+{
+    std::lock_guard<std::mutex> g(g_diag_mutex);
+    ReadDiag &d = g_diag[f->rel];
+    d.size = f->size;
+    ++d.fetched;
+    ++d.fetched_since;
+    d.distinct.insert(number);
+}
 
 bool own_file(const FILE *f)
 {
@@ -358,6 +678,10 @@ std::atomic<uint64_t> g_n_open{0}, g_n_stat_hit{0}, g_n_stat_miss{0}, g_n_list{0
 std::mutex g_cache_mutex;
 std::map<std::string, Attr> g_attrs;
 std::map<std::string, Listing> g_listings;
+// Paths the server said do not exist. The library asks for the same missing files on every check (every 2 s while the
+// menu is open), and each one was a round trip to the server on the menu's thread. Emptied with the other caches when
+// the library is read again, so a game that is added appears then.
+std::map<std::string, int64_t> g_missing;
 
 std::string cache_key(const Share *s, const std::string &rel)
 {
@@ -369,6 +693,7 @@ void cache_clear()
     std::lock_guard<std::mutex> g(g_cache_mutex);
     g_attrs.clear();
     g_listings.clear();
+    g_missing.clear();
 }
 
 // A big folder's listing (the textures of a game: tens of thousands of files, a server answering a few dozen entries at a
@@ -451,6 +776,12 @@ int nfs_stat_path(const Where &w, struct stat *st)
             fill_stat(st, it->second.dir, it->second.size, it->second.mtime, it->second.mode, it->second.ino);
             return 0;
         }
+        const auto gone = g_missing.find(key);
+        if (gone != g_missing.end() && now_ms() - gone->second < kCacheMs)
+        {
+            ++g_n_stat_hit;
+            return ENOENT;
+        }
     }
     ++g_n_stat_miss;
     nfs_stat_64 s;
@@ -460,8 +791,20 @@ int nfs_stat_path(const Where &w, struct stat *st)
         rc = nfs_stat64(w.share->ctx, w.rel.c_str(), &s);
     }
     if (rc < 0)
+    {
+        if (-rc == ENOENT)
+        {
+            std::lock_guard<std::mutex> g(g_cache_mutex);
+            g_missing[key] = now_ms();
+        }
         return -rc;
-    fill_stat(st, (s.nfs_mode & S_IFMT) == S_IFDIR, s.nfs_size, s.nfs_mtime, s.nfs_mode, s.nfs_ino);
+    }
+    const bool dir = (s.nfs_mode & S_IFMT) == S_IFDIR;
+    fill_stat(st, dir, s.nfs_size, s.nfs_mtime, s.nfs_mode, s.nfs_ino);
+    // Kept like a listed entry: the library asks for the same files of every game again and again (exefs/main), and each
+    // answer is a lookup per folder of the path.
+    std::lock_guard<std::mutex> g(g_cache_mutex);
+    g_attrs[key] = {dir, dir ? 0 : s.nfs_size, s.nfs_mtime, s.nfs_mode, s.nfs_ino, now_ms()};
     return 0;
 }
 
@@ -492,7 +835,8 @@ void free_cache(File *f)
             c->stop = true;
             c->cv.notify_all();
         }
-        c->worker.join(); // (a read that hangs is cut by the watchdog)
+        for (std::thread &worker : c->workers)
+            worker.join(); // (a read that hangs is cut by the watchdog)
         --g_workers;
     }
     for (auto &entry : c->blocks)
@@ -542,11 +886,50 @@ void watch_reads()
                     if (sum != last_sum)
                     {
                         last_sum = sum;
+                        if (g_disk_on)
+                            nfs_log("disk cache: %llu ranges and %llu blocks read from the drive, %llu written, %llu of %llu MB used;"
+                                    " the game asked %llu reads, %llu MB",
+                                    static_cast<unsigned long long>(g_n_disk_range.load()),
+                                    static_cast<unsigned long long>(g_n_disk_hit.load()),
+                                    static_cast<unsigned long long>(g_n_disk_put.load()),
+                                    static_cast<unsigned long long>(g_disk_total >> 20),
+                                    static_cast<unsigned long long>(g_disk_budget >> 20),
+                                    static_cast<unsigned long long>(g_n_asked.load()),
+                                    static_cast<unsigned long long>(g_n_asked_bytes.load() >> 20));
+                        {
+                            static uint64_t last_ns = 0, last_n = 0;
+                            const uint64_t ns = g_asked_ns.load(), cnt = g_n_asked.load();
+                            const uint64_t dn = cnt - last_n, dns = ns - last_ns;
+                            nfs_log("drive writes: %llu ms in all off the game's path, %llu blocks skipped (queue full)",
+                                    static_cast<unsigned long long>(g_disk_put_ns.load() / 1000000),
+                                    static_cast<unsigned long long>(g_disk_put_dropped.load()));
+                            nfs_log("read time: %llu ms in the game's last %llu reads (avg %.1f ms, longest so far %llu ms)",
+                                    static_cast<unsigned long long>(dns / 1000000), static_cast<unsigned long long>(dn),
+                                    dn ? dns / 1e6 / dn : 0.0, static_cast<unsigned long long>(g_asked_max_ns.exchange(0) / 1000000));
+                            last_ns = ns;
+                            last_n = cnt;
+                        }
                         nfs_log("stats: opens %llu, stat %llu (+%llu asked), lists %llu (+%llu cached), reads %llu (%llu MB)",
                                 static_cast<unsigned long long>(g_n_open), static_cast<unsigned long long>(g_n_stat_hit),
                                 static_cast<unsigned long long>(g_n_stat_miss), static_cast<unsigned long long>(g_n_list),
                                 static_cast<unsigned long long>(g_n_list_hit), static_cast<unsigned long long>(g_n_read),
                                 static_cast<unsigned long long>(g_n_bytes >> 20));
+                        std::lock_guard<std::mutex> g(g_diag_mutex);
+                        auto top = g_diag.end();
+                        for (auto it = g_diag.begin(); it != g_diag.end(); ++it)
+                            if (it->second.fetched_since && (top == g_diag.end() || it->second.fetched_since > top->second.fetched_since))
+                                top = it;
+                        if (top != g_diag.end())
+                        {
+                            const ReadDiag &d = top->second;
+                            nfs_log("reads: %s: %llu MB in 5 s; %llu MB fetched in all, %llu MB of it distinct, of %llu MB",
+                                    top->first.c_str(), static_cast<unsigned long long>((d.fetched_since * kBlock) >> 20),
+                                    static_cast<unsigned long long>((d.fetched * kBlock) >> 20),
+                                    static_cast<unsigned long long>((d.distinct.size() * kBlock) >> 20),
+                                    static_cast<unsigned long long>(d.size >> 20));
+                        }
+                        for (auto &entry : g_diag)
+                            entry.second.fetched_since = 0;
                     }
                 }
                 std::vector<Share *> list;
@@ -620,6 +1003,11 @@ File *open_file(const char *path, int *error)
     f->share = w.share;
     f->rel = w.rel;
     f->size = static_cast<uint64_t>(st.st_size);
+    if (g_disk_on && f->size > kBlock)
+    {
+        f->disk_key = disk_key(w.share->url, w.rel, f->size, static_cast<uint64_t>(st.st_mtime));
+        disk_touch(f->disk_key);
+    }
     int rc;
     {
         std::lock_guard<std::mutex> g(w.share->lock);
@@ -646,12 +1034,16 @@ File *open_file(const char *path, int *error)
 }
 
 // A new connection to a share, in place of one that went silent (called with the lock of the share held). The file
-// handles of the old one are not valid on it: each file opens its own again (fetch_block).
-bool reconnect(Share *s)
+// handles of the old one are not valid on it: each file opens its own again (fetch_block). When it cannot be made,
+// `why` says what libnfs answered.
+bool reconnect(Share *s, std::string &why)
 {
     nfs_context *ctx = nfs_init_context();
     if (!ctx)
+    {
+        why = "no memory for a new connection";
         return false;
+    }
     nfs_set_timeout(ctx, std::max(g_timeout_ms.load() / 2, 3000));
     nfs_set_autoreconnect(ctx, 2);
     nfs_set_readdir_max_buffer_size(ctx, kReaddirBytes, kReaddirBytes);
@@ -665,36 +1057,58 @@ bool reconnect(Share *s)
     }
     if (rc != 0)
     {
+        const char *e = nfs_get_error(ctx);
+        why = e && *e ? e : strerror(-rc);
         nfs_destroy_context(ctx);
         return false;
     }
     if (s->ctx)
-        nfs_destroy_context(s->ctx);
+    {
+        // Reads in flight on the old connection (cut by the watchdog, or failing) return first.
+        for (int waited = 0; s->reads_in_flight.load() > 0 && waited < 5000; waited += 20)
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        destroy_context(s->ctx, s->mt);
+    }
     s->ctx = ctx;
     ++s->gen;
+    start_service_thread(s);
     return true;
 }
 
-// One block from the server (no lock of the cache held). A read that fails or stalls is tried again on a new connection
-// a few times before the server is given up.
+// The file is being closed: its read-ahead thread stops retrying (free_cache waits for it).
+bool closing(File *f)
+{
+    Cache *c = f->cache;
+    if (!c)
+        return false;
+    std::lock_guard<std::mutex> g(c->m);
+    return c->stop;
+}
+
+// One block from the server (no lock of the cache held). A read that fails or stalls is tried again on a new
+// connection until it works, waiting a little longer each time (0.5 s, 1, 2, 4, 8, then every 10 s): a blip of the
+// network or of the server never freezes the game (it used to give the server up after 3 tries, and every read after
+// that failed, so the game hung on its loading screen). Only closing the file stops it.
 Block fetch_block(File *f, uint64_t number)
 {
-    constexpr int kTries = 3;
     Block b;
-    if (f->share->dead)
-        return b;
     const uint64_t start = number * kBlock;
     if (start >= f->size)
         return b;
     const size_t want = static_cast<size_t>(std::min<uint64_t>(kBlock, f->size - start));
+    if (disk_get(f, number, want, b))
+        return b;
     uint8_t *data = static_cast<uint8_t *>(malloc(want));
     if (!data)
         return b;
     size_t done = 0;
     int failures = 0;
+    int64_t failing_since = 0;
     while (done < want)
     {
         int rc = -EIO, seen;
+        bool ready = false, unlocked = false;
+        std::string why;
         {
             std::lock_guard<std::mutex> g(f->share->lock);
             seen = f->share->gen;
@@ -706,8 +1120,15 @@ Block fetch_block(File *f, uint64_t number)
                     f->fh = fresh;
                     f->gen = seen;
                 }
+                else
+                {
+                    const char *e = nfs_get_error(f->share->ctx);
+                    why = std::string("opening the file again: ") + (e ? e : "?");
+                }
             }
-            if (f->share->ctx && f->gen == seen && f->fh)
+            ready = f->share->ctx && f->gen == seen && f->fh;
+            unlocked = ready && f->share->mt;
+            if (ready && !unlocked)
             {
                 f->share->read_since = now_ms();
                 rc = nfs_pread(f->share->ctx, f->fh, data + done, want - done, start + done);
@@ -716,12 +1137,44 @@ Block fetch_block(File *f, uint64_t number)
                     ++g_n_read;
                     g_n_bytes += static_cast<uint64_t>(rc);
                 }
+                else if (rc < 0)
+                {
+                    const char *e = nfs_get_error(f->share->ctx);
+                    why = e && *e ? e : strerror(-rc);
+                }
                 f->share->read_since = 0;
             }
+            else if (!ready && why.empty())
+                why = "no connection";
+            if (unlocked && f->share->reads_in_flight.fetch_add(1) == 0)
+                f->share->read_since = now_ms(); // the watchdog times the oldest group of reads in flight
             f->share->stalled = false;
+        }
+        if (unlocked)
+        {
+            Share *s = f->share;
+            rc = nfs_pread(s->ctx, f->fh, data + done, want - done, start + done);
+            if (rc > 0)
+            {
+                ++g_n_read;
+                g_n_bytes += static_cast<uint64_t>(rc);
+            }
+            else if (rc < 0)
+            {
+                const char *e = nfs_get_error(s->ctx);
+                why = e && *e ? e : strerror(-rc);
+            }
+            if (s->reads_in_flight.fetch_sub(1) == 1)
+                s->read_since = 0;
         }
         if (rc > 0)
         {
+            if (failures)
+            {
+                nfs_log("nfs: %s: reads work again after %d tries (%.1f s)", f->share->url.c_str(), failures,
+                        (now_ms() - failing_since) / 1000.0);
+                g_reconnecting = false;
+            }
             done += static_cast<size_t>(rc);
             failures = 0;
             continue;
@@ -731,25 +1184,35 @@ Block fetch_block(File *f, uint64_t number)
             free(data);
             return b;
         }
-        if (f->share->dead || ++failures > kTries)
-        {
-            f->share->dead = true;
-            g_lost = true;
-            g_reconnecting = false;
-            free(data);
-            return b;
-        }
+        if (!failures)
+            failing_since = now_ms();
+        ++failures;
         g_reconnecting = true;
-        nfs_log("nfs: %s: a read failed, trying again on a new connection (%d of %d)", f->share->url.c_str(),
-                           failures, kTries);
-        std::this_thread::sleep_for(std::chrono::milliseconds(500 * failures));
+        const int wait_ms = failures > 5 ? 10000 : 500 << (failures - 1);
+        if (failures <= 10 || failures % 30 == 0)
+            nfs_log("nfs: %s: a read of %s failed (%s), trying again on a new connection in %.1f s (try %d, failing %.0f s)",
+                    f->share->url.c_str(), f->rel.c_str(), why.c_str(), wait_ms / 1000.0, failures,
+                    (now_ms() - failing_since) / 1000.0);
+        for (int waited = 0; waited < wait_ms; waited += 100)
+        {
+            if (closing(f))
+            {
+                free(data);
+                return b;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
         std::lock_guard<std::mutex> g(f->share->lock);
         if (f->share->gen == seen)
-            reconnect(f->share);
+        {
+            std::string no;
+            if (!reconnect(f->share, no) && (failures <= 10 || failures % 30 == 0))
+                nfs_log("nfs: %s: no new connection yet (%s)", f->share->url.c_str(), no.c_str());
+        }
     }
-    g_reconnecting = false;
     b.data = data;
     b.len = want;
+    disk_put(f, number, b);
     return b;
 }
 
@@ -774,6 +1237,19 @@ size_t cache_cap()
     return std::max<size_t>(kCacheTotal / static_cast<size_t>(n), kCacheLeast);
 }
 
+constexpr uint64_t kWindowLeast = 2; // blocks read ahead after a jump (1 MB)
+
+// The game is at `number` now (called with c->m): a step to the next block (or the same) widens the read-ahead, a jump
+// narrows it again.
+void note_position(Cache *c, uint64_t number)
+{
+    if (number == c->want || number == c->want + 1)
+        c->window = std::min<uint64_t>(c->window * 2, 1u << 16);
+    else
+        c->window = kWindowLeast;
+    c->want = number;
+}
+
 // The thread of a big file: the block the game wants first, then the ones after it, as far as its share of memory goes.
 void read_ahead(File *f)
 {
@@ -784,13 +1260,15 @@ void read_ahead(File *f)
     {
         const uint64_t at = c->want;
         const size_t cap = cache_cap();
-        const uint64_t ahead = (cap / kBlock) * 7 / 8; // what would be dropped at once is not read
+        // What would be dropped at once is not read, and no further than the game's reading pattern asks for.
+        const uint64_t ahead = std::min<uint64_t>((cap / kBlock) * 7 / 8, c->window + 1);
         uint64_t target = ~0ull;
-        if (!c->blocks.count(at) && at < blocks)
+        const auto wanted = [&](uint64_t k) { return !c->blocks.count(k) && !c->fetching.count(k) && !disk_has(f, k); };
+        if (at < blocks && wanted(at))
             target = at;
         else
             for (uint64_t k = at + 1; k < blocks && k < at + ahead; ++k)
-                if (!c->blocks.count(k))
+                if (wanted(k))
                 {
                     target = k;
                     break;
@@ -798,12 +1276,16 @@ void read_ahead(File *f)
         if (target == ~0ull)
         {
             trim(c, at, cap);
-            c->cv.wait_for(lk, std::chrono::milliseconds(200));
+            c->cv.wait_for(lk, std::chrono::milliseconds(c->fetching.empty() ? 200 : 20));
             continue;
         }
+        c->fetching.insert(target);
         lk.unlock();
         Block b = fetch_block(f, target);
+        if (b.data)
+            note_fetch(f, target);
         lk.lock();
+        c->fetching.erase(target);
         if (!b.data)
         {
             c->failed = true;
@@ -839,19 +1321,30 @@ size_t block_bytes(File *f, uint64_t number, size_t offset, uint8_t *dst, size_t
             memcpy(dst, b.data + offset, take);
             if (c->want != number)
             {
-                c->want = number;
+                note_position(c, number);
                 c->cv.notify_all();
             }
             return take;
         }
         if (f->share->dead || c->failed)
             return 0;
-        c->want = number;
+        if (c->want != number)
+            note_position(c, number);
+        {
+            lk.unlock();
+            const size_t from_drive = disk_read_range(f, number, offset, dst, n);
+            lk.lock();
+            if (from_drive)
+                return from_drive;
+        }
         if (!c->worker_on && f->size > kReadAhead && !c->stop)
         {
             c->worker_on = true;
             ++g_workers;
-            c->worker = std::thread(read_ahead, f);
+            // With the service thread, four reads in flight (each a 512 KB block); one otherwise.
+            const int count = f->share->mt ? 4 : 1;
+            for (int i = 0; i < count; ++i)
+                c->workers.emplace_back(read_ahead, f);
         }
         if (c->worker_on)
         {
@@ -861,6 +1354,8 @@ size_t block_bytes(File *f, uint64_t number, size_t offset, uint8_t *dst, size_t
         }
         lk.unlock();
         Block b = fetch_block(f, number);
+        if (b.data)
+            note_fetch(f, number);
         lk.lock();
         if (!b.data)
             return 0;
@@ -875,8 +1370,25 @@ size_t block_bytes(File *f, uint64_t number, size_t offset, uint8_t *dst, size_t
     }
 }
 
+size_t read_at_untimed(File *f, uint64_t pos, void *dst, size_t n);
+
 size_t read_at(File *f, uint64_t pos, void *dst, size_t n)
 {
+    const auto start = std::chrono::steady_clock::now();
+    const size_t got = read_at_untimed(f, pos, dst, n);
+    const uint64_t ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    g_asked_ns += ns;
+    uint64_t prev = g_asked_max_ns.load();
+    while (ns > prev && !g_asked_max_ns.compare_exchange_weak(prev, ns)) {
+    }
+    return got;
+}
+
+size_t read_at_untimed(File *f, uint64_t pos, void *dst, size_t n)
+{
+    ++g_n_asked;
+    g_n_asked_bytes += n;
     if (f->nt)
     {
         const size_t read = pos < f->size ? ntfsfs_pread(f->nt, dst, static_cast<size_t>(std::min<uint64_t>(n, f->size - pos)), pos) : 0;
@@ -1022,8 +1534,9 @@ void drop_share(Share *s)
     {
         std::lock_guard<std::mutex> g(s->lock);
         if (s->ctx)
-            nfs_destroy_context(s->ctx);
+            destroy_context(s->ctx, s->mt);
         s->ctx = nullptr;
+        s->mt = false;
     }
     std::lock_guard<std::mutex> g(g_mutex);
     s->mounted = false;
@@ -1305,6 +1818,7 @@ extern "C" int nfs_mount_all(int timeout_ms)
         else if (p.job->ok)
         {
             p.share->ctx = p.job->ctx;
+            start_service_thread(p.share);
             p.share->base = p.job->base;
             p.share->folder = p.job->folder;
             p.share->mounted = true;
@@ -1503,6 +2017,62 @@ extern "C" void nfs_set_index_dir(const char *dir)
     g_index_dir = dir ? dir : "";
 }
 
+extern "C" void nfs_set_disk_cache(const char *dir, unsigned long long bytes)
+{
+    if (!dir || !*dir || bytes == 0 || g_disk_on)
+        return;
+    g_disk_dir = dir;
+    g_disk_budget = bytes;
+    mkdir(g_disk_dir.c_str(), 0777);
+    // What a previous run left: each game's size (its blocks) and when it was used (its folder's date).
+    uint64_t total = 0;
+    std::map<std::string, DiskGame> games;
+    if (DIR *d = opendir(g_disk_dir.c_str()))
+    {
+        while (dirent *e = readdir(d))
+        {
+            if (e->d_name[0] == '.')
+                continue;
+            const std::string game = g_disk_dir + "/" + e->d_name;
+            struct stat gs;
+            if (__real_stat(game.c_str(), &gs) != 0 || !S_ISDIR(gs.st_mode))
+                continue;
+            DiskGame entry;
+            entry.used = static_cast<int64_t>(gs.st_mtime);
+            if (DIR *blocks = opendir(game.c_str()))
+            {
+                while (dirent *b = readdir(blocks))
+                {
+                    if (b->d_name[0] == '.')
+                        continue;
+                    const size_t length = strlen(b->d_name);
+                    if (length > 4 && strcmp(b->d_name + length - 4, ".tmp") == 0)
+                    {
+                        unlink((game + "/" + b->d_name).c_str());
+                        continue;
+                    }
+                    entry.bytes += kBlock; // a game's last block may be shorter: close enough for the budget
+                }
+                closedir(blocks);
+            }
+            total += entry.bytes;
+            games[e->d_name] = entry;
+        }
+        closedir(d);
+    }
+    {
+        std::lock_guard<std::mutex> g(g_disk_mutex);
+        g_disk_games = std::move(games);
+        g_disk_total = total;
+    }
+    g_disk_on = true;
+    nfs_log("nfs: disk cache %s: %llu MB of %llu MB in %zu games", g_disk_dir.c_str(),
+            static_cast<unsigned long long>(total >> 20), static_cast<unsigned long long>(bytes >> 20),
+            g_disk_games.size());
+    if (total > bytes)
+        disk_evict(std::string{});
+}
+
 extern "C" bool nfs_is_path(const char *path)
 {
     return is_nfs(path) || ntfsfs_is_path(path);
@@ -1641,53 +2211,6 @@ extern "C" void nfs_alias_commit(void)
     g_alias_any.store(!g_alias.empty(), std::memory_order_release);
 }
 
-// ---- which paths hold the process's descriptors (EDEN_FD_PATHS in stderr.log, every 20 s):
-// the console allows ~267, far fewer than RLIMIT_NOFILE says.
-namespace
-{
-    std::mutex g_fd_paths_mutex;
-    std::unordered_map<int, std::string> &fd_paths()
-    {
-        static std::unordered_map<int, std::string> paths;
-        return paths;
-    }
-    void remember_fd(int fd, const char *path)
-    {
-        if (fd < 0 || path == nullptr)
-            return;
-        std::lock_guard lock{g_fd_paths_mutex};
-        fd_paths()[fd] = path;
-    }
-    void forget_fd(int fd)
-    {
-        std::lock_guard lock{g_fd_paths_mutex};
-        fd_paths().erase(fd);
-    }
-}
-
-extern "C" void eden_fd_paths_report(FILE *out)
-{
-    std::map<std::string, int> folders;
-    size_t total = 0;
-    {
-        std::lock_guard lock{g_fd_paths_mutex};
-        total = fd_paths().size();
-        for (const auto &[fd, path] : fd_paths())
-        {
-            const auto slash = path.find_last_of('/');
-            ++folders[slash == std::string::npos ? path : path.substr(0, slash)];
-        }
-    }
-    std::vector<std::pair<int, std::string>> largest;
-    for (auto &[folder, count] : folders)
-        largest.emplace_back(count, folder);
-    std::sort(largest.rbegin(), largest.rend());
-    std::fprintf(out, "EDEN_FD_PATHS tracked=%zu folders=%zu", total, folders.size());
-    for (size_t i = 0; i < largest.size() && i < 10; ++i)
-        std::fprintf(out, " | %d %s", largest[i].first, largest[i].second.c_str());
-    std::fprintf(out, "\n");
-}
-
 // ---- the C library's calls
 
 extern "C"
@@ -1696,12 +2219,7 @@ extern "C"
     {
         std::string nfs_path;
         if (!redirect(path, nfs_path))
-        {
-            FILE *stream = __real_fopen(path, mode);
-            if (stream != nullptr)
-                remember_fd(__real_fileno(stream), path);
-            return stream;
-        }
+            return __real_fopen(path, mode);
         path = nfs_path.c_str();
         if (!read_mode(mode))
         {
@@ -1722,11 +2240,7 @@ extern "C"
     {
         File *n = file_of(f);
         if (!n)
-        {
-            if (f != nullptr)
-                forget_fd(__real_fileno(f));
             return ps5_memstream_fclose(f);
-        }
         free_file(n);
         return 0;
     }
@@ -1860,11 +2374,7 @@ extern "C"
         }
         std::string nfs_path;
         if (!redirect(path, nfs_path))
-        {
-            const int fd = __real_open(path, flags, mode);
-            remember_fd(fd, path);
-            return fd;
-        }
+            return __real_open(path, flags, mode);
         if ((flags & O_ACCMODE) != O_RDONLY || (flags & (O_CREAT | O_TRUNC)))
         {
             errno = EROFS;
@@ -1884,10 +2394,7 @@ extern "C"
     {
         File *f = file_of_fd(fd);
         if (!f)
-        {
-            forget_fd(fd);
             return __real_close(fd);
-        }
         free_file(f);
         return 0;
     }

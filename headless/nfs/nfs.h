@@ -82,6 +82,8 @@ extern "C"
 
     /* Where the listings of big folders are kept between runs (valid while the folder's modification time is the same). */
     void nfs_set_index_dir(const char *dir);
+    // Keep blocks read from the shares on the console's drive under `dir`, up to `bytes` (0: off). Once, at start.
+    void nfs_set_disk_cache(const char *dir, unsigned long long bytes);
 
     /* True for a path under /nfs (when shares are set). */
     bool nfs_is_path(const char *path);
