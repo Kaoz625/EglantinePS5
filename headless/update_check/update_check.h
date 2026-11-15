@@ -44,8 +44,12 @@ extern "C"
 
 #define UPDATE_CHECK_HOST "raw.githubusercontent.com"
 /* EglantinePS5: its own catalog, the branch `catalog` of its repository
- * (tools/publish-update-catalog.py), instead of prosperostore.net and that site's mirror. */
-#define UPDATE_CHECK_API "https://" UPDATE_CHECK_HOST "/viejunerd/Eglantine-PS5-/catalog/"
+ * (tools/publish-update-catalog.py), instead of prosperostore.net and that site's mirror.
+ * Blazing fork (Kaoz625): asks OUR fork's `catalog` branch, which does not exist, so the check
+ * answers "unknown" and no "Update available" dialog is shown. With viejunerd's catalog, one press of
+ * Cross on that dialog (an RP press landing late, 8 + 15 Nov) made self-updater.elf replace our build
+ * with the official release. To follow the official catalog again, put viejunerd/Eglantine-PS5- back. */
+#define UPDATE_CHECK_API "https://" UPDATE_CHECK_HOST "/Kaoz625/EglantinePS5/catalog/"
 #define UPDATE_CHECK_ORIGINS 1
 #define UPDATE_CHECK_MAX_RESPONSE 65536u
 
