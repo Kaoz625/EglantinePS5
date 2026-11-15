@@ -29,7 +29,13 @@ if [[ -n ${EDEN_DEV_CHECKOUT:-} ]]; then
 fi
 # EDEN_CI_DEV_TITLE (release.yml input dev_title): a development build that boots that one title, with
 # the profiling counters and the compat-input.txt scripted pad, packed like a release.
-if [[ -n ${EDEN_CI_DEV_TITLE:-} ]]; then
+if [[ ${EDEN_CI_DEV_TITLE:-} == diag ]]; then
+    # dev_title=diag: the RELEASE build plus EDEN_MKW_DIAGNOSTICS (compat-input.txt scripted pad in games,
+    # MKW_MEMORY every 5 s), without the dev profile counters, so its fps compares with a plain release.
+    # (15 Nov: the dev profile's source injections fail to configure on the v1.219.028+ core.)
+    export EDEN_MKW_DIAGNOSTICS=ON
+    make release
+elif [[ -n ${EDEN_CI_DEV_TITLE:-} ]]; then
     # MKW_MEMORY every 5 s (headless/performance.cpp); cheap next to the profile counters.
     export EDEN_MKW_DIAGNOSTICS=ON
     make prepare
