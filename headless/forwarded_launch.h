@@ -2,6 +2,7 @@
 #pragma once
 #include <string>
 #include <string_view>
+#include <cstddef>
 
 namespace Eden {
 
@@ -29,7 +30,26 @@ inline ForwardedArgs ParseForwardedArgs(int argc, char** argv) {
     return result;
 }
 
-inline std::string ResolveForwardedRom(std::string_view rom, std::string_view roms_dir) {
+// "%20" and other %XX in a --rom path are decoded: a payload loader splits its arguments at spaces, so a path
+// with spaces ("/nfs/<host>/switch/Mario Kart World [...].nup") can only arrive encoded (Blazing, 15 Nov 2026).
+inline std::string DecodeForwardedRom(std::string_view rom) {
+    auto hex = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 :
+                                   c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; };
+    std::string out;
+    for (std::size_t i = 0; i < rom.size(); ++i) {
+        if (rom[i] == '%' && i + 2 < rom.size() && hex(rom[i + 1]) >= 0 && hex(rom[i + 2]) >= 0) {
+            out += static_cast<char>(hex(rom[i + 1]) * 16 + hex(rom[i + 2]));
+            i += 2;
+        } else {
+            out += rom[i];
+        }
+    }
+    return out;
+}
+
+inline std::string ResolveForwardedRom(std::string_view encoded, std::string_view roms_dir) {
+    const std::string decoded = DecodeForwardedRom(encoded);
+    std::string_view rom = decoded;
     while (!rom.empty() && (rom.back() == ' ' || rom.back() == '\r' || rom.back() == '\n')) rom.remove_suffix(1);
     if (rom.empty()) return {};
     if (rom.front() == '/') return std::string{rom};
