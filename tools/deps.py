@@ -170,8 +170,41 @@ def fetch_git(item):
             fail(f'{item["name"]}: fetched {head}, pinned {item["commit"]}')
         staging.rename(path)
     if 'setup' in item and not (path / item['setup_creates']).exists():
+        preseed_zlib(path)
         print(f'deps: setting up {item["name"]}: {" ".join(item["setup"])}', flush=True)
         subprocess.run(item['setup'], cwd=path, check=True)
+
+
+# The boilerplate's setup takes zlib 1.3.2 from zlib.net, which hands CI runners something else now and then
+# ("1 computed checksum did NOT match", 3 of 6 runs on 15 Nov 2026). Its setup keeps an archive already in its
+# cache when the hash matches, so put a checked copy there first (zlib.net, then madler's GitHub release).
+ZLIB_HASH = 'bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16'
+ZLIB_URLS = ('https://zlib.net/fossils/zlib-1.3.2.tar.gz',
+             'https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz')
+
+
+def preseed_zlib(path):
+    import hashlib, time, urllib.request
+    target = path / '.deps' / 'native' / 'zlib' / 'zlib-1.3.2.tar.gz'
+    if not (path / 'tools' / 'setup-native-dependencies.sh').exists():
+        return
+    if target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() == ZLIB_HASH:
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in range(4):
+        for url in ZLIB_URLS:
+            try:
+                with urllib.request.urlopen(url, timeout=60) as response:
+                    data = response.read()
+            except OSError as error:
+                print(f'deps: zlib from {url}: {error}', flush=True)
+                continue
+            if hashlib.sha256(data).hexdigest() == ZLIB_HASH:
+                target.write_bytes(data)
+                print(f'deps: zlib 1.3.2 placed from {url}', flush=True)
+                return
+            print(f'deps: zlib from {url}: wrong checksum ({len(data)} bytes), trying again', flush=True)
+        time.sleep(5 * (attempt + 1))
 
 
 def fetch(item):
