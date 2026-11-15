@@ -955,10 +955,20 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         no_mesh = std::filesystem::exists(no_mesh_file);
     }
     const bool emulated_mesh{mesh_draw && pipeline->IsEmulatedMesh()};
+    // Blazing (15 Nov 2026): Mario Kart World's task/mesh draws hang the PS5's GPU (VK_ERROR_DEVICE_LOST
+    // 75-111 s in, with and without our core patches); viejunerd's 0046 skips them for this title too.
+    // EDEN_NX2_MKW_MESH=1 draws them.
+    static const bool mkw_mesh = [] {
+        const char* value = std::getenv("EDEN_NX2_MKW_MESH");
+        return value != nullptr && value[0] != '0';
+    }();
+    const bool no_mesh_title{mesh_draw && !mkw_mesh &&
+                             Settings::GetCurrentProgramID() == 0x0400C3F00006E000ULL};
     if (mesh_draw &&
-        (no_mesh || (!device.IsExtMeshShaderSupported() && !emulated_mesh) ||
+        (no_mesh || no_mesh_title || (!device.IsExtMeshShaderSupported() && !emulated_mesh) ||
          (emulated_mesh && is_indirect))) {
         report_failure(no_mesh         ? "EDEN_NX2_NO_MESH"
+                       : no_mesh_title ? "off for Mario Kart World"
                        : emulated_mesh ? "indirect emulated mesh draw"
                                        : "no VK_EXT_mesh_shader");
         TraceRenderState(is_indexed, "mesh-skipped", nullptr);
