@@ -1725,7 +1725,7 @@ int main(int argc, char** argv) {
                                 VideoCommon::LoadingProbe::capture_enabled = true;
                                 LOG_CRITICAL(HW_GPU, "MKW GPFIFO ring armed, maximum8MiB/4096records");
                             }
-                            if (diagnostic_sample == 4) Tegra::GpfifoCapture::Flush("mkw-loading-snapshot");
+                            // (no Tegra::GpfifoCapture in this core: the MKW diagnostics take no GPFIFO ring snapshot)
                             const auto report = [](const char* name, auto& channel) {
                                 LOG_CRITICAL(Render_Vulkan, "MKW progress {} phase={} arg={:#x} serial={}", name,
                                     channel.phase.load(), channel.argument.load(), channel.serial.load());
