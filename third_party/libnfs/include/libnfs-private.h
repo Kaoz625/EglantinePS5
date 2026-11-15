@@ -88,7 +88,7 @@
  * else libnfs falls back to the poll timeout, exactly as it did before the
  * wakeup existed.
  */
-#if defined(HAVE_MULTITHREADING) && defined(HAVE_SYS_EVENTFD_H)
+#if defined(HAVE_MULTITHREADING) && (defined(HAVE_SYS_EVENTFD_H) || defined(LIBNFS_PIPE_WAKEUP))
 #define LIBNFS_EVENTFD_WAKEUP 1
 #endif
 
@@ -366,6 +366,7 @@ struct rpc_context {
 	 * wakes on rpc->poll_timeout, so -1 costs latency, never correctness.
 	 */
 	int evfd;
+	int evfd_write; /* LIBNFS_PIPE_WAKEUP: the pipe's write end; -1 otherwise */
 	int is_connected;
 	int is_nonblocking;
 

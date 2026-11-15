@@ -492,7 +492,9 @@ void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, Id value) {
     const AttributeType type{ctx.runtime_info.color_output_types[index]};
     if (type == AttributeType::Float) {
         const Id pointer{ctx.OpAccessChain(ctx.output_f32, ctx.frag_color.at(index), component_id)};
-        ctx.OpStore(pointer, value);
+        // A NaN colour is written as zero (Swordpdf/ProsperoEden e34338dd, issue 245): a blur,
+        // bloom or temporal pass would spread it into dark boxes that grow each frame.
+        ctx.OpStore(pointer, ctx.OpSelect(ctx.F32[1], ctx.OpIsNan(ctx.U1, value), ctx.Const(0.0f), value));
     } else if (type == AttributeType::UnsignedInt) {
         const Id pointer{ctx.OpAccessChain(ctx.output_u32, ctx.frag_color.at(index), component_id)};
         ctx.OpStore(pointer, ctx.OpBitcast(ctx.U32[1], value));
@@ -503,7 +505,9 @@ void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, Id value) {
     } else {
         // Disabled or unknown, treat as float
         const Id pointer{ctx.OpAccessChain(ctx.output_f32, ctx.frag_color.at(index), component_id)};
-        ctx.OpStore(pointer, value);
+        // A NaN colour is written as zero (Swordpdf/ProsperoEden e34338dd, issue 245): a blur,
+        // bloom or temporal pass would spread it into dark boxes that grow each frame.
+        ctx.OpStore(pointer, ctx.OpSelect(ctx.F32[1], ctx.OpIsNan(ctx.U1, value), ctx.Const(0.0f), value));
     }
 }
 
