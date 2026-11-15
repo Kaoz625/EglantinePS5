@@ -271,6 +271,7 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
       master_semaphore{std::make_unique<MasterSemaphore>(device)},
       command_pool{std::make_unique<CommandPool>(*master_semaphore, device)},
       upload_batch{std::make_unique<UploadBatch>()} {
+    blz_stall_thread = std::thread([this] { BlzStallWatch(); });
 
     if (Common::DkbFrameTrace::Enabled()) {
         const auto physical = device.GetPhysical();
@@ -312,6 +313,10 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
 }
 
 Scheduler::~Scheduler() {
+    blz_stall_stop.store(true, std::memory_order_relaxed);
+    if (blz_stall_thread.joinable()) {
+        blz_stall_thread.join();
+    }
     if (trace_query_pool) {
         WaitWorker();
         worker_thread.request_stop();
@@ -991,6 +996,25 @@ void Scheduler::TraceGpuSubmission() {
     trace_gpu_recording = true;
 }
 
+
+namespace {
+struct BlzSubmitRecord {
+    u64 tick;
+    s64 ns;
+    u32 draws;
+    u32 dispatches;
+    u64 compute_hash;
+    int origin;
+};
+constexpr size_t kBlzRing = 256;
+std::array<BlzSubmitRecord, kBlzRing> blz_ring{};
+std::atomic<u64> blz_ring_count{0};
+s64 BlzNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+} // namespace
 u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
     if (uploads_pending) {
         // Keep the copies in the tick that protects their staging regions and buffer lifetimes.
@@ -1004,6 +1028,17 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     InvalidateState();
 
     const u64 signal_value = master_semaphore->NextTick();
+    {
+        const u64 slot = blz_ring_count.fetch_add(1, std::memory_order_relaxed);
+        blz_ring[slot % kBlzRing] = BlzSubmitRecord{
+            .tick = signal_value,
+            .ns = BlzNowNs(),
+            .draws = BlzSubmitTrace::draws.exchange(0, std::memory_order_relaxed),
+            .dispatches = BlzSubmitTrace::dispatches.exchange(0, std::memory_order_relaxed),
+            .compute_hash = BlzSubmitTrace::last_compute_hash.load(std::memory_order_relaxed),
+            .origin = static_cast<int>(gpu_submit_origin),
+        };
+    }
     RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
                             submit_origin = gpu_submit_origin,
                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
@@ -1187,6 +1222,54 @@ void Scheduler::AcquireNewChunk() {
         // Otherwise, we can just take from the reserve.
         chunk = std::move(chunk_reserve.back());
         chunk_reserve.pop_back();
+    }
+}
+
+
+// Prints the ring of recent submissions when the GPU has made no progress for 2 s while work is
+// pending (again at 10 s and 30 s): which tick it is stuck on, and what that submission carried.
+void Scheduler::BlzStallWatch() {
+    u64 last_known = 0;
+    s64 last_progress = BlzNowNs();
+    int reported = 0;
+    while (!blz_stall_stop.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        master_semaphore->Refresh();
+        const u64 known = master_semaphore->KnownGpuTick();
+        const u64 current = master_semaphore->CurrentTick();
+        const s64 now = BlzNowNs();
+        if (known != last_known || current <= known + 1) {
+            if (reported != 0) {
+                std::fprintf(stderr, "BLZ_GPU_STALL_END known=%llu after_ms=%lld\n",
+                             static_cast<unsigned long long>(known),
+                             static_cast<long long>((now - last_progress) / 1000000));
+            }
+            last_known = known;
+            last_progress = now;
+            reported = 0;
+            continue;
+        }
+        const s64 stalled_ms = (now - last_progress) / 1000000;
+        static constexpr s64 kAt[] = {2000, 10000, 30000};
+        if (reported >= 3 || stalled_ms < kAt[reported]) {
+            continue;
+        }
+        ++reported;
+        const u64 count = blz_ring_count.load(std::memory_order_relaxed);
+        std::fprintf(stderr,
+                     "BLZ_GPU_STALL stalled_ms=%lld known_tick=%llu current_tick=%llu submits=%llu\n",
+                     static_cast<long long>(stalled_ms), static_cast<unsigned long long>(known),
+                     static_cast<unsigned long long>(current), static_cast<unsigned long long>(count));
+        const u64 shown = std::min<u64>(count, 48);
+        for (u64 i = count - shown; i < count; ++i) {
+            const BlzSubmitRecord r = blz_ring[i % kBlzRing];
+            std::fprintf(stderr,
+                         "BLZ_GPU_SUBMIT tick=%llu %s age_ms=%lld draws=%u dispatches=%u last_compute=%016llx origin=%d\n",
+                         static_cast<unsigned long long>(r.tick), r.tick <= known ? "done" : "PENDING",
+                         static_cast<long long>((now - r.ns) / 1000000), r.draws, r.dispatches,
+                         static_cast<unsigned long long>(r.compute_hash), r.origin);
+        }
+        std::fflush(stderr);
     }
 }
 

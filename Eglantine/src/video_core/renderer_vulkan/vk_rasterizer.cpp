@@ -1354,6 +1354,7 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 } // Anonymous namespace
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+    BlzSubmitTrace::draws.fetch_add(1, std::memory_order_relaxed);
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     {
         // A draw's first and count can come from memory a skipped (rejected) compute program
@@ -1593,6 +1594,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 }
 
 void RasterizerVulkan::DrawIndirect() {
+    BlzSubmitTrace::draws.fetch_add(1, std::memory_order_relaxed);
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
     if (Common::DkbFrameTrace::Enabled()) {
@@ -1864,6 +1866,7 @@ void RasterizerVulkan::CollectIndirectTrace() {
 }
 
 void RasterizerVulkan::DrawTexture() {
+    BlzSubmitTrace::draws.fetch_add(1, std::memory_order_relaxed);
     SCOPE_EXIT { SyncProbe(scheduler, "draw_texture", nullptr); };
 
     SCOPE_EXIT {
@@ -2246,6 +2249,7 @@ constexpr VkPipelineStageFlags COMPUTE_CONSUMER_STAGES =
 } // namespace
 
 void RasterizerVulkan::DispatchCompute() {
+    BlzSubmitTrace::dispatches.fetch_add(1, std::memory_order_relaxed);
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
     FlushWork();
     gpu_memory->FlushCaching();
@@ -2256,6 +2260,9 @@ void RasterizerVulkan::DispatchCompute() {
 
     u64 native_key{};
     ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline(native_key)};
+    if (pipeline) {
+        BlzSubmitTrace::last_compute_hash.store(pipeline->ShaderHash(), std::memory_order_relaxed);
+    }
     if (!pipeline) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
         return;

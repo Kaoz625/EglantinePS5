@@ -37,6 +37,14 @@ class QueryCacheBase;
 
 namespace Vulkan {
 
+// Blazing GPU-stall trace (15 Nov 2026, Ocarina of Time GPU hang on the PS5): what each submission
+// carried, kept in a ring and printed (stderr, BLZ_GPU_STALL) when the GPU stops making progress.
+namespace BlzSubmitTrace {
+inline std::atomic<u32> draws{0};
+inline std::atomic<u32> dispatches{0};
+inline std::atomic<u64> last_compute_hash{0};
+} // namespace BlzSubmitTrace
+
 class CommandPool;
 class Device;
 class Framebuffer;
@@ -466,6 +474,9 @@ private:
     StateTracker& state_tracker;
 
     std::unique_ptr<MasterSemaphore> master_semaphore;
+    std::thread blz_stall_thread;
+    std::atomic<bool> blz_stall_stop{false};
+    void BlzStallWatch();
     FragmentBarrierState fragment_barrier;
     bool render_pass_has_stores{};
     bool compute_writes_pending{};
