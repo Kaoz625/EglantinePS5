@@ -140,6 +140,7 @@ namespace Common {
 bool SparseTablesAvailable() noexcept; // src/memory_pages.cpp
 void GuestMemoryUsage(std::size_t* span, std::size_t* held) noexcept;
 std::size_t GuestMemoryHeldIn(std::uint64_t offset, std::size_t bytes) noexcept;
+void SetGuestMemoryFine(bool on) noexcept; // src/guest_memory_service.inc
 }
 #if defined(EDEN_DEV_PROFILE) || defined(EDEN_DEV_ROM_ID)
 static bool dev_stop_hang = false; // dev-settings stop_hang=on
@@ -1245,6 +1246,14 @@ int main(int argc, char** argv) {
             // one is off unless chosen there, for every game or for this one. The levels start
             // every session at their exact values (above), so one that is not chosen is off.
             const auto speed = Eden::LoadPerformance(eden_game_title_id(guest));
+#ifdef PS5_NATIVE
+            // Fine compaction (zero 16 KiB pages of a written slot given back, the slot fenced) only for
+            // Donkey Kong Bananza and Mario Kart World, as in viejunerd v1.219.029. The in-repo core lost
+            // this call, so fine compaction ran for every game (log "EDEN_CRAM on: ... fine=1"); suspect in
+            // the Ocarina of Time GPU reset at 4-5 min on PHAT5 (blz, 16 Nov 2026).
+            ::Common::SetGuestMemoryFine(eden_game_title_id(guest) == 0x040074A01BF12000ULL ||
+                                         eden_game_title_id(guest) == 0x0400C3F00006E000ULL);
+#endif
             Settings::values.use_asynchronous_shaders = speed.async_shaders;
             if (speed.fast_gpu) {
                 // Nothing calls UpdateGPUAccuracy() here; set the live value too.
