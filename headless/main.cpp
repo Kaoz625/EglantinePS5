@@ -1150,8 +1150,17 @@ int main(int argc, char** argv) {
             // Donkey Kong Bananza and Mario Kart World run short of memory: written slots with many
             // pages of zeroes keep only the others (576 MiB of Bananza's 4.3 GiB were such pages), and
             // a write makes one whole.
-            ::Common::SetGuestMemoryFine(eden_game_title_id(guest) == 0x040074A01BF12000ULL ||
-                                         eden_game_title_id(guest) == 0x0400C3F00006E000ULL);
+            // The Legend of Zelda: Ocarina of Time (Switch 2) too: on a standard PS5 its memory grows
+            // from 3.4 to 5.8 GiB at the first load and the pool runs out (16 Nov 2026).
+            // EDEN_CRAM_FINE=1/0 (env.txt) turns it on or off for any game, to measure it.
+            {
+                bool fine = eden_game_title_id(guest) == 0x040074A01BF12000ULL ||
+                            eden_game_title_id(guest) == 0x0400C3F00006E000ULL ||
+                            eden_game_title_id(guest) == 0x0400486024DEC000ULL;
+                if (const char* asked = std::getenv("EDEN_CRAM_FINE"); asked && *asked)
+                    fine = asked[0] != '0';
+                ::Common::SetGuestMemoryFine(fine);
+            }
 #endif
             Settings::values.use_asynchronous_shaders = speed.async_shaders;
             if (speed.fast_gpu) {
