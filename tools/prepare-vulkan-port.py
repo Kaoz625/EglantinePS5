@@ -656,6 +656,20 @@ adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp', 'vulkan_stagi
      '            last_release = now;\n'
      '            ReleaseCompleted();\n'
      '        }\n'
+     '    } else {\n'
+     '        // Large kept buffers (over 32 MiB) go as soon as the GPU is done with them, short or not:\n'
+     '        // kept for 64 frames, idle ones held 0.5-0.9 GB during Ocarina of Time\'s loads (uploads\n'
+     '        // of up to 288 MiB), in the one pool the game\'s memory shares (heydemoura/EglantinePS5 #113).\n'
+     '        const auto idle = [this](const StagingBuffer& entry) {\n'
+     '            return !entry.deferred && scheduler.IsFree(entry.tick);\n'
+     '        };\n'
+     '        for (StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {\n'
+     '            for (size_t level = 26; level < NUM_LEVELS; ++level) {\n'
+     '                if (!(*cache)[level].entries.empty()) {\n'
+     '                    ::Eden::StagingBuffers::ReleaseFrom((*cache)[level], idle);\n'
+     '                }\n'
+     '            }\n'
+     '        }\n'
      '    }'),
     ('    const auto is_free = [this](const StagingBuffer& entry) {\n'
      '        return !entry.deferred && scheduler.IsFree(entry.tick);\n'
@@ -1327,6 +1341,17 @@ probes = {
     # With custom border colours off (the console default), report which clamp-to-border
     # samplers ask for a colour the three standard ones cannot give exactly.
     'vk_texture_cache': [
+        # While the console's pool is short, finished decode images are not kept for the next texture
+        # of their shape (up to 256 MiB of them, 60 frames): they go (heydemoura/EglantinePS5 #113).
+        ('    std::erase_if(free_transcodes, [](PendingTranscode& t) {\n'
+         '        return ++t.unused_frames > MAX_UNUSED_SCRATCH_FRAMES;\n'
+         '    });\n',
+         '    std::erase_if(free_transcodes, [](PendingTranscode& t) {\n'
+         '        return ++t.unused_frames > MAX_UNUSED_SCRATCH_FRAMES;\n'
+         '    });\n'
+         '    if (::Eden::Performance::graphics_memory_short.load(std::memory_order_relaxed)) {\n'
+         '        free_transcodes.clear();\n'
+         '    }\n'),
         ('void TextureCacheRuntime::Finish() {',
          'void TextureCacheRuntime::Finish() {\n'
          '    ::Eden::VulkanProbe::GpuSubmitOriginScope origin{__builtin_return_address(0), true};'),

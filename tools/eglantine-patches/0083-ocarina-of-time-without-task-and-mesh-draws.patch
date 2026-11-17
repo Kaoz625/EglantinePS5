@@ -1,0 +1,23 @@
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index cb76063..f550ab7 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -392,10 +392,16 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+         const char* value = std::getenv("EDEN_NX2_MKW_MESH");
+         return value != nullptr && value[0] != '0';
+     }();
+-    const bool no_mesh_title{!mkw_mesh && Settings::GetCurrentProgramID() == 0x0400C3F00006E000ULL};
++    // The Legend of Zelda: Ocarina of Time (Switch 2): the first task/mesh draw of the first
++    // in-engine scene (the end of the opening movie) hangs the GPU's graphics pipe; the system
++    // then kills the app (measured on a PS5 on firmware 10.20, 16 Nov 2026: 3 of 3 runs with the
++    // draws, 0 of 4 without). The same switch draws them again.
++    const u64 mesh_title_id{Settings::GetCurrentProgramID()};
++    const bool no_mesh_title{!mkw_mesh && (mesh_title_id == 0x0400C3F00006E000ULL ||
++                                           mesh_title_id == 0x0400486024DEC000ULL)};
+     if (mesh_draw && (no_mesh || no_mesh_title || !device.IsExtMeshShaderSupported())) {
+         report_failure(no_mesh         ? "EDEN_NX2_NO_MESH"
+-                       : no_mesh_title ? "off for Mario Kart World"
++                       : no_mesh_title ? "off for this title (Mario Kart World, Ocarina of Time)"
+                                        : "no VK_EXT_mesh_shader");
+         return;
+     }
