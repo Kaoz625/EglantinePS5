@@ -1,0 +1,37 @@
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index f550ab71f9..08d755e41c 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -210,6 +210,20 @@ bool IsPrimitiveRestartSupported(const Device& device, VkPrimitiveTopology topol
+ }
+ } // Anonymous namespace
+ 
++// PS5: the two descriptor update queues are heap blocks of 96 MiB and 24 MiB (8 frames of
++// 0x80000 and 0x20000 entries of 24 bytes), and the heap's memory is taken whole from the 12 GiB
++// pool. A quarter of each (24 + 6 MiB): a frame that fills its part waits for the worker and
++// starts its part again (UpdateDescriptorQueue::Acquire). EDEN_NX2_DESC_QUEUE_DIV=1 (2, 8) sets
++// the divisor; 1 is the size the core ships with.
++static size_t DescriptorQueueEntries(size_t entries) {
++    size_t divisor = 4;
++    if (const char* asked = std::getenv("EDEN_NX2_DESC_QUEUE_DIV"); asked && *asked) {
++        const long value = std::strtol(asked, nullptr, 10);
++        if (value >= 1 && value <= 16) divisor = static_cast<size_t>(value);
++    }
++    return entries / divisor;
++}
++
+ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra::GPU& gpu_,
+                                    Tegra::MaxwellDeviceMemoryManager& device_memory_,
+                                    const Device& device_, MemoryAllocator& memory_allocator_,
+@@ -217,9 +231,9 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
+     : gpu{gpu_}, device_memory{device_memory_}, device{device_},
+       memory_allocator{memory_allocator_}, state_tracker{state_tracker_}, scheduler{scheduler_},
+       staging_pool(device, memory_allocator, scheduler), descriptor_pool(device, scheduler),
+-      guest_descriptor_queue(device, UpdateDescriptorQueue::GUEST_FRAME_PAYLOAD_SIZE,
++      guest_descriptor_queue(device, DescriptorQueueEntries(UpdateDescriptorQueue::GUEST_FRAME_PAYLOAD_SIZE),
+                              device.IsExtDescriptorBufferSupported()),
+-      compute_pass_descriptor_queue(device, UpdateDescriptorQueue::COMPUTE_FRAME_PAYLOAD_SIZE),
++      compute_pass_descriptor_queue(device, DescriptorQueueEntries(UpdateDescriptorQueue::COMPUTE_FRAME_PAYLOAD_SIZE)),
+       descriptor_buffer_ring(device, memory_allocator),
+       blit_image(device, scheduler, state_tracker, descriptor_pool), render_pass_cache(device),
+       texture_cache_runtime{
