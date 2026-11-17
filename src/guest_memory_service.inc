@@ -26,7 +26,24 @@ namespace {
 enum : std::uint8_t { SlotZero = 0, SlotOwn = 1, SlotShared = 2, SlotFine = 3, SlotLock = 0x80, SlotMask = 0x7f };
 constexpr std::size_t FinePage = 16384, FinePages = SparseSlot / FinePage;
 // A written slot becomes Fine with at least this many pages of zeroes (512 KiB given back).
-constexpr std::size_t FineMinZeroPages = 32;
+constexpr std::size_t FineMinZeroPagesDefault = 32;
+// EDEN_CRAM_FINE_MIN=<8..127> (env.txt) changes it for a measurement.
+// (Read each time: env.txt is applied after the first call.)
+[[maybe_unused]] std::size_t FineMinZeroPages() noexcept {
+    const char* asked = std::getenv("EDEN_CRAM_FINE_MIN");
+    const long value = asked && *asked ? std::strtol(asked, nullptr, 10) : 0;
+    return value >= 8 && value < static_cast<long>(FinePages) ? static_cast<std::size_t>(value)
+                                                              : FineMinZeroPagesDefault;
+}
+// A Fine slot's pages that hold data stay writable (the console): only a write to one of its pages
+// of zeroes makes the slot whole. With every page read-only, Ocarina of Time (Switch 2) wrote its
+// Fine slots again as fast as they were made (fined 1,125, made whole 987 in 90 s) and the slots
+// gave back 0.2-0.3 GiB of the 0.48 GiB their pages of zeroes hold. EDEN_CRAM_FINE_RW=0 (env.txt)
+// is the read-only form again.
+[[maybe_unused]] bool FineWritable() noexcept {
+    const char* asked = std::getenv("EDEN_CRAM_FINE_RW");
+    return !(asked && asked[0] == '0');
+}
 // A slot made whole again by a write waits 1, 2, 4 ... 1024 scan passes before it may be Fine again.
 constexpr unsigned FineBackoffMax = 10;
 
@@ -311,6 +328,9 @@ bool PromoteFine(SparseRange& range, std::size_t slot) noexcept {
 #ifdef PS5_NATIVE
     std::int64_t physical = -1;
     if (eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 && !ReserveBlock(&physical)) return false;
+    // Its pages of data may be writable (FineWritable): read-only while they are copied, so a
+    // writer faults and waits for the slot's lock instead of writing into the old pages.
+    if (mprotect(reinterpret_cast<void*>(at), SparseSlot, PROT_READ) != 0) std::abort();
     void* view = reinterpret_cast<void*>(cpu_mapping_hint);
     if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ | PROT_WRITE, 0, physical, SparseSlot) != 0) {
         (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
@@ -336,9 +356,9 @@ bool PromoteFine(SparseRange& range, std::size_t slot) noexcept {
 }
 
 #ifdef PS5_NATIVE
-bool MapRun(std::uintptr_t at, std::size_t bytes, std::int64_t physical) noexcept {
+bool MapRun(std::uintptr_t at, std::size_t bytes, std::int64_t physical, int protection = PROT_READ) noexcept {
     void* address = reinterpret_cast<void*>(at);
-    return sceKernelMapDirectMemory(&address, bytes, PROT_READ, MAP_FIXED, physical, FinePage) == 0 &&
+    return sceKernelMapDirectMemory(&address, bytes, protection, MAP_FIXED, physical, FinePage) == 0 &&
            address == reinterpret_cast<void*>(at);
 }
 #endif
@@ -373,7 +393,9 @@ bool MakeFine(SparseRange& range, std::size_t slot, const bool (&zero)[FinePages
         std::size_t end = page + 1;
         while (end < FinePages && zero[end] == zero[page]) ++end;
         const std::size_t bytes = (end - page) * FinePage;
-        ok = MapRun(at + page * FinePage, bytes, zero[page] ? zero_block : compact + std::int64_t(next * FinePage));
+        ok = zero[page] ? MapRun(at + page * FinePage, bytes, zero_block)
+                        : MapRun(at + page * FinePage, bytes, compact + std::int64_t(next * FinePage),
+                                 FineWritable() ? PROT_READ | PROT_WRITE : PROT_READ);
         if (!zero[page]) next += end - page;
         page = end;
     }
@@ -795,7 +817,7 @@ bool ScanFine(SparseRange& range, std::size_t slot) noexcept {
     if (counters.passes.load(std::memory_order_relaxed) < range.fine_after[slot]) return false;
     std::size_t zeros = 0;
     for (std::size_t page = 0; page < FinePages; ++page) zeros += PageZero(at + page * FinePage);
-    if (zeros < FineMinZeroPages) return false;
+    if (zeros < FineMinZeroPages()) return false;
     LockSlot(range, slot);
     if (SlotState(range, slot) != SlotOwn) {
         UnlockSlot(range, slot, SlotState(range, slot));
@@ -812,7 +834,7 @@ bool ScanFine(SparseRange& range, std::size_t slot) noexcept {
         counters.returns_scan.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
-    if (zeros >= FineMinZeroPages) {
+    if (zeros >= FineMinZeroPages()) {
         fined = MakeFine(range, slot, zero, FinePages - zeros);
         if (!fined) counters.fine_failures.fetch_add(1, std::memory_order_relaxed);
     }
@@ -1096,7 +1118,13 @@ bool ServiceAvailable() noexcept {
                 if (!ScanFine(*range, 1) || SlotState(*range, 1) != SlotFine) step = "fine";
                 else if (*page3 != 0x0f1e2d3c4b5a6978ull || *word != 0) step = "fine-read";
                 else if (held - guest_committed.load(std::memory_order_relaxed) != SparseSlot - FinePage) step = "fine-held";
+#ifdef PS5_NATIVE
+                else if (FineWritable() && ((*page3 = 0x1122334455667788ull), SlotState(*range, 1) != SlotFine ||
+                                            *page3 != 0x1122334455667788ull || *word != 0))
+                    step = "fine-rw"; // a write to its page of data: in place, the slot still Fine
+#endif
                 else {
+                    *page3 = 0x0f1e2d3c4b5a6978ull;
                     *word = 13; // page 0: the slot is whole again
                     if (*word != 13 || *page3 != 0x0f1e2d3c4b5a6978ull || SlotState(*range, 1) != SlotOwn ||
                         (range->fine[1] & 0xf00) == 0)
@@ -1151,9 +1179,9 @@ void ServiceStart(SparseRange& range) noexcept {
     keeper = std::thread(ReserveKeeper);
 #endif
     char line[128];
-    const int length = std::snprintf(line, sizeof(line), "EDEN_CRAM on: scan=%d dedup=%d fine=%d reserve=%zuMiB\n",
+    const int length = std::snprintf(line, sizeof(line), "EDEN_CRAM on: scan=%d dedup=%d fine=%d fine_rw=%d fine_min=%zu reserve=%zuMiB\n",
                                      scan_requested.load() ? 1 : 0, dedup_requested.load() ? 1 : 0,
-                                     fine_requested.load() ? 1 : 0,
+                                     fine_requested.load() ? 1 : 0, FineWritable() ? 1 : 0, FineMinZeroPages(),
                                      reserve_count.load() * (SparseSlot >> 20));
     if (length > 0) Report(line);
 }
