@@ -1,0 +1,16 @@
+diff --git a/src/common/fiber.cpp b/src/common/fiber.cpp
+index 613ac97e22..0feb5ec3ca 100644
+--- a/src/common/fiber.cpp
++++ b/src/common/fiber.cpp
+@@ -17,7 +17,10 @@ namespace Common {
+ #ifdef __OPENORBIS__
+ constexpr size_t DEFAULT_STACK_SIZE = 128 * 4096;
+ #else
+-constexpr size_t DEFAULT_STACK_SIZE = 512 * 4096;
++// PS5: a fiber's stack comes from the heap, and the heap's memory is taken whole from the 12 GiB
++// pool (no page is given only when touched, unlike a desktop host). 2 MiB a guest thread held
++// 120 MiB in Ocarina of Time (60 stacks at the out-of-memory stop). 512 KiB, the OpenOrbis value.
++constexpr size_t DEFAULT_STACK_SIZE = 128 * 4096;
+ #endif
+ constexpr u32 CANARY_VALUE = 0xDEADBEEF;
+ 
