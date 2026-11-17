@@ -1,0 +1,236 @@
+diff --git a/src/video_core/memory_cuts.h b/src/video_core/memory_cuts.h
+new file mode 100644
+index 0000000000..c03bde51b3
+--- /dev/null
++++ b/src/video_core/memory_cuts.h
+@@ -0,0 +1,26 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <cstdlib>
++
++#include "common/common_types.h"
++#include "common/settings.h"
++
++namespace VideoCommon {
++
++/// The Legend of Zelda: Ocarina of Time (Switch 2).
++inline constexpr u64 OcarinaOfTimeSwitch2 = 0x0400486024DEC000ULL;
++
++/// A memory cut in MiB for this session. On a standard PS5 Ocarina of Time (Switch 2) needs about
++/// 1 GiB more than the 12 GiB pool holds (measured 16-17 Nov 2026), so these cuts are on by default
++/// for that title only. Each one has its own switch (env.txt line NAME=<MiB>): a number sets it for
++/// any game, 0 turns it off (the old size). Returns 0 when the cut is off.
++[[nodiscard]] inline u64 MemoryCutMiB(const char* name, u64 ocarina_default) {
++    if (const char* value = std::getenv(name); value != nullptr && *value != '\0') {
++        return std::strtoull(value, nullptr, 10);
++    }
++    return Settings::GetCurrentProgramID() == OcarinaOfTimeSwitch2 ? ocarina_default : 0;
++}
++
++} // namespace VideoCommon
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index e8db3c1a60..f3cd4e8c27 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -15,6 +15,8 @@
+ #include "common/bit_util.h"
+ #include "common/common_types.h"
+ #include "common/literals.h"
++#include "common/logging.h"
++#include "video_core/memory_cuts.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+@@ -41,6 +43,14 @@ constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
+ #endif
+ 
+ size_t GetStreamBufferSize(const Device& device) {
++    // A smaller stream buffer for a title short of memory (Ocarina of Time on a standard PS5:
++    // 32 MiB, 96 MiB less); larger uploads take staging buffers instead.
++    // EDEN_NX2_STREAM_MIB=<MiB> (env.txt) sets it, 0 = the size below.
++    if (const u64 cut = VideoCommon::MemoryCutMiB("EDEN_NX2_STREAM_MIB", 32); cut != 0) {
++        const VkDeviceSize size = Common::AlignUp((std::min)(cut << 20, MAX_STREAM_BUFFER_SIZE), MAX_ALIGNMENT);
++        LOG_INFO(Render_Vulkan, "Stream buffer {} MiB (EDEN_NX2_STREAM_MIB)", size >> 20);
++        return size;
++    }
+     if (!device.HasDebuggingToolAttached()) {
+         if (device.IsIntegrated()) {
+             // An integrated GPU's device-local host-visible heap can be no bigger than the stream
+@@ -110,6 +120,15 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
+     }
+     stream_pointer = stream_buffer.Mapped();
+     ASSERT_MSG(!stream_pointer.empty(), "Stream buffer must be host visible!");
++    // A staging buffer is rounded up to a power of two and then kept for reuse: one 288 MiB upload
++    // (Ocarina of Time, Link's house) held a 512 MiB buffer. Large ones get their own size and are
++    // freed once the GPU is done with them. EDEN_NX2_STAGING_EXACT_MIB=<MiB> (env.txt) sets from
++    // what size, 0 = off.
++    exact_min_bytes = static_cast<size_t>(VideoCommon::MemoryCutMiB("EDEN_NX2_STAGING_EXACT_MIB", 16) << 20);
++    if (exact_min_bytes != 0) {
++        LOG_INFO(Render_Vulkan, "Staging buffers of {} MiB and more: own size, freed when done",
++                 exact_min_bytes >> 20);
++    }
+ }
+ 
+ StagingBufferPool::~StagingBufferPool() = default;
+@@ -139,6 +158,35 @@ void StagingBufferPool::TickFrame() {
+     ReleaseCache(MemoryUsage::DeviceLocal);
+     ReleaseCache(MemoryUsage::Upload);
+     ReleaseCache(MemoryUsage::Download);
++    if (!exact_buffers.empty()) {
++        std::erase_if(exact_buffers, [this](const ExactBuffer& entry) {
++            if (!scheduler.IsFree(entry.staging.tick)) {
++                return false;
++            }
++            exact_bytes -= (std::min)(exact_bytes, entry.bytes);
++            return true;
++        });
++    }
++    // Every 600 frames with EDEN_NX2_TC_LOG: what the staging buffers hold.
++    static const bool log = std::getenv("EDEN_NX2_TC_LOG") != nullptr;
++    if (log && ++frames % 600 == 0) {
++        u64 cached = 0, largest = 0;
++        for (auto* const cache : {&device_local_cache, &upload_cache, &download_cache}) {
++            for (const StagingBuffers& level : *cache) {
++                for (const StagingBuffer& entry : level.entries) {
++                    cached += entry.mapped_span.size();
++                    largest = (std::max<u64>)(largest, entry.mapped_span.size());
++                }
++            }
++        }
++        LOG_INFO(Render_Vulkan,
++                 "Staging buffers: stream {} MiB, cached {} MiB (largest {} MiB), own-size {} MiB "
++                 "now, {} MiB peak, {} made in 600 frames",
++                 stream_buffer_size >> 20, cached >> 20, largest >> 20, exact_bytes >> 20,
++                 exact_peak_bytes >> 20, exact_created);
++        exact_peak_bytes = exact_bytes;
++        exact_created = 0;
++    }
+ }
+ 
+ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
+@@ -186,6 +234,47 @@ bool StagingBufferPool::AreRegionsActive(size_t region_begin, size_t region_end)
+ 
+ StagingBufferRef StagingBufferPool::GetStagingBuffer(size_t size, MemoryUsage usage,
+                                                      bool deferred) {
++    if (exact_min_bytes != 0 && !deferred && size >= exact_min_bytes) {
++        // Not in the cache: a level's entries are reused for any size of that level.
++        VkBufferCreateInfo buffer_ci = {
++            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++            .pNext = nullptr,
++            .flags = 0,
++            .size = Common::AlignUp(static_cast<VkDeviceSize>(size), VkDeviceSize{1} << 20),
++            .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
++                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
++                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
++            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++            .queueFamilyIndexCount = 0,
++            .pQueueFamilyIndices = nullptr,
++        };
++        if (device.IsExtTransformFeedbackSupported()) {
++            buffer_ci.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;
++        }
++        if (device.IsBufferDeviceAddressSupported()) {
++            buffer_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
++        }
++        vk::Buffer buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
++        const std::span<u8> mapped_span = buffer.Mapped();
++        const VkDeviceAddress buffer_address =
++            device.IsBufferDeviceAddressSupported()
++                ? device.GetLogical().GetBufferDeviceAddress(*buffer)
++                : VkDeviceAddress{};
++        exact_bytes += buffer_ci.size;
++        exact_peak_bytes = (std::max)(exact_peak_bytes, exact_bytes);
++        ++exact_created;
++        ExactBuffer& entry = exact_buffers.emplace_back(ExactBuffer{StagingBuffer{
++            .buffer = std::move(buffer),
++            .device_address = buffer_address,
++            .mapped_span = mapped_span,
++            .usage = usage,
++            .log2_level = 0,
++            .index = unique_ids++,
++            .tick = scheduler.CurrentTick(),
++            .deferred = false,
++        }, buffer_ci.size});
++        return entry.staging.Ref();
++    }
+     if (const std::optional<StagingBufferRef> ref = TryGetReservedBuffer(size, usage, deferred)) {
+         return *ref;
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+index 6bf8edbb2d..8cd4eb3c5f 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+@@ -127,6 +127,19 @@ private:
+     size_t current_delete_level = 0;
+     u64 buffer_index = 0;
+     u64 unique_ids{};
++
++    /// Requests of at least this many bytes get a buffer of their own size (not rounded up to a
++    /// power of two), kept only until the GPU is done with it (EDEN_NX2_STAGING_EXACT_MIB, 0 = off).
++    size_t exact_min_bytes = 0;
++    struct ExactBuffer {
++        StagingBuffer staging;
++        u64 bytes;
++    };
++    std::vector<ExactBuffer> exact_buffers;
++    u64 exact_bytes = 0;
++    u64 exact_peak_bytes = 0;
++    u64 exact_created = 0;
++    u64 frames = 0;
+ };
+ 
+ } // namespace Vulkan
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index d448141ad3..844447e635 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -24,6 +24,7 @@
+ #include "video_core/dirty_flags.h"
+ #include "video_core/engines/kepler_compute.h"
+ #include "video_core/guest_memory.h"
++#include "video_core/memory_cuts.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+ #include "video_core/texture_cache/image_view_base.h"
+ #include "video_core/texture_cache/samples_helper.h"
+@@ -279,8 +280,12 @@ template <class P>
+ void TextureCache<P>::TickFrame() {
+     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
+     // rather than kept for the rest of the session.
++    // EDEN_NX2_TC_SCRATCH_MIB=<MiB> (env.txt): freed from a smaller size for a title short of
++    // memory (Ocarina of Time on a standard PS5: 16 MiB), 0 = LargeScratchCapacity.
++    static const u64 scratch_cut = MemoryCutMiB("EDEN_NX2_TC_SCRATCH_MIB", 16);
++    const size_t scratch_limit = scratch_cut != 0 ? static_cast<size_t>(scratch_cut << 20) : LargeScratchCapacity;
+     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
+-        if (scratch->capacity() > LargeScratchCapacity) {
++        if (scratch->capacity() > scratch_limit) {
+             scratch->release();
+         }
+     }
+@@ -1007,7 +1012,10 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
+     // Record the copies of a batch, wait for the GPU once, then swizzle in modification order
+     // (the copies only read, so they do not depend on each other). A batch is capped so the
+     // staging memory held at once stays bounded.
+-    constexpr size_t MaxBatchBytes = 64_MiB;
++    // EDEN_NX2_TC_BATCH_MIB=<MiB> (env.txt): a smaller cap for a title short of memory (Ocarina of
++    // Time on a standard PS5: 16 MiB), 0 = 64 MiB.
++    const u64 batch_cut = MemoryCutMiB("EDEN_NX2_TC_BATCH_MIB", 16);
++    const size_t MaxBatchBytes = batch_cut != 0 ? static_cast<size_t>(batch_cut << 20) : 64_MiB;
+     using Map = decltype(runtime.DownloadStagingBuffer(size_t{}));
+     using Copies = decltype(FullDownloadCopies(std::declval<const ImageInfo&>()));
+     struct Pending {
+@@ -1822,8 +1830,11 @@ template <class P>
+ bool TextureCache<P>::UploadInChunks(Image& image) {
+     // A whole upload of a very large image needs a staging buffer of its full size (rounded up to
+     // a power of two: 1 GiB for 600 MiB of data), which can fail when memory is tight.
+-    constexpr u64 min_size = 64_MiB;
+-    constexpr u64 chunk_size = 32_MiB;
++    // EDEN_NX2_TC_CHUNK_MIB=<MiB> (env.txt): smaller chunks for a title short of memory (Ocarina
++    // of Time on a standard PS5: 8 MiB chunks from 16 MiB on), 0 = 32 MiB chunks from 64 MiB on.
++    const u64 chunk_cut = MemoryCutMiB("EDEN_NX2_TC_CHUNK_MIB", 8);
++    const u64 min_size = chunk_cut != 0 ? (chunk_cut << 21) : 64_MiB;
++    const u64 chunk_size = chunk_cut != 0 ? (chunk_cut << 20) : 32_MiB;
+     constexpr ImageFlagBits excluded = ImageFlagBits::Sparse | ImageFlagBits::Converted |
+                                        ImageFlagBits::AcceleratedUpload | ImageFlagBits::Unbacked |
+                                        ImageFlagBits::TrimmedLevels;
