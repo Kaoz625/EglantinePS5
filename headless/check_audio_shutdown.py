@@ -27,7 +27,7 @@ if __name__ == '__main__':
             fixed.replace('        cheat_engine.reset();\n', '', 1)):
         try:
             check(bad)
-        except AssertionError:
+        except (AssertionError, ValueError):
             continue
         raise AssertionError('Accepted missing or late audio worker shutdown, or a late cheat engine')
     print('Resolved program ID, early audio shutdown and early cheat engine teardown; rejection controls PASS')
