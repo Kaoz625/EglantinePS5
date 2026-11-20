@@ -385,7 +385,7 @@ namespace {
 // Retry a rejected native program after 0.25, 0.5, 1, 2, 4, 8, 8, 8 ... s, at most this many times.
 constexpr u32 MaxRejectionRetries = 12;
 std::chrono::steady_clock::duration RejectionRetryDelay(u32 attempts) {
-    return std::chrono::milliseconds{250} << (std::min)(attempts, 5U);
+    return std::chrono::milliseconds{250LL << (std::min)(attempts, 5U)};
 }
 bool RejectionRetriesEnabled() {
     static const bool enabled = [] {
