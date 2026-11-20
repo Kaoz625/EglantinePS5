@@ -176,6 +176,7 @@ struct Cache
     uint64_t window = 2;
     bool stop = false, failed = false, worker_on = false;
     std::set<uint64_t> fetching; // blocks a worker is reading now (another worker takes the next one)
+    uint64_t keep_end = 0; // the read-ahead window is [want, keep_end): trim keeps it while a block outside it can go
     std::vector<std::thread> workers;
 };
 
@@ -1225,6 +1226,11 @@ Block fetch_block(File *f, uint64_t number)
 }
 
 // Drops the blocks farthest from where the game is, until the cache is within its share of memory (called with c->m).
+// A block of the read-ahead window never goes while one behind the game can: the window's last block is exactly what a
+// worker reads next, so dropping it made the workers fetch it, drop it and fetch it again without end, at the full
+// speed of the network and even while the game read nothing (20 Nov 2026, Hyrule Warriors AoI .nup on PHAT5: 29 GB
+// fetched for 3.8 GB distinct while the game asked 2.2 GB; it happened as soon as the blocks behind the game held more
+// than 1/8 of the cache and less than half the window).
 void trim(Cache *c, uint64_t at, size_t cap)
 {
     while (c->bytes > cap && !c->blocks.empty())
@@ -1233,6 +1239,8 @@ void trim(Cache *c, uint64_t at, size_t cap)
         const uint64_t behind = at > first->first ? (at - first->first) * 2 : 0; // what is behind counts double
         const uint64_t ahead = last->first > at ? last->first - at : 0;
         auto victim = behind >= ahead ? first : last;
+        if (victim == last && first->first < at && last->first < c->keep_end)
+            victim = first;
         c->bytes -= victim->second.len;
         free(victim->second.data);
         c->blocks.erase(victim);
@@ -1270,6 +1278,7 @@ void read_ahead(File *f)
         const size_t cap = cache_cap();
         // What would be dropped at once is not read, and no further than the game's reading pattern asks for.
         const uint64_t ahead = std::min<uint64_t>((cap / kBlock) * 7 / 8, c->window + 1);
+        c->keep_end = at + ahead;
         uint64_t target = ~0ull;
         const auto wanted = [&](uint64_t k) { return !c->blocks.count(k) && !c->fetching.count(k) && !disk_has(f, k); };
         if (at < blocks && wanted(at))
