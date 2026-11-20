@@ -81,42 +81,46 @@ if [[ "${EDEN_PS5_VULKAN:-OFF}" == ON ]]; then
 fi
 # Source checks of the release configuration (development builds opt out: EDEN_SKIP_SOURCE_CHECKS=1).
 [[ ${EDEN_SKIP_SOURCE_CHECKS:-0} == 1 ]] && exit 0
-python3 -B "$root/headless/check_audio_shutdown.py" "$scratch/source/src/core/core.cpp"
-python3 -B "$root/tools/check-load-failure.py"
-python3 -B "$root/tools/check-launcher-autoboot.py"
-python3 -B "$root/tools/check-vfs-file-budget.py"
-python3 -B "$root/tools/check-nso-memory.py"
-python3 -B "$root/tools/check-performance.py"
-python3 -B "$root/tools/check-performance-settings.py"
-python3 -B "$root/tools/check-startup-performance.py"
-python3 -B "$root/tools/check-worker-affinity.py"
-python3 -B "$root/tools/check-tsc-fallback.py"
-python3 -B "$root/tools/check-jit-protection.py"
-python3 -B "$root/tools/check-jit-allocator.py"
-python3 -B "$root/tools/check-jit-patch-lookup.py"
-python3 -B "$root/tools/check-jit-assert.py"
-python3 -B "$root/tools/check-crash-report.py"
-python3 -B "$root/tools/check-system-keyboard.py"
-python3 -B "$root/tools/check-shader-attributes.py"
+# Every source check runs; the build fails at the end, naming all that failed (one CI run lists them).
+failed_checks=()
+chk() { python3 -B "$@" || failed_checks+=("$(basename "$1")"); }
+chk "$root/headless/check_audio_shutdown.py" "$scratch/source/src/core/core.cpp"
+chk "$root/tools/check-load-failure.py"
+chk "$root/tools/check-launcher-autoboot.py"
+chk "$root/tools/check-vfs-file-budget.py"
+chk "$root/tools/check-nso-memory.py"
+chk "$root/tools/check-performance.py"
+chk "$root/tools/check-performance-settings.py"
+chk "$root/tools/check-startup-performance.py"
+chk "$root/tools/check-worker-affinity.py"
+chk "$root/tools/check-tsc-fallback.py"
+chk "$root/tools/check-jit-protection.py"
+chk "$root/tools/check-jit-allocator.py"
+chk "$root/tools/check-jit-patch-lookup.py"
+chk "$root/tools/check-jit-assert.py"
+chk "$root/tools/check-crash-report.py"
+chk "$root/tools/check-system-keyboard.py"
+chk "$root/tools/check-shader-attributes.py"
 
 if [[ "$probe" == OFF ]]; then
-    python3 -B "$root/tools/check-exclusive-monitor.py"
+    chk "$root/tools/check-exclusive-monitor.py"
 else
     # The graphics-only entry returns before Core construction; its JIT is dead-stripped.
-    python3 -B "$root/tools/check-gpu-probe.py" --self-test
-    python3 -B "$root/tools/check-native-queue-probe.py"
+    chk "$root/tools/check-gpu-probe.py" --self-test
+    chk "$root/tools/check-native-queue-probe.py"
 fi
 if [[ "$graphics" == ON ]]; then
-    python3 -B "$root/tools/check-native-gpu-thread.py"
+    chk "$root/tools/check-native-gpu-thread.py"
     if [[ "${EDEN_PS5_VULKAN:-OFF}" == ON ]]; then
-        python3 -B "$root/tools/check-staging-pressure.py"
+        chk "$root/tools/check-staging-pressure.py"
     fi
-    python3 -B "$root/tools/check-gpu-sync-stop.py"
-    python3 -B "$root/tools/check-nvdrv-process-lifetime.py"
-    python3 -B "$root/tools/check-integer-buffer-clear.py"
-    python3 -B "$root/tools/check-game-capture-shutdown.py"
+    chk "$root/tools/check-gpu-sync-stop.py"
+    chk "$root/tools/check-nvdrv-process-lifetime.py"
+    chk "$root/tools/check-integer-buffer-clear.py"
+    chk "$root/tools/check-game-capture-shutdown.py"
 fi
 
-python3 -B tools/check-hud.py
-python3 -B tools/check-hud-mask.py
-python3 -B tools/check-game-frame-summary.py
+chk tools/check-hud.py
+chk tools/check-hud-mask.py
+chk tools/check-game-frame-summary.py
+if ((${#failed_checks[@]})); then echo "FAILED source checks: ${failed_checks[*]}" >&2; exit 1; fi

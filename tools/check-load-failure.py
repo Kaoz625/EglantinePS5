@@ -38,8 +38,10 @@ b=s.index('        // Waiting for GPU', a)
 branch=s[a:b]
 assert 'process.reset();' in branch and branch.index('process.reset();') < branch.index('ShutdownMainProcess();')
 # Every failure path of Load releases the process before the kernel shuts down.
-pairs = s.count('            process.reset();\n            ShutdownMainProcess();')
-assert pairs >= 2 and pairs == s.count('            ShutdownMainProcess();'), pairs
+# (Load only: upstream's GPU-replay setup also shuts down when no GPU comes up; it holds no process.)
+load = s[s.index('    SystemResultStatus Load('):s.index('    void ShutdownMainProcess() {')]
+pairs = load.count('            process.reset();\n            ShutdownMainProcess();')
+assert pairs >= 2 and pairs == load.count('            ShutdownMainProcess();'), pairs
 with tempfile.TemporaryDirectory(prefix='eden-process-order-') as tmp:
  p=Path(tmp);src=p/'test.cpp';exe=p/'test'
  src.write_text('''#include <memory>
