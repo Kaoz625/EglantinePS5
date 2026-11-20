@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Include from the desktop CMAKE_PROJECT_yuzu_INCLUDE hook; defer this function
+# Include from the desktop CMAKE_PROJECT_lichii_INCLUDE hook; defer this function
 # until the emulator targets exist. Keep SDL audio and the desktop renderers.
 function(add_linux_port_support)
     get_filename_component(PORT_ROOT "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../.." ABSOLUTE)

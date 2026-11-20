@@ -10,15 +10,15 @@ mkdir -p "$work" "$root/dist"
 bash tools/sync-eden-source.sh "$work/source"
 python3 "$root/tools/linux/checks/wait64_abi_check.py" "$work/source"
 cmake -S "$work/source" -B "$work/cmake" -G Ninja \
-    -DCMAKE_PROJECT_yuzu_INCLUDE="$root/tools/linux/checks/inject.cmake" \
+    -DCMAKE_PROJECT_lichii_INCLUDE="$root/tools/linux/checks/inject.cmake" \
     -DEGLANTINE_NUP_CHECK_SOURCE="$root/tools/linux/checks/nup_check.cpp" \
     -DCMAKE_C_COMPILER="${CC:-clang}" -DCMAKE_CXX_COMPILER="${CXX:-clang++}" \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_LTO=OFF \
     -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='-O2 -g -DNDEBUG -fno-omit-frame-pointer' \
-    -DBUILD_TESTING=OFF -DYUZU_TESTS=OFF -DYUZU_CMD=ON \
+    -DBUILD_TESTING=OFF -DLICHII_TESTS=OFF -DLICHII_CMD=ON \
     -DDYNARMIC_ENABLE_NO_EXECUTE_SUPPORT=ON \
-    -DYUZU_ROOM=OFF -DYUZU_ROOM_STANDALONE=OFF \
-    -DYUZU_USE_BUNDLED_QT=OFF -DYUZU_USE_BUNDLED_SDL3=ON \
+    -DLICHII_ROOM=OFF -DLICHII_ROOM_STANDALONE=OFF \
+    -DLICHII_USE_BUNDLED_QT=OFF -DLICHII_USE_BUNDLED_SDL3=ON \
     -DVulkanHeaders_FORCE_BUNDLED=ON -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
     -DENABLE_UPDATE_CHECKER=OFF -DUSE_DISCORD_PRESENCE=OFF -DENABLE_WERROR=OFF \
     "$@"

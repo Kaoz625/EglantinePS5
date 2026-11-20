@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Configure via -DCMAKE_PROJECT_yuzu_INCLUDE=/absolute/path/to/this/file
+# Configure via -DCMAKE_PROJECT_lichii_INCLUDE=/absolute/path/to/this/file
 # and -DEGLANTINE_NUP_CHECK_SOURCE=/path/to/tools/linux/checks/nup_check.cpp.
 include("${CMAKE_CURRENT_LIST_DIR}/../port-support.cmake")
 cmake_language(DEFER CALL add_linux_port_support)
