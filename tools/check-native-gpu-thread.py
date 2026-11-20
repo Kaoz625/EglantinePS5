@@ -11,7 +11,9 @@ cache = Path((root / '.local/headless-cache').read_text().strip())
 # The GPU worker as this build compiles it (Eglantine/'s gpu_thread.cpp, PS5 view).
 worker = eglantine_source('src/video_core/gpu_thread.cpp')
 dispatch_call = re.search(r'\n( {16}Profile::Scope scope\{Profile::Zone::Push\};\n.*?scheduler\.Push\(system\.GPU\(\), submit_list->channel, std::move\(submit_list->entries\)\);)', worker, re.S).group(1)
+# Upstream (zortos nx2) marks the front state for its back-thread idle trace before the wait.
 idle_call = ('                Profile::Scope scope{Profile::Zone::Idle};\n'
+             '                BackIdleTrace::SetFrontState(FrontState::QueueEmpty);\n'
              '                state.queue.PopWait(next, stop_token);')
 development = 'EDEN_DEV_PROFILE:BOOL=ON' in (cache / 'native-local/CMakeCache.txt').read_text()
 lifecycle_at = worker.index('// PS5-only ThreadManager lifecycle')

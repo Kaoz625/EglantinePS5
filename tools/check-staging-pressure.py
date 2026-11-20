@@ -17,18 +17,21 @@ code = r'''
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <unordered_map>
 #include <vector>
 #include "staging_buffers.h"
 struct StagingBufferPool {
     struct StagingBuffer {
         unsigned index;
-        bool deferred;
         std::uint64_t tick;
         std::span<std::byte> mapped_span{};
         unsigned log2_level = 24;
     };
     struct StagingBuffers {
         std::vector<StagingBuffer> entries;
+        // Upstream (zortos nx2) keeps buffers handed out deferred apart from the entries until
+        // FreeDeferred puts them back: ReleaseCompleted must never reach them.
+        std::unordered_map<std::uint64_t, StagingBuffer> deferred;
         std::size_t iterate_index = 0, delete_index = 0;
     };
     using StagingBuffersCache = std::array<StagingBuffers, 3>;
@@ -45,16 +48,17 @@ int main() {
     for (auto* cache : {&pool.device_local_cache, &pool.upload_cache, &pool.download_cache}) {
         for (auto& level : *cache) {
             // A deferred reference must survive even when its old tick is complete.
-            level.entries = {{1, false, 9}, {2, true, 1}, {3, false, 11}, {4, false, 10}};
-            level.iterate_index = 4;
-            level.delete_index = 3;
+            level.entries = {{1, 9}, {3, 11}, {4, 10}};
+            level.deferred = {{2, {2, 1}}};
+            level.iterate_index = 3;
+            level.delete_index = 2;
         }
     }
     pool.ReleaseCompleted();
     for (auto* cache : {&pool.device_local_cache, &pool.upload_cache, &pool.download_cache}) {
         for (auto& level : *cache) {
-            assert(level.entries.size() == 2);
-            assert(level.entries[0].index == 2 && level.entries[1].index == 3);
+            assert(level.entries.size() == 1 && level.entries[0].index == 3);
+            assert(level.deferred.size() == 1 && level.deferred.at(2).index == 2);
             assert(level.iterate_index <= level.entries.size());
             assert(level.delete_index < level.entries.size());
         }
@@ -64,14 +68,18 @@ int main() {
     pool.ReleaseCompleted();
     for (auto* cache : {&pool.device_local_cache, &pool.upload_cache, &pool.download_cache}) {
         for (auto& level : *cache) {
-            assert(level.entries.size() == 1 && level.entries[0].index == 2);
-            level.entries[0].deferred = false;
+            assert(level.entries.empty());
+            assert(level.deferred.size() == 1 && level.deferred.at(2).index == 2);
+            // FreeDeferred: back into the entries with a completed tick.
+            auto node = level.deferred.extract(2);
+            node.mapped().tick = 11;
+            level.entries.push_back(node.mapped());
         }
     }
     pool.ReleaseCompleted();
     for (auto* cache : {&pool.device_local_cache, &pool.upload_cache, &pool.download_cache}) {
         for (auto& level : *cache) {
-            assert(level.entries.empty());
+            assert(level.entries.empty() && level.deferred.empty());
             assert(level.iterate_index == 0 && level.delete_index == 0);
         }
     }

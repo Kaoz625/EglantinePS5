@@ -75,7 +75,13 @@ int main(){
  memory.fail=true;assert(!load(h,f,true));memory.fail=false;
  h.segments[2].bss_size=UINT32_MAX;assert(!load(h,f,false));
  h.segments[2].bss_size=6000;h.segments[0].offset=99999;assert(!load(h,f,true));
- h.segments[0].offset=0;h.segments[0].location=99999;assert(!load(h,f,true));
+ // Upstream (zortos nx2) sizes the image by the furthest segment, so a segment placed past the
+ // others is copied inside a larger image instead of being refused (ASan proves the copy stays in it).
+ h.segments[0].offset=0;h.segments[0].location=99999;
+ {auto end=load(h,f,true);assert(end && *end==0x100000+((99999+4+6000+4095)&~4095ull));
+  assert(image.size()==*end-0x100000 && image[99999]==1 && image[99999+3]==4);}
+ h.segments[0].location=0;h.segments[0].size=5;assert(!load(h,f,true)); // stored segment larger than its data
+ h.segments[0].size=4;
  h.segments[0].location=0;Settings::values.program_args.value="hello";
  assert(load(h,f,true,true)==0x105000);assert(image.size()==20480);
  assert(staging_size==8196+4096 && memory.address==0x103004);

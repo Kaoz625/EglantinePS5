@@ -18,6 +18,8 @@ code=r'''
 using u64=unsigned long long;
 // TickWork ends a fast draw chain (video_core/nx2_fast_draw.h); nothing to chain here.
 namespace VideoCommon::Nx2FastDraw {enum class Reason{TickWork};inline void Break(Reason){}}
+// Upstream GPU-trace recorder (video_core/gpu_trace): ends a recording at shutdown; none runs here.
+namespace VideoCommon::GpuTrace {inline void OnGpuShutdown(){}}
 struct Worker {std::thread t;std::atomic_bool stopping{};void Stop(){stopping=true;if(t.joinable())t.join();}void NotifyShutdown(){Stop();}void TickGPU(bool){}void InvalidateReadbackCache(){}};
 struct GPU {
  std::mutex sync_request_mutex,sync_mutex;
