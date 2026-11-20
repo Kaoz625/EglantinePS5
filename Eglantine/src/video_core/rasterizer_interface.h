@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -239,7 +238,7 @@ public:
 
     virtual void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
         // The skip keeps the texture cache: software engine writes reach images only here.
-        const auto which = Settings::values.skip_cpu_inner_invalidation.GetValue()
+        const auto which = Settings::SkipCpuInnerInvalidation()
                                ? VideoCommon::CacheType::TextureCache
                                : VideoCommon::CacheType::All;
         for (const auto& [cpu_addr, size] : sequences) {
@@ -342,8 +341,11 @@ public:
 
     /// Records a health check of a game's DLSS network output (dst) against its input (src) and
     /// returns the result of an earlier check once the GPU has finished it.
+    /// `src_region` is the part of src the game rendered, from its top-left corner (a dynamic
+    /// resolution network's render region); without it, the whole of src.
     [[nodiscard]] virtual std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
-        const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst) {
+        const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
+        std::optional<std::array<u32, 2>> src_region = std::nullopt) {
         return std::nullopt;
     }
 

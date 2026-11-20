@@ -27,6 +27,10 @@ namespace Tegra {
 // Ampere classes and the Turing+ macro ISA, which Eden's Maxwell engines don't implement.
 inline std::atomic<bool> g_nx2_ampere{false};
 
+// The frame interval nx2:vi2 paces the game's presents to, in ns (0: not paced there, or not
+// known). Frame generation plans against it (FrameGenPacer).
+inline std::atomic<u64> g_nx2_guest_frame_interval_ns{0};
+
 // GPU VA that nx2:gpu GetVaRange and GetUserPartition report to NVN. The in-process
 // allocator hands out addresses in [Nx2GpuVaStart, Nx2GpuVaEnd). NvRm's AllocAsEx range
 // can be smaller; the GMMU page tables still have to cover this one.
@@ -593,7 +597,7 @@ public:
         free_slot->operation = operation;
         free_slot->word = word;
         free_slot->seen =
-            word != nullptr ? __atomic_load_n(word, __ATOMIC_RELAXED) : 0;
+            word != nullptr ? std::atomic_ref<u32>{*word}.load(std::memory_order_relaxed) : 0;
         free_slot->latched.store(false, std::memory_order_relaxed);
         free_slot->owner.store(owner, std::memory_order_relaxed);
         count.fetch_add(1, std::memory_order_release);
@@ -637,7 +641,7 @@ public:
             if (slot.word == nullptr || slot.owner.load(std::memory_order_relaxed) == nullptr) {
                 continue;
             }
-            const u32 current = __atomic_load_n(slot.word, __ATOMIC_RELAXED);
+            const u32 current = std::atomic_ref<u32>{*slot.word}.load(std::memory_order_relaxed);
             if (current != slot.seen) {
                 slot.seen = current;
                 stored = true;

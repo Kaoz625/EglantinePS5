@@ -6,7 +6,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <utility>
@@ -108,14 +107,18 @@ void ServerManager::RequestStop() {
 }
 
 ServerManager::~ServerManager() {
-    RequestStop();
+    // Signal stop.
+    m_stop_source.request_stop();
 #if defined(EDEN_DEV_PROFILE) // PS5 development build
     const auto eden_t0 = std::chrono::steady_clock::now();
 #else // PS5
 #endif // PS5
+    if (!m_loop_skipped) {
+        m_wakeup_event->Signal(m_system.Kernel());
 
-    // Wait for processing to stop.
-    m_stopped.Wait();
+        // Wait for processing to stop.
+        m_stopped.Wait();
+    }
 #if defined(EDEN_DEV_PROFILE) // PS5 development build
     const auto eden_t1 = std::chrono::steady_clock::now();
 #else // PS5
@@ -322,6 +325,13 @@ Result ServerManager::LoopProcess() {
     };
 
     R_RETURN(this->LoopProcessImpl());
+}
+
+void ServerManager::SkipLoop() {
+    m_stop_source.request_stop();
+    m_wakeup_event->Signal(m_system.Kernel());
+    m_threads.clear();
+    m_loop_skipped = true;
 }
 
 void ServerManager::LinkToDeferredList(MultiWaitHolder* holder) {

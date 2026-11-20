@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -52,7 +51,13 @@ public:
 
     void Protect(size_t virtual_offset, size_t length, MemoryPermission perms);
 
-    void EnableDirectMappedAddress();
+#ifdef HAS_NCE
+    [[nodiscard]] bool EnableDirectMappedAddress();
+    [[nodiscard]] bool IsDirectMapped() const noexcept {
+        return direct_mapped;
+    }
+#endif
+    void ResetVirtualMappings();
 
     /// Clears guest memory being handed out. Memory still zero since it was created (or since its
     /// last full clear) is skipped: clearing it only made the host give every page real memory.
@@ -89,6 +94,10 @@ public:
         return backing_base;
     }
 
+    [[nodiscard]] size_t BackingSize() const noexcept {
+        return backing_size;
+    }
+
     [[nodiscard]] u8* VirtualBasePointer() noexcept {
         return virtual_base;
     }
@@ -106,6 +115,11 @@ public:
 
 private:
     void Swap(HostMemory& other) noexcept;
+
+#ifdef HAS_NCE
+    [[nodiscard]] bool NormalizeVirtualOffset(size_t& address, size_t length) const noexcept;
+    bool direct_mapped{};
+#endif
 
     friend class HostMemoryTestAccess;
     struct AllocationTestControl {

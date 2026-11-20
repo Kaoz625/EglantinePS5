@@ -70,6 +70,9 @@ struct Runtime {
     bool CanReportMemoryUsage() const {
         return false;
     }
+    u64 GetBufferAllocationTail() const {
+        return 0;
+    }
     u64 GetDeviceLocalMemory() const {
         return 0;
     }
@@ -353,7 +356,8 @@ struct BufferCacheTestAccess {
         cache.memory_tracker.ForEachUploadRange(address, size, [](auto, auto) {});
         return id;
     }
-    static Buffer& Get(Cache& cache, BufferId id) {
+    template <class C>
+    static Buffer& Get(C& cache, BufferId id) {
         return cache.slot_buffers[id];
     }
     /// Add without the upload: guest memory not yet read into the buffer.
@@ -398,6 +402,10 @@ struct BufferCacheTestAccess {
     /// are uploaded.
     static void Upload(Cache& cache, BufferId id, DAddr address, u32 size) {
         (void)cache.SynchronizeBuffer(cache.slot_buffers[id], address, size);
+    }
+    /// GPU addresses resolve through `memory` (ObtainBuffer).
+    static void UseGpuMemory(Cache& cache, Tegra::MemoryManager& memory) {
+        cache.gpu_memory = &memory;
     }
     /// A guest write the buffer cache doesn't hear of, on a page the tracker counts as written.
     static void MarkCpuModified(Cache& cache, DAddr address, u64 size) {
@@ -482,6 +490,27 @@ struct BufferCacheTestAccess {
     }
     static const auto& ReadChecks(Cache& cache) {
         return cache.read_check;
+    }
+    static BufferCacheChannelInfo& Channel(Cache& cache, s32 bind_id) {
+        return cache.channel_storage[cache.channel_map.find(bind_id)->second];
+    }
+    static void Delete(Cache& cache, BufferId id) {
+        cache.DeleteBuffer(id);
+    }
+    static void UpdateIndex(Cache& cache) {
+        cache.UpdateIndexBuffer();
+    }
+    static BufferId InlineIndexBuffer(Cache& cache) {
+        return cache.inline_buffer_id;
+    }
+    static u64 BufferBytes(Cache& cache) {
+        return cache.buffer_bytes;
+    }
+    static u64 CachingPageSize() {
+        return Cache::CACHING_PAGESIZE;
+    }
+    static void UpdateUniforms(Cache& cache, size_t stage) {
+        cache.UpdateUniformBuffers(stage);
     }
 };
 
@@ -1492,7 +1521,7 @@ TEST_CASE("Newer bytes that guest memory doesn't hold yet land the read download
     auto& counters = VideoCore::AsyncReadback::g_counters;
     const u64 landings = counters.clear_landings.load();
     const u64 waits = counters.clear_waits.load();
-    SECTION("an indirect dispatch's arguments, written by the GPU and discarded") {
+    SECTION("an overwritten range discards its old GPU contents") {
         (void)f.cache->ObtainCPUBuffer(0x20040, 12,
                                        VideoCommon::ObtainBufferSynchronize::FullSynchronize,
                                        VideoCommon::ObtainBufferOperation::DiscardWrite);
@@ -2714,4 +2743,258 @@ TEST_CASE("Async read-back counts the reading thread's and the GPU side's waits 
     REQUIRE(counters.reader_waits.load() - reader_waits == 1);
     REQUIRE(counters.gpu_side_waits.load() - gpu_side_waits == 1);
     REQUIRE(f.runtime.host_read_waits == 2);
+}
+
+TEST_CASE("Deleting a buffer clears its id from every channel's bindings", "[buffer_ports]") {
+    struct ChannelsFixture : Fixture {
+        ChannelsFixture() {
+            for (auto* state : {&first, &second}) {
+                state->memory_manager = &*memory;
+                state->payload.emplace(system, *memory, *state);
+                cache->CreateChannel(*state);
+            }
+        }
+        ~ChannelsFixture() {
+            cache.reset();
+        }
+        Tegra::Control::ChannelState first{0};
+        Tegra::Control::ChannelState second{1};
+    } f;
+    namespace Dirty = VideoCommon::Dirty;
+    const auto id = Access::Add(*f.cache, 0x10000, 0x10000);
+    const VideoCommon::Binding bound{.device_addr = 0x10800, .size = 0x100, .buffer_id = id};
+    auto& current = Access::Channel(*f.cache, 0);
+    auto& other = Access::Channel(*f.cache, 1);
+    current.uniform_buffers[0][0] = bound;
+    other.index_buffer = bound;
+    other.vertex_buffers[2] = bound;
+    other.uniform_buffers[0][0] = bound;
+    other.storage_buffers[4][1] = bound;
+    other.transform_feedback_buffers[3] = bound;
+    other.indirect_buffer_binding = bound;
+    other.compute_uniform_buffers[5] = bound;
+    other.enabled_uniform_buffer_masks[0] = 1;
+    auto& flags = other.maxwell3d.dirty.flags;
+    flags.reset();
+
+    // Deleted while channel 0 is current; the next buffer takes its slot.
+    f.cache->BindToChannel(0);
+    Access::Delete(*f.cache, id);
+    REQUIRE(Access::Add(*f.cache, 0x30000, 0x10000) == id);
+
+    REQUIRE(!current.uniform_buffers[0][0].buffer_id);
+    for (const auto* binding :
+         {&other.index_buffer, &other.vertex_buffers[2], &other.uniform_buffers[0][0],
+          &other.storage_buffers[4][1], &other.transform_feedback_buffers[3],
+          &other.indirect_buffer_binding, &other.compute_uniform_buffers[5]}) {
+        REQUIRE(!binding->buffer_id);
+        REQUIRE(binding->device_addr == 0x10800);
+    }
+    REQUIRE(flags[Dirty::IndexBuffer]);
+    REQUIRE(flags[Dirty::VertexBuffers]);
+    REQUIRE(flags[Dirty::VertexBuffer0 + 2]);
+    REQUIRE(!flags[Dirty::VertexBuffer0 + 1]);
+
+    // Channel 1's next draw resolves its uniform buffer again, to a buffer that holds the range.
+    f.cache->BindToChannel(1);
+    Access::UpdateUniforms(*f.cache, 0);
+    const auto resolved = other.uniform_buffers[0][0].buffer_id;
+    REQUIRE(resolved);
+    REQUIRE(resolved != VideoCommon::NULL_BUFFER_ID);
+    REQUIRE(resolved != id);
+    REQUIRE(Access::Get(*f.cache, resolved).IsInBounds(0x10800, 0x100));
+}
+
+TEST_CASE("The inline index buffer is unregistered when it is deleted or outgrown",
+          "[buffer_ports]") {
+    struct ChannelFixture : Fixture {
+        ChannelFixture() {
+            state.memory_manager = &*memory;
+            state.payload.emplace(system, *memory, state);
+            cache->CreateChannel(state);
+            cache->BindToChannel(0);
+        }
+        ~ChannelFixture() {
+            cache.reset();
+        }
+        Tegra::Control::ChannelState state{0};
+    } f;
+    auto& channel = Access::Channel(*f.cache, 0);
+    auto& indexes = channel.maxwell3d.draw_manager.draw_state.inline_index_draw_indexes;
+    const auto draw = [&](size_t size) {
+        indexes.assign(size, 0);
+        channel.maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+        Access::UpdateIndex(*f.cache);
+        REQUIRE(channel.index_buffer.buffer_id == Access::InlineIndexBuffer(*f.cache));
+        return channel.index_buffer.buffer_id;
+    };
+    const u64 bytes{Access::BufferBytes(*f.cache)};
+
+    // The collector deletes it once it goes unused; the next inline index draw makes a new one.
+    Access::Delete(*f.cache, draw(0x10));
+    REQUIRE(Access::InlineIndexBuffer(*f.cache) == VideoCommon::NULL_BUFFER_ID);
+    REQUIRE(Access::BufferBytes(*f.cache) == bytes);
+
+    // A larger draw replaces it, and the old one leaves the cache's accounting with it.
+    draw(0x10);
+    const auto large = draw(Access::CachingPageSize() + 1);
+    REQUIRE(Access::Get(*f.cache, large).SizeBytes() > Access::CachingPageSize());
+    Access::Delete(*f.cache, large);
+    REQUIRE(Access::InlineIndexBuffer(*f.cache) == VideoCommon::NULL_BUFFER_ID);
+    REQUIRE(Access::BufferBytes(*f.cache) == bytes);
+}
+
+TEST_CASE("Claimed CPU writes keep their bytes when an earlier one downloads their page",
+          "[buffer_ports]") {
+    Fixture f;
+    // The download branch of WriteMemory: only the scheduler's owner downloads, and Switch 2
+    // titles upload inline instead.
+    const bool ampere = Tegra::g_nx2_ampere.exchange(false);
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    std::ranges::fill(Access::Get(*f.cache, id).bytes, 0x12);
+    Access::Dirty(*f.cache, 0x20000, 0x1000);
+    std::memset(f.bytes + 0x10100, 0xaa, 0x10);
+    std::memset(f.bytes + 0x10800, 0xbb, 0x10);
+    const std::array<std::pair<DAddr, u64>, 2> ranges{{{0x20100, 0x10}, {0x20800, 0x10}}};
+    // A thread of its own, so marking it the GPU thread doesn't carry over to other tests.
+    std::thread{[&] {
+        VideoCommon::GpuSplit::MarkGpuThread();
+        f.cache->ClaimCpuWrites(ranges);
+        for (const auto& [address, size] : ranges) {
+            f.cache->WriteMemory(address, size);
+        }
+    }}.join();
+    Tegra::g_nx2_ampere.store(ampere);
+    REQUIRE(f.bytes[0x10000] == 0x12);
+    REQUIRE(f.bytes[0x10100] == 0xaa);
+    REQUIRE(f.bytes[0x10800] == 0xbb);
+    REQUIRE(f.bytes[0x1080f] == 0xbb);
+    REQUIRE(f.bytes[0x10810] == 0x12);
+}
+
+namespace {
+/// Command list page 0x18000 (GPU 0x108000) of KeepFixture's buffer, read from its copies as the
+/// split's front reads them (DmaPusher::ReadGpuWrittenCommands).
+struct ListPageFixture : KeepFixture {
+    static constexpr DAddr Page = 0x18000;
+    static constexpr GPUVAddr PageGpu = 0x108000;
+
+    ListPageFixture() : KeepFixture{nullptr} {
+        Draw(nullptr); // Binds the channel DMACopy and DMAClear use.
+        Tegra::Nx2MarkCommandListPage(Page);
+    }
+    /// Collects the page writes of a dispatch or DMA operation and has the host GPU make the
+    /// copies taken after it, as the rasterizer does.
+    template <typename Func>
+    void Work(Func&& func) {
+        cache->Nx2CollectListCopies(true);
+        func();
+        if (cache->Nx2CopyListPages(runtime.CurrentTick())) {
+            runtime.Complete(runtime.SubmitForHostRead());
+        }
+        cache->Nx2CollectListCopies(false);
+    }
+    /// A dispatch that writes `value` over [address, address + size).
+    void Dispatch(DAddr address, u32 size, u8 value) {
+        Work([&] {
+            auto& buffer = Access::Get(*cache, id);
+            runtime.pending.push_back([&buffer, address, size, value] {
+                std::fill_n(buffer.bytes.begin() + static_cast<std::ptrdiff_t>(address - 0x10000),
+                            size, value);
+            });
+            Access::GpuWrite(*cache, id, address, size);
+        });
+    }
+    /// Whether the front reads [address, address + 0x20) from a copy that holds `value`.
+    bool CopyHolds(DAddr address, u8 value) {
+        std::array<u8, 0x20> out{};
+        if (cache->Nx2ReadListCopy(address, out, true) != KeepCache::Nx2ListRead::Copied) {
+            return false;
+        }
+        return std::ranges::all_of(out, [value](u8 byte) { return byte == value; });
+    }
+
+    const Nx2TitleScope nx2_title;
+};
+} // namespace
+
+TEST_CASE("A command list page is copied again after a DMA copy of data no GPU work wrote",
+          "[buffer_ports]") {
+    ListPageFixture f;
+    f.Dispatch(ListPageFixture::Page, 0x20, 3);
+    REQUIRE(f.CopyHolds(ListPageFixture::Page, 3));
+
+    // The source holds only what the CPU wrote, so none of the copied bytes are GPU-modified.
+    std::memset(f.bytes + 0x4000, 7, 0x20);
+    f.cache->WriteMemory(0x14000, 0x20);
+    f.Work([&] { REQUIRE(f.cache->DMACopy(0x104000, ListPageFixture::PageGpu, 0x20)); });
+    REQUIRE(f.bytes[0x8000] == 7);
+    REQUIRE(f.CopyHolds(ListPageFixture::Page, 7));
+}
+
+TEST_CASE("A command list page is copied again after a DMA clear", "[buffer_ports]") {
+    ListPageFixture f;
+    f.Dispatch(ListPageFixture::Page, 0x20, 3);
+    REQUIRE(f.CopyHolds(ListPageFixture::Page, 3));
+
+    // MaxwellDMA writes guest memory once the cache cleared the buffer.
+    f.Work([&] { REQUIRE(f.cache->DMAClear(ListPageFixture::PageGpu, 8, 0x09090909)); });
+    std::memset(f.bytes + 0x8000, 9, 0x20);
+    REQUIRE(f.CopyHolds(ListPageFixture::Page, 9));
+}
+
+TEST_CASE("A command list page's copy holds the CPU's bytes the buffer had not taken yet",
+          "[buffer_ports]") {
+    ListPageFixture f;
+    f.Dispatch(ListPageFixture::Page, 0x20, 3);
+    f.cache->DownloadMemory(ListPageFixture::Page, 0x1000);
+    REQUIRE(f.bytes[0x8000] == 3);
+
+    // Later CPU writes to the page reach no cache: only the first is reported.
+    std::memset(f.bytes + 0x8100, 5, 0x20);
+    f.cache->WriteMemory(ListPageFixture::Page + 0x100, 0x20);
+    REQUIRE_FALSE(f.CopyHolds(ListPageFixture::Page, 3));
+
+    f.Work([&] { REQUIRE(f.cache->DMAClear(ListPageFixture::PageGpu, 8, 0x09090909)); });
+    std::memset(f.bytes + 0x8000, 9, 0x20);
+    REQUIRE(f.CopyHolds(ListPageFixture::Page, 9));
+    REQUIRE(f.CopyHolds(ListPageFixture::Page + 0x100, 5));
+}
+
+TEST_CASE("A DMA clear finds buffers past the first quarter of its range", "[buffer_ports]") {
+    KeepFixture f{nullptr};
+    f.Draw(nullptr); // Binds the channel DMAClear uses.
+    f.memory->Map(0x200000, 0x20000, 0x10000, Tegra::PTEKind::PITCH, true);
+    (void)Access::Add(*f.cache, 0x20800, 0x100);
+
+    // DMAClear counts words: 0x200 of them end where the buffer starts, 0x201 reach into it.
+    REQUIRE_FALSE(f.cache->DMAClear(0x200000, 0x200, 0x09090909));
+    REQUIRE(f.cache->DMAClear(0x200000, 0x201, 0x09090909));
+}
+
+TEST_CASE("A DMA copy names the destination ranges whose GPU-written bytes guest memory lacks",
+          "[buffer_ports]") {
+    KeepFixture f{nullptr};
+    f.Draw(nullptr); // Binds the channel DMACopy uses.
+    auto& buffer = Access::Get(*f.cache, f.id);
+    // The GPU wrote the first half of the source; guest memory holds older bytes there.
+    std::memset(f.bytes + 0x4000, 1, 0x40);
+    std::fill_n(buffer.bytes.begin() + 0x4000, 0x20, u8{9});
+    Access::MarkWritten(*f.cache, f.id, 0x14000, 0x20);
+    boost::container::small_vector<std::pair<DAddr, size_t>, 4> gpu_written;
+    REQUIRE(f.cache->DMACopy(0x104000, 0x106000, 0x40, &gpu_written));
+    REQUIRE(gpu_written.size() == 1);
+    REQUIRE(gpu_written[0] == std::pair<DAddr, size_t>{0x16000, 0x20});
+    // An image over the first half uploading now would take the older bytes.
+    REQUIRE(std::all_of(f.bytes + 0x6000, f.bytes + 0x6040, [](u8 b) { return b == 1; }));
+    f.cache->DownloadMemory(0x16000, 0x40);
+    REQUIRE(std::all_of(f.bytes + 0x6000, f.bytes + 0x6020, [](u8 b) { return b == 9; }));
+    REQUIRE(std::all_of(f.bytes + 0x6020, f.bytes + 0x6040, [](u8 b) { return b == 1; }));
+
+    // A source only the CPU wrote: the destination's guest memory has its bytes at once.
+    std::memset(f.bytes + 0x5000, 7, 0x20);
+    f.cache->WriteMemory(0x15000, 0x20);
+    REQUIRE(f.cache->DMACopy(0x105000, 0x107000, 0x20, &gpu_written));
+    REQUIRE(gpu_written.empty());
+    REQUIRE(std::all_of(f.bytes + 0x7000, f.bytes + 0x7020, [](u8 b) { return b == 7; }));
 }

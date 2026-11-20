@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -28,6 +27,12 @@ enum class BlendMode {
     VideoKey,
 };
 
+enum class ColorSpace {
+    RGB709, // Presented as sRGB.
+    RGB2020_PQ,
+    RGB709_Linear,
+};
+
 /**
  * Struct describing framebuffer configuration
  */
@@ -44,6 +49,8 @@ struct FramebufferConfig {
     bool native_tiling{};
     std::shared_ptr<const CpuFramebuffer> cpu_pixels;
     u32 layer_stack_mask{Service::Nvnflinger::DefaultLayerStackMask};
+    ColorSpace color_space{ColorSpace::RGB709};
+    u16 linear_unit_luminance{}; // Nits per linear 1.0; typically 80 for scRGB (observed in MKW's SDK).
 };
 
 Common::Rectangle<f32> NormalizeCrop(const FramebufferConfig& framebuffer, u32 texture_width,

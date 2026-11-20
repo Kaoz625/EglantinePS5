@@ -2,7 +2,6 @@
 #include <cstdint>
 #include "core/device_memory.h"
 namespace Common { void GuestMemoryFreed(std::uint64_t offset, std::size_t bytes) noexcept; void GuestMemoryFreedPart(std::uint64_t offset, std::size_t bytes) noexcept; inline constexpr std::size_t GuestFreedSlotBytes = std::size_t{2} << 20; }
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/core.h"

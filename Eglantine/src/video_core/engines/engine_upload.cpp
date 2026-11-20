@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstring>
@@ -120,7 +119,8 @@ void State::ProcessData(std::span<const u8> read_buffer) {
         Tegra::Texture::SwizzleSubrect(tmp, read_buffer, bytes_per_pixel, width, regs.dest.height,
                                        regs.dest.depth, x_offset, regs.dest.y, x_elements,
                                        regs.line_count, regs.dest.BlockHeight(),
-                                       regs.dest.BlockDepth(), regs.line_length_in);
+                                       regs.dest.BlockDepth(), regs.line_length_in,
+                                       memory_manager.UsesNativeTiling());
     }
 }
 

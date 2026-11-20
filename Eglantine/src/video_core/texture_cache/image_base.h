@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -61,6 +60,9 @@ enum class ImageFlagBits : u32 {
     /// device memory when the guest memory under it can hold data (Image::BindTiles), and only
     /// the parts written are uploaded.
     SparseTiles = 1 << 23,
+    /// Its own address space mapped it to more than one device range when it was made (with
+    /// Sparse only when the texture says so).
+    NonContiguous = 1 << 24,
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
@@ -134,6 +136,11 @@ struct ImageBase {
     /// At least the newest modification_tick among aliased_images (raised when an alias's tick is
     /// set or an alias is added): SynchronizeAliases has nothing to do while it is not newer.
     u64 newest_alias_tick = 0;
+    /// The cache's modification counter when the image took its contents from guest memory or
+    /// other images (made, or uploaded again), or a clear replaced all of them: write-backs noted
+    /// after it are bytes it holds older copies of, unless it rendered over them itself (which the
+    /// cache can't tell from a render elsewhere in it).
+    u64 load_tick = 0;
     /// frame_tick + 1 of the first frame a render pass other than a clear wrote it, or 0.
     u64 first_written_frame = 0;
     /// Levels whose every layer a shader last wrote through a storage view. Any other GPU write

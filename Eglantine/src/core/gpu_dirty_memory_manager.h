@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
@@ -32,7 +31,7 @@ public:
         // was otherwise built with shifts of 32 or more, which could leave it empty and lose the
         // write (with an older one left in back_buffer and `current` showing nothing).
         while (size != 0) {
-            const size_t in_page = (std::min)(size, page_size - (address & page_mask));
+            const size_t in_page = (std::min<size_t>)(size, page_size - (address & page_mask));
             CollectInPage(address, in_page);
             address += in_page;
             size -= in_page;

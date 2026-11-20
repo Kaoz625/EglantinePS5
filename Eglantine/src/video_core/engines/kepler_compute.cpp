@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -21,8 +20,10 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
+#include "shader_recompiler/frontend/ampere/program_override.h"
 #include "core/core.h"
 #include "video_core/gpu_split.h"
+#include "video_core/dlss_contract.h"
 #include "video_core/fire_emblem_upscale.h"
 #include "video_core/front_qmd.h"
 #include "video_core/nx2_profile.h"
@@ -30,6 +31,8 @@
 #include "video_core/nx2_drain_check.h"
 #include "video_core/nx2_list_indirect.h"
 #include "video_core/nx2_list_indirect_stats.h"
+#include "video_core/nx2_list_macro_trace.h"
+#include "video_core/nx2_mme_capture.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/native_upscale.h"
@@ -42,6 +45,7 @@
 #include "video_core/macro_turing_jit.h"
 #endif
 #include "video_core/rasterizer_interface.h"
+#include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/textures/decoders.h"
 
 namespace Tegra::Engines {
@@ -371,6 +375,9 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 memory_manager.ReadBlockUnsafe(address, descriptor.data(), sizeof(descriptor));
                 if (checked) {
                     DrainCheck::NoteBackRead(address, descriptor);
+                }
+                if (VideoCommon::ListMacroTrace::g_enabled) {
+                    VideoCommon::ListMacroTrace::NoteQmd(address, descriptor);
                 }
                 if (static u32 logged{}; (descriptor[53] & (1U << 23)) && logged < 8) {
                     ++logged;
@@ -801,6 +808,9 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
             return true;
         }
     }
+    if (BypassOotBaseNetwork()) {
+        return true;
+    }
     bool dispatched = true;
     try {
         rasterizer->DispatchCompute();
@@ -847,12 +857,17 @@ constexpr u32 DLSS_NETWORK_CLEAN_EVALUATIONS = 8;
 /// goes bad does so within its first few evaluations), and fail to be dropped.
 constexpr u32 DLSS_NETWORK_GOOD_CHECKS = 30;
 constexpr u32 DLSS_NETWORK_BAD_CHECKS = 10;
+/// Drops for mismatched output after which the network stays dropped: one that keeps going bad
+/// would switch between it and the replacement upscale.
+constexpr u32 DLSS_NETWORK_MAX_DROPS = 3;
 /// A check fails when more than this percentage of its blocks is mismatched (working networks:
 /// at most 0.2% on Fortune's Weave's title and Kunlun Base; frozen ones: 6-10%), or when any output
 /// sample is NaN or infinite.
 constexpr u32 DLSS_CHECK_MISMATCH_PERCENT = 3;
 } // Anonymous namespace
 
+/// Track captured network passes and return whether native dispatch should be skipped.
+/// Spatial-only chains still dispatch natively and replace the display output afterward.
 bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     using namespace VideoCommon::FireEmblemUpscale;
     const auto passes = CapturedPasses(program_id);
@@ -879,14 +894,24 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     if (dlss_chain.spatial_only) {
         return false;
     }
+    const auto blocker = GameDlssBlocker();
     const bool replacement = dlss_chain.failure != VideoCore::GameDlssReason::None ||
-                             GameDlssBlocker() != VideoCore::GameDlssReason::None;
+                             blocker != VideoCore::GameDlssReason::None;
+    // While the network recovers from mismatched output, its output pass runs, so the recheck in
+    // FinishDlssEvaluation (after the dispatch) sees this frame's network output; the replacement
+    // upscale then draws over it.
+    const bool recheck_after_dispatch =
+        dlss_chain.failure == VideoCore::GameDlssReason::OutputMismatch &&
+        blocker == VideoCore::GameDlssReason::None && !DlssNetworkDroppedForGood();
     if (dlss_chain.output_pass) {
-        return replacement && FinishDlssEvaluation();
+        return replacement && !recheck_after_dispatch && FinishDlssEvaluation();
     }
-    return dlss_chain.failure != VideoCore::GameDlssReason::None &&
-           !passes->IsPrepass(native_key) &&
-           dlss_chain.programs.contains(native_key);
+    // While the network can't be shown at all (turned off or replaced on request, resolution
+    // scaling, no support), its own passes are skipped like a network dropped for good: the
+    // replacement draws over their result anyway, and a pass that can't run (tensor operations
+    // unavailable) would drop the prepass's jitter, motion vectors and depth the replacement needs.
+    return (blocker != VideoCore::GameDlssReason::None || DlssNetworkDroppedForGood()) &&
+           !passes->IsPrepass(native_key) && dlss_chain.programs.contains(native_key);
 }
 
 // The game's own DLSS network (its translated programs) is shown once every pass of an
@@ -921,10 +946,21 @@ VideoCore::GameDlssReason KeplerCompute::GameDlssBlocker() const {
     return GameDlssReason::None;
 }
 
+bool KeplerCompute::DlssNetworkDroppedForGood() const {
+    using VideoCore::GameDlssReason;
+    return dlss_chain.failure != GameDlssReason::None &&
+           (dlss_chain.failure != GameDlssReason::OutputMismatch ||
+            dlss_chain.drops >= DLSS_NETWORK_MAX_DROPS);
+}
+
 // Checks the network's output against its input (on the GPU; the result arrives a few frames
-// later) and drops the network for the session after DLSS_NETWORK_BAD_CHECKS failed checks in a
-// row: a network that produces NaN, freezes on an old image or draws garbage would otherwise stay
-// on screen.
+// later) and drops the network after DLSS_NETWORK_BAD_CHECKS failed checks in a row: a network
+// that produces NaN, freezes on an old image or draws garbage would otherwise stay on screen.
+// Output with NaN drops it for the session. Mismatched output can be a moment the check misjudges
+// or the network gets over (The Duskbloods' was dropped minutes into play, and the replacement
+// upscale drew the rest of the session): the network keeps running behind the replacement upscale
+// and is shown again once DLSS_NETWORK_GOOD_CHECKS checks in a row pass, until it has been dropped
+// DLSS_NETWORK_MAX_DROPS times.
 void KeplerCompute::CheckDlssNetwork() {
     dlss_chain.checked = rasterizer->CanProbeGameDlssOutput();
     if (!dlss_chain.checked) {
@@ -981,28 +1017,63 @@ void KeplerCompute::CheckDlssNetwork() {
     if (!input || !output) {
         return;
     }
-    const auto probe = rasterizer->ProbeGameDlssOutput(*input, *output);
+    // A dynamic resolution network renders a region of its input and upscales that region to the
+    // whole output: compare only the region (all of the input would mismatch the output wherever
+    // the region leaves stale pixels, and drop a working network).
+    std::optional<std::array<u32, 2>> input_region;
+    if (dlss_chain.render_region) {
+        using namespace VideoCommon::FireEmblemUpscale;
+        if (cbuf.size.Value() < RenderLastColumnOffset + 4 ||
+            !memory_manager.IsFullyMappedRange(cbuf_address, RenderLastColumnOffset + 4)) {
+            return;
+        }
+        const u32 width = memory_manager.Read<u32>(cbuf_address + RenderLastColumnOffset) + 1;
+        const u32 height = memory_manager.Read<u32>(cbuf_address + RenderLastRowOffset) + 1;
+        if (width == 0 || height == 0 || width > input->width || height > input->height) {
+            return;
+        }
+        input_region = std::array{width, height};
+    }
+    const auto probe = rasterizer->ProbeGameDlssOutput(*input, *output, input_region);
     if (!probe) {
         return;
     }
     const bool invalid = probe->invalid_samples != 0;
     const bool mismatched = probe->mismatched * 100 > probe->blocks * DLSS_CHECK_MISMATCH_PERCENT;
+    using VideoCore::GameDlssReason;
     if (!invalid && !mismatched) {
         ++dlss_chain.good_checks;
         dlss_chain.bad_checks = 0;
+        if (dlss_chain.failure == GameDlssReason::OutputMismatch &&
+            dlss_chain.good_checks >= DLSS_NETWORK_GOOD_CHECKS) {
+            dlss_chain.failure = GameDlssReason::None;
+            LOG_INFO(HW_GPU, "Game DLSS network: its output checks out again in {} checks in a row",
+                     dlss_chain.good_checks);
+        }
         return;
     }
     dlss_chain.good_checks = 0;
     if (++dlss_chain.bad_checks < DLSS_NETWORK_BAD_CHECKS) {
         return;
     }
-    dlss_chain.failure = invalid ? VideoCore::GameDlssReason::InvalidOutput
-                                 : VideoCore::GameDlssReason::OutputMismatch;
+    if (dlss_chain.failure == GameDlssReason::OutputMismatch && !invalid) {
+        // Still mismatched while it runs behind the replacement upscale.
+        return;
+    }
+    dlss_chain.failure =
+        invalid ? GameDlssReason::InvalidOutput : GameDlssReason::OutputMismatch;
+    if (!invalid) {
+        ++dlss_chain.drops;
+    }
     LOG_WARNING(HW_GPU,
                 "Game DLSS network: {} in {} checks in a row (last: {}/{} blocks mismatched, worst "
-                "{:.3f}, {} invalid samples); the replacement upscale draws the output from now on",
+                "{:.3f}, gain {:.3f}, {} invalid samples); the replacement upscale draws the output "
+                "{}",
                 VideoCore::GameDlssReasonText(dlss_chain.failure), dlss_chain.bad_checks,
-                probe->mismatched, probe->blocks, probe->worst, probe->invalid_samples);
+                probe->mismatched, probe->blocks, probe->worst, probe->gain,
+                probe->invalid_samples,
+                DlssNetworkDroppedForGood() ? "from now on"
+                                            : "until the network's output checks out again");
 }
 
 // Logs what draws the game's DLSS evaluation, when that changes.
@@ -1067,9 +1138,12 @@ bool KeplerCompute::FinishDlssEvaluation() {
     const GameDlssReason blocker = GameDlssBlocker();
     const bool can_show =
         blocker == GameDlssReason::None && dlss_chain.failure == GameDlssReason::None;
-    // Checked before the replacement upscale draws over the output. Checks start over whenever
-    // the network can't run.
-    if (complete && can_show) {
+    // Checked before the replacement upscale draws over the output, also while the network runs
+    // behind it after mismatched output. Checks start over whenever the network can't run.
+    const bool recheck = blocker == GameDlssReason::None &&
+                         dlss_chain.failure == GameDlssReason::OutputMismatch &&
+                         !DlssNetworkDroppedForGood();
+    if (complete && (can_show || recheck)) {
         CheckDlssNetwork();
     } else {
         dlss_chain.good_checks = 0;
@@ -1138,6 +1212,37 @@ std::optional<Texture::TICEntry> KeplerCompute::ConstBuffer0Image(u32 offset) co
     return GetTICEntry(tic_index);
 }
 
+/// Identify a known 1.0.0 output pass before shader translation can reject it.
+/// The first word is a quick filter. The full native key must match before replacing the pass.
+bool KeplerCompute::BypassOotBaseNetwork() {
+    using namespace VideoCommon::OotNetwork;
+    const u64 program_id = Settings::GetCurrentProgramID();
+    if (!BypassEnabled(program_id)) {
+        return false;
+    }
+    const GPUVAddr program = regs.code_loc.Address() + launch_description.program_start;
+    if (!memory_manager.IsFullyMappedRange(program, sizeof(u32))) {
+        return false;
+    }
+    const u32 first_word = memory_manager.Read<u32>(program);
+    // Several output programs start with the same instruction.
+    for (const auto& candidate : BaseOutputPrograms) {
+        if (candidate.first_word != first_word ||
+            !memory_manager.IsFullyMappedRange(program, candidate.size)) {
+            continue;
+        }
+        std::vector<Shader::Ampere::Instruction> code(candidate.size /
+                                                     sizeof(Shader::Ampere::Instruction));
+        memory_manager.ReadBlock(program, code.data(), candidate.size);
+        if (Shader::Ampere::NativeProgramKey(code) == candidate.key) {
+            return BypassOotNetwork(program_id, candidate.key);
+        }
+    }
+    return false;
+}
+
+/// Replace a known output pass with a copy of the latest tonemapped image, using scaling for the
+/// base game. The update's network passes may be skipped after a successful replacement.
 bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     using namespace VideoCommon::OotNetwork;
     if (!BypassEnabled(program_id)) {
@@ -1147,39 +1252,95 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     if (!bypass) {
         return false;
     }
-    // The tonemap pass draws before the network every frame; until it has been seen (menus, the
-    // first frame) the network runs as usual. Its first passes are skipped only while the output
-    // pass is being replaced, so a failed replacement brings the whole network back next frame.
-    Maxwell3D::Regs::RenderTargetConfig tonemapped;
-    {
-        std::scoped_lock lock{bypass->mutex};
-        tonemapped = bypass->tonemapped;
+    // The first passes are skipped only while the output pass is being replaced, so a failed
+    // replacement brings the whole network back next frame. The game can also finish a frame with
+    // an output program this does not replace (#1688), which would read the skipped network's
+    // stale result every frame: a skip that no replacement followed brings the network back too.
+    if (native_key == PrepassProgramKey) {
+        if (bypass->output_pending.exchange(false, std::memory_order_relaxed) &&
+            bypass->output_replaced.exchange(false, std::memory_order_relaxed)) {
+            static bool logged = false;
+            if (!std::exchange(logged, true)) {
+                LOG_INFO(HW_GPU,
+                         "Ocarina of Time: the network's output pass was not replaced; running "
+                         "the network (first program after it: {:016x})",
+                         bypass->after_network.load(std::memory_order_relaxed));
+            }
+        }
+        const bool skip = bypass->output_replaced.load(std::memory_order_relaxed);
+        bypass->output_pending.store(skip, std::memory_order_relaxed);
+        return skip;
     }
-    if (tonemapped.Address() == 0) {
-        return false;
+    if (ShouldSkipUnusedDispatch(native_key,
+                                 bypass->output_replaced.load(std::memory_order_relaxed),
+                                 bypass->output_pending.load(std::memory_order_relaxed))) {
+        static bool logged = false;
+        if (!std::exchange(logged, true)) {
+            LOG_INFO(HW_GPU, "Skipping unused AA dispatch {:016x} after output replacement",
+                     native_key);
+        }
+        return true;
     }
-    if (native_key == PrepassProgramKey || native_key == NetworkProgramKey) {
+    if (native_key == NetworkProgramKey) {
+        bypass->after_network.store(0, std::memory_order_relaxed);
         return bypass->output_replaced.load(std::memory_order_relaxed);
     }
-    if (native_key != OutputProgramKey) {
+    const bool base_output = std::ranges::find(BaseOutputPrograms, native_key,
+                                              &BaseOutputProgram::key) != BaseOutputPrograms.end();
+    if (native_key != OutputProgramKey && !base_output) {
+        u64 none = 0;
+        bypass->after_network.compare_exchange_strong(none, native_key, std::memory_order_relaxed);
         return false;
     }
-    // The copy needs the tonemapped image to be a B10G11R11 block-linear image of the output's size.
+    // The update's output pass samples the HDR scene the tonemap pass reads (B10G11R11 memory
+    // through an E5B9G9R9 descriptor, see TryOcarinaUpscale), so copying it would skip the
+    // tonemap. The copy reads the latest draw of the input's size since the last output pass
+    // instead: that is the tonemap, drawn after the scene, whichever shader draws it.
+    const auto input = ConstBuffer0Image(InputImageHandleOffset);
     const auto output = ConstBuffer0Image(OutputImageHandleOffset);
-    if (!output || output->format != Texture::TextureFormat::B10G11R11 || output->Address() == 0 ||
-        output->Address() == tonemapped.Address() || !output->IsBlockLinear() ||
-        tonemapped.format != Tegra::RenderTargetFormat::B10G11R11_FLOAT ||
-        tonemapped.tile_mode.is_pitch_linear || tonemapped.width != output->Width() ||
-        tonemapped.height != output->Height()) {
+    const auto valid = [](const std::optional<Texture::TICEntry>& image) {
+        return image && image->Address() != 0 && image->IsBlockLinear() && image->Width() != 0 &&
+               image->Height() != 0;
+    };
+    Maxwell3D::Regs::RenderTargetConfig tonemapped{};
+    {
+        std::scoped_lock lock{bypass->mutex};
+        if (bypass->latest_address.exchange(0, std::memory_order_relaxed) != 0) {
+            tonemapped = bypass->latest_draw;
+        }
+    }
+    const Texture::TextureFormat input_format =
+        input ? input->format.Value() : Texture::TextureFormat{};
+    const bool images_valid = valid(input) && valid(output) &&
+                              (input_format == Texture::TextureFormat::B10G11R11 ||
+                               input_format == Texture::TextureFormat::E5B9G9R9) &&
+                              output->format == Texture::TextureFormat::B10G11R11;
+    // Draws are matched against the previous output pass's images, so the first one only learns
+    // them.
+    const bool learned = bypass->input_width.load(std::memory_order_relaxed) != 0;
+    if (images_valid) {
+        bypass->input_width.store(input->Width(), std::memory_order_relaxed);
+        bypass->input_height.store(input->Height(), std::memory_order_relaxed);
+        bypass->output_address.store(output->Address(), std::memory_order_relaxed);
+    }
+    // The base game can run its tonemap at a lower resolution than the output.
+    if (!images_valid || tonemapped.Address() == 0 || tonemapped.Address() == output->Address() ||
+        (base_output ? tonemapped.width > output->Width() || tonemapped.height > output->Height()
+                     : tonemapped.width != output->Width() ||
+                           tonemapped.height != output->Height())) {
         bypass->output_replaced.store(false, std::memory_order_relaxed);
         static bool warned = false;
-        if (!std::exchange(warned, true)) {
+        if ((learned || !images_valid) && !std::exchange(warned, true)) {
+            const auto size = [](const std::optional<Texture::TICEntry>& image) {
+                return image ? fmt::format("{}x{} format {:#x}", image->Width(), image->Height(),
+                                           static_cast<u32>(image->format.Value()))
+                             : std::string{"unreadable"};
+            };
             LOG_WARNING(HW_GPU,
-                        "Ocarina of Time: unexpected network images; not replaced (tonemapped {}x{}, "
-                        "output {})",
-                        tonemapped.width, tonemapped.height,
-                        output ? fmt::format("{}x{}", output->Width(), output->Height())
-                               : std::string{"unreadable"});
+                        "Ocarina of Time: unexpected network images; not replaced (tonemapped "
+                        "{:#x} {}x{}, input {}, output {})",
+                        tonemapped.Address(), tonemapped.width, tonemapped.height, size(input),
+                        size(output));
         }
         return false;
     }
@@ -1195,6 +1356,8 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     destination.addr_upper = static_cast<u32>(output->Address() >> 32);
     destination.addr_lower = static_cast<u32>(output->Address());
     Fermi2D::Surface source = destination;
+    source.width = tonemapped.width;
+    source.height = tonemapped.height;
     source.block_width.Assign(tonemapped.tile_mode.block_width);
     source.block_height.Assign(tonemapped.tile_mode.block_height);
     source.block_depth.Assign(tonemapped.tile_mode.block_depth);
@@ -1204,7 +1367,7 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     const s32 height = static_cast<s32>(output->Height());
     const Fermi2D::Config config{
         .operation = Fermi2D::Operation::SrcCopy,
-        .filter = Fermi2D::Filter::Point,
+        .filter = base_output ? Fermi2D::Filter::Bilinear : Fermi2D::Filter::Point,
         .must_accelerate = true,
         .dst_x0 = 0,
         .dst_y0 = 0,
@@ -1212,16 +1375,19 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
         .dst_y1 = height,
         .src_x0 = 0,
         .src_y0 = 0,
-        .src_x1 = width,
-        .src_y1 = height,
+        .src_x1 = static_cast<s32>(source.width),
+        .src_y1 = static_cast<s32>(source.height),
     };
     const bool copied = rasterizer->AccelerateSurfaceCopy(source, destination, config);
     bypass->output_replaced.store(copied, std::memory_order_relaxed);
+    bypass->output_pending.store(false, std::memory_order_relaxed);
     static bool logged = false;
     if (!std::exchange(logged, true)) {
         LOG_INFO(HW_GPU,
-                 "Ocarina of Time: anti-aliasing network bypassed ({}): {:#x} -> {:#x} {}x{}",
-                 copied ? "copy of the tonemapped image" : "copy failed", tonemapped.Address(),
+                 "Ocarina of Time: anti-aliasing network bypassed ({}): "
+                 "shader {:016x}, {:#x} {}x{} (input {:#x}) -> {:#x} {}x{}",
+                 copied ? "copy of the tonemapped image" : "copy failed", native_key,
+                 tonemapped.Address(), source.width, source.height, input->Address(),
                  output->Address(), width, height);
     }
     return copied;
@@ -1324,11 +1490,16 @@ void KeplerCompute::RememberDlssMotionVectors() {
     dlss_motion_color = color->Address();
     const u32 depth_offset = dlss_chain.render_region ? 0x288 : 0x298;
     const auto depth = cbuf.size.Value() >= 0x29c ? image(depth_offset) : std::nullopt;
-    if (depth && depth->format == Texture::TextureFormat::Z32 && depth->Address() != 0 &&
-        same_grid(*depth) && depth->IsBlockLinear()) {
+    if (!depth || depth->Address() == 0 || !same_grid(*depth) || !depth->IsBlockLinear()) {
+        return;
+    }
+    // The texture cache's mapping for this TIC, so both accept the same depths. The TIC comes from
+    // the guest, so an unknown tuple is skipped instead of asserting.
+    const auto depth_format = VideoCommon::TryPixelFormatFromTextureInfo(
+        depth->format, depth->r_type, depth->g_type, depth->b_type, depth->a_type,
+        depth->srgb_conversion != 0);
+    if (depth_format && VideoCommon::DlssContract::IsUpscalerDepthFormat(*depth_format)) {
         dlss_depth = *depth;
-    } else {
-        dlss_depth.reset();
     }
 }
 
@@ -1449,22 +1620,35 @@ bool KeplerCompute::ScaleDlssRenderRegion(GPUVAddr constants,
     // Without this evaluation's jitter or usable motion vectors (a rejected pass clears them), the
     // region is still scaled, without history, rather than leaving the network's output.
     const bool use_history = jitter && motion && width <= motion->Width() &&
-                             height <= motion->Height() &&
-                             (!depth || (width <= depth->Width() && height <= depth->Height()));
+                             height <= motion->Height();
+    // A depth too small for the region is left out; history still runs (on the stand-in).
+    const bool depth_fits = depth && width <= depth->Width() && height <= depth->Height();
     Fermi2D::Surface motion_surface{};
     if (use_history) {
         motion_surface = surface(*motion);
         motion_surface.format = Tegra::RenderTargetFormat::R16G16_FLOAT;
     }
-    // The game's motion vectors point from the previous position to the current one (a rightward
-    // pan gives negative x while the scene moves left), the reverse of what the upscale expects.
+    // Measured: the vectors at cb0+0x290 are in output pixels and point to the previous position
+    // (prev = cur + mv); the raw cb0+0x284 buffer has the opposite sign (the prepass scales it by -1080).
     const std::array<f32, 2> motion_scale =
-        use_history ? std::array{-1.0f, -1.0f} : std::array{0.0f, 0.0f};
-    const bool done = rasterizer->AccelerateTemporalUpscale(
-        surface(*input), surface(*output), motion_surface,
-        use_history && depth ? &*depth : nullptr,
-        jitter ? jitter->offset : std::array{0.0f, 0.0f}, motion_scale, use_history,
-        std::array{width, height});
+        use_history ? std::array{1.0f / static_cast<f32>(output->Width()),
+                                 1.0f / static_cast<f32>(output->Height())}
+                    : std::array{0.0f, 0.0f};
+    const auto upscale = [&](bool history, const Texture::TICEntry* upscale_depth) {
+        return rasterizer->AccelerateTemporalUpscale(
+            surface(*input), surface(*output), history ? motion_surface : Fermi2D::Surface{},
+            upscale_depth, jitter ? jitter->offset : std::array{0.0f, 0.0f},
+            history ? motion_scale : std::array{0.0f, 0.0f}, history, std::array{width, height});
+    };
+    // Each refusal drops one input: the depth (it can be refused after it was prepared), then the
+    // history, which leaves the spatial draw the region always had.
+    bool done = use_history && depth_fits && upscale(true, &*depth);
+    if (!done && use_history) {
+        done = upscale(true, nullptr);
+    }
+    if (!done) {
+        done = upscale(false, nullptr);
+    }
     static u32 last_width{};
     if (width != last_width) {
         last_width = width;
@@ -1626,6 +1810,13 @@ struct FrontQmdMemory {
     }
     void NoteWriteAt(VideoCommon::GpuSplit& split, GPUVAddr address, u64 size, u64 position) const {
         split.NoteWriteAt(memory, address, size, position);
+    }
+    [[nodiscard]] u64 OtherWritesTarget(const VideoCommon::GpuSplit& split,
+                                        GPUVAddr address) const {
+        return split.OtherWritesTarget(memory, address);
+    }
+    void NoteSemaphoreRelease(VideoCommon::GpuSplit& split, GPUVAddr address) const {
+        split.NoteSemaphoreRelease(memory, address);
     }
     [[nodiscard]] const void* Id() const {
         return &memory;
@@ -1807,10 +1998,16 @@ void KeplerCompute::ReleaseFront() {
     LOG_INFO(HW_GPU, "GPU thread split stopped: compute macros back on the engine");
 }
 
-void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {
+void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument, bool from_macro) {
     // As ProcessNativeMethod does with the macro code and bindings.
     if (method == 0x45 || method == 0x47) {
         fs.compute_uploaded = true;
+    }
+    if (VideoCommon::MmeCapture::active && method - 0x45 < 4) {
+        VideoCommon::MmeCapture::RecordWrite(
+            memory_manager.GetID(), this, from_macro ? "compute macro" : "compute dma",
+            !native_context ? "standalone" : fs.compute_uploaded ? "compute" : "3d",
+            method, argument, FrontMacroEngine(fs).native_write_offset, fs.bind_pointer);
     }
     Nx2ListIndirect::NoteUploadMethod(fs.upload, method, argument, [&fs](u32 reg) {
         return fs.registers[reg];
@@ -1986,6 +2183,11 @@ void KeplerCompute::FrontNoteUpload(VideoCommon::GpuSplit& split, FrontState& fs
 }
 
 
+bool KeplerCompute::FrontRunsMacroWord(u32 method) const {
+    const auto& executing = front ? front->executing_macro : native_executing_macro;
+    return method >= 0xe00 && method < native_registers.size() &&
+           (executing || (method & 1) == 0);
+}
 
 void KeplerCompute::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& fs,
                                     u32 control) {
@@ -2010,6 +2212,7 @@ void KeplerCompute::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontSta
     if (!reduction && !one_word) {
         // 64 bits (a timestamp follows).
         split.NoteSemaphoreWrite(*device + 4, 0, true, false, landing);
+        split.NoteUnknownWrites(*device + 8, 8, landing);
     }
 }
 
@@ -2111,21 +2314,35 @@ bool KeplerCompute::FrontTakeListWords(VideoCommon::GpuSplit& split, u32 method,
 void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
                                   FrontState& fs) {
     const auto positions = FrontMacroPositions(fs);
-    const u32 start = positions[((*fs.executing_macro - 0xe00) / 2) % positions.size()];
+    const u32 method = *fs.executing_macro;
+    const u32 slot = static_cast<u32>(((method - 0xe00) / 2) % positions.size());
+    const u32 start = positions[slot];
     fs.executing_macro.reset();
     auto& macro = FrontMacroEngine(fs);
+    const bool use_compute_bank = fs.compute_uploaded;
     if (native_data_ram) {
         macro.native_interpreter.active_dram = native_data_ram;
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
-    const auto read = [&fs](u32 address) {
-        return address < fs.registers.size() ? fs.registers[address] : 0U;
+    namespace ListTrace = VideoCommon::ListMacroTrace;
+    ListTrace::Call* const trace =
+        ListTrace::g_enabled
+            ? ListTrace::BeginCall(ListTrace::Engine::Compute, static_cast<EngineInterface*>(this),
+                                   method, macro.native_code, macro.native_code_generation, start,
+                                   fs.parameters, *macro.native_interpreter.active_dram,
+                                   fs.registers)
+            : nullptr;
+    const auto read = [&fs, trace](u32 address) {
+        const u32 value = address < fs.registers.size() ? fs.registers[address] : 0U;
+        ListTrace::NoteRead(trace, address, value);
+        return value;
     };
     const auto emit = [&](u32 address, u32 value) {
         if (address >= 0xe00) {
             return false;
         }
-        FrontApply(fs, address, value);
+        ListTrace::NoteWrite(trace, address, value);
+        FrontApply(fs, address, value, true);
         if (IsQmdMethod(address)) {
             GetFrontQmd().MaybeTakeOver(split, native_qmd);
         }
@@ -2156,6 +2373,9 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         Nx2ListIndirect::Reason reason{};
         if (list_front->Run(context, Nx2ListIndirect::GetChannel(native_data_ram), concretized,
                             reason)) {
+            if (trace != nullptr) {
+                ListTrace::EndCall(*trace, true); // The words are the back's, as on the back
+            }
             fs.parameters.clear();
             return;
         }
@@ -2163,13 +2383,19 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
             Nx2ListIndirect::Stats::NoteConcretized(reason);
         }
     }
+    u32 last_pc = ~0U;
 #ifdef ARCHITECTURE_x86_64
     if (!macro.native_jit) {
         macro.native_jit = std::make_shared<TuringMacroJit>();
     }
-    macro.native_jit->Prepare(macro.native_code, macro.native_code_generation);
-    const auto result = macro.native_jit->Execute(
-        start, fs.parameters, std::span<u32>{*macro.native_interpreter.active_dram}, read, emit);
+    const bool capture_pc = VideoCommon::MmeCapture::active;
+    macro.native_jit->Prepare(macro.native_code, macro.native_code_generation, capture_pc);
+    const auto result =
+        trace != nullptr && trace->data_ram
+            ? macro.native_interpreter.Execute(macro.native_code, start, fs.parameters, read, emit)
+            : macro.native_jit->Execute(start, fs.parameters,
+                                        std::span<u32>{*macro.native_interpreter.active_dram},
+                                        read, emit, capture_pc ? &last_pc : nullptr);
 #else
     const auto result =
         macro.native_interpreter.Execute(macro.native_code, start, fs.parameters, read, emit);
@@ -2178,6 +2404,16 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         macro.native_execution_failed = true;
         LOG_ERROR(HW_GPU, "Native MME (split front) failed: compute start={:#x}, consumed={}, error={}",
                   start, result.consumed, result.error);
+        if (VideoCommon::MmeCapture::active) {
+            VideoCommon::MmeCapture::Fail(
+                memory_manager.GetID(), this,
+                !native_context ? "standalone" : use_compute_bank ? "compute" : "3d",
+                method, slot, start, result, last_pc, macro.native_code, fs.parameters);
+        }
+    }
+    if (trace != nullptr) {
+        ListTrace::EndCall(*trace, false, macro.native_interpreter.data_ram_reads,
+                           macro.native_interpreter.data_ram_writes);
     }
     fs.parameters.clear();
 }

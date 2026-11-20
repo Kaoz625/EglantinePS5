@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -49,12 +48,12 @@ Result MapPhysicalMemory(Core::System& system, u64 addr, u64 size) {
     MemoryStats::Note(MemoryStats::MapPhysicalMemory, size, true);
     LOG_DEBUG(Kernel_SVC, "called, addr={:#016x}, size={:#x}", addr, size);
 
-    if (!Common::IsAligned(addr, Core::Memory::YUZU_PAGESIZE)) {
+    if (!Common::IsAligned(addr, Core::Memory::LICHII_PAGESIZE)) {
         LOG_ERROR(Kernel_SVC, "Address is not aligned to 4KB, {:#016X}", addr);
         R_THROW(ResultInvalidAddress);
     }
 
-    if (!Common::IsAligned(size, Core::Memory::YUZU_PAGESIZE)) {
+    if (!Common::IsAligned(size, Core::Memory::LICHII_PAGESIZE)) {
         LOG_ERROR(Kernel_SVC, "Size is not aligned to 4KB, {:#X}", size);
         R_THROW(ResultInvalidSize);
     }
@@ -99,12 +98,12 @@ Result UnmapPhysicalMemory(Core::System& system, u64 addr, u64 size) {
     MemoryStats::Note(MemoryStats::UnmapPhysicalMemory, size, true);
     LOG_DEBUG(Kernel_SVC, "called, addr={:#016x}, size={:#x}", addr, size);
 
-    if (!Common::IsAligned(addr, Core::Memory::YUZU_PAGESIZE)) {
+    if (!Common::IsAligned(addr, Core::Memory::LICHII_PAGESIZE)) {
         LOG_ERROR(Kernel_SVC, "Address is not aligned to 4KB, {:#016X}", addr);
         R_THROW(ResultInvalidAddress);
     }
 
-    if (!Common::IsAligned(size, Core::Memory::YUZU_PAGESIZE)) {
+    if (!Common::IsAligned(size, Core::Memory::LICHII_PAGESIZE)) {
         LOG_ERROR(Kernel_SVC, "Size is not aligned to 4KB, {:#X}", size);
         R_THROW(ResultInvalidSize);
     }

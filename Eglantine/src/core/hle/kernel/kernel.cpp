@@ -13,7 +13,6 @@ namespace Common { void CommitGuestMemory(std::uint64_t offset, std::size_t byte
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
@@ -29,6 +28,9 @@ namespace Common { void CommitGuestMemory(std::uint64_t offset, std::size_t byte
 #include "common/assert.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
+#ifdef HAS_NCE
+#include "common/settings.h"
+#endif
 #include "common/thread.h"
 #include "common/thread_worker.h"
 #include "core/arm/arm_interface.h"
@@ -102,7 +104,6 @@ struct KernelCore::Impl {
     }
 
     void Initialize(KernelCore& kernel) {
-        services_closing = false;
         hardware_timer.emplace(kernel);
         hardware_timer->Initialize();
 
@@ -187,15 +188,25 @@ struct KernelCore::Impl {
             // finalize can't unmap the next game's memory, and clear the arena.
             const u32 references = application_process->GetReferenceCount();
             application_process->GetPageTable().GetImpl().fastmem_arena = nullptr;
+#ifdef HAS_HYPERVISOR
+            application_process->ReleaseHypervisor();
+#endif
             application_process->Close(system.Kernel());
             application_process = nullptr;
             if (references > 1) {
                 LOG_WARNING(Kernel, "Application process still had {} references at shutdown",
                             references);
             }
-            auto& arena = system.DeviceMemory().buffer;
-            arena.Unmap(0, arena.VirtualSize(), false);
+            system.DeviceMemory().buffer.ResetVirtualMappings();
+#ifdef HAS_NCE
+        } else if (system.DeviceMemory().buffer.IsDirectMapped()) {
+            system.DeviceMemory().buffer.ResetVirtualMappings();
+#endif
         }
+
+#ifdef HAS_NCE
+        Settings::SetNceEnabled(false);
+#endif
 
         next_object_id = 0;
         next_kernel_process_id = KProcess::InitialProcessIdMin;
@@ -278,10 +289,18 @@ struct KernelCore::Impl {
         eden_mark("hardware_timer");
 #else // PS5
 #endif // PS5
+
+        // Servers may run again, for the next process.
+        std::scoped_lock lk{server_lock};
+        services_closed = false;
     }
 
     void CloseServices() {
-        // Ensures all servers gracefully shutdown.
+        // Ensures all servers gracefully shutdown. They are stopped without the server lock held:
+        // the services on guest cores all run on core 3, so one still starting would block that
+        // core on the lock in RunServer, and the servers waited on here could never stop (a close
+        // while the boot shader cache loads starts the guest cores just then). Servers that start
+        // from now on are refused, and kept until the kernel shuts down (the call from Shutdown).
 #if defined(EDEN_DEV_PROFILE) // PS5 development build
         using EdenClock = std::chrono::steady_clock;
         const auto eden_ms = [](EdenClock::time_point from) {
@@ -290,15 +309,20 @@ struct KernelCore::Impl {
         const auto eden_start = EdenClock::now();
 #else // PS5
 #endif // PS5
-        decltype(server_managers) closing_managers;
+        std::vector<std::unique_ptr<Service::ServerManager>> managers;
 #if defined(EDEN_DEV_PROFILE) // PS5 development build
         decltype(server_names) closing_names;
 #else // PS5
 #endif // PS5
         {
             std::scoped_lock lk{server_lock};
-            services_closing = true;
-            closing_managers.swap(server_managers);
+            services_closed = true;
+            managers = std::move(server_managers);
+            server_managers.clear();
+            for (auto& refused : refused_servers) {
+                managers.push_back(std::move(refused));
+            }
+            refused_servers.clear();
 #if defined(EDEN_DEV_PROFILE) // PS5 development build
             closing_names.swap(server_names);
 #else // PS5
@@ -306,10 +330,10 @@ struct KernelCore::Impl {
         }
 #if defined(EDEN_DEV_PROFILE) // PS5 development build
         const double eden_lock_ms = eden_ms(eden_start);
-        const size_t eden_count = closing_managers.size();
+        const size_t eden_count = managers.size();
         auto eden_phase = EdenClock::now();
         double eden_stop_worst = 0;
-        for (auto& manager : closing_managers) {
+        for (auto& manager : managers) {
             const auto eden_one = EdenClock::now();
             manager->RequestStop();
             eden_stop_worst = std::max(eden_stop_worst, eden_ms(eden_one));
@@ -317,9 +341,9 @@ struct KernelCore::Impl {
         const double eden_stop_ms = eden_ms(eden_phase);
         eden_phase = EdenClock::now();
         double eden_worst = 0;
-        for (size_t i = 0; i < closing_managers.size(); ++i) {
+        for (size_t i = 0; i < managers.size(); ++i) {
             const auto eden_one = EdenClock::now();
-            closing_managers[i].reset();
+            managers[i].reset();
             const double ms = eden_ms(eden_one);
             eden_worst = std::max(eden_worst, ms);
             if (ms >= 20.0) {
@@ -328,9 +352,11 @@ struct KernelCore::Impl {
             }
         }
 #else // PS5
-        for (auto& manager : closing_managers) manager->RequestStop();
+        for (auto& manager : managers) manager->RequestStop();
 #endif // PS5
-        closing_managers.clear();
+        for (auto& manager : managers) {
+            manager.reset();
+        }
 #if defined(EDEN_DEV_PROFILE) // PS5 development build
         const double eden_destroy_ms = eden_ms(eden_phase);
         eden_phase = EdenClock::now();
@@ -951,13 +977,17 @@ struct KernelCore::Impl {
     ::Common::unordered_set<KAutoObject*> registered_in_use_objects;
 
     std::vector<KThread*> service_threads;
-    bool services_closing = false;
 #if defined(EDEN_DEV_PROFILE) // PS5 development build
     std::vector<std::string> server_names;
 #else // PS5
 #endif // PS5
     std::mutex server_lock;
     std::vector<std::unique_ptr<Service::ServerManager>> server_managers;
+    bool services_closed{}; ///< Set once CloseServices ran, guarded by server_lock
+    /// Servers refused while services close, kept until the kernel shuts down: their handlers stay
+    /// reachable through sm (glue's time manager calls psc's time:m, which registers services on
+    /// its server). Guarded by server_lock.
+    std::vector<std::unique_ptr<Service::ServerManager>> refused_servers;
 
     std::array<std::optional<Kernel::PhysicalCore>, Core::Hardware::NUM_CPU_CORES> cores;
 
@@ -1164,14 +1194,26 @@ void KernelCore::UnregisterInUseObject(KAutoObject* object) {
 void KernelCore::RunServer(std::unique_ptr<Service::ServerManager>&& server_manager) {
     auto* manager = server_manager.get();
 
+    bool refused = false;
     {
         std::scoped_lock lk{impl->server_lock};
-        if (!impl->services_closing && !impl->is_shutting_down) {
+        if (impl->is_shutting_down || impl->services_closed) {
+            refused = true;
+        } else {
             impl->server_managers.emplace_back(std::move(server_manager));
         }
     }
 
-    if (server_manager) manager->RequestStop();
+    if (refused) {
+        // Services are closing: this server never runs. It stays ours until SkipLoop is done, so a
+        // CloseServices running meanwhile can't destroy it under us. Then the kernel keeps it until
+        // it shuts down.
+        manager->SkipLoop();
+        std::scoped_lock lk{impl->server_lock};
+        impl->refused_servers.emplace_back(std::move(server_manager));
+        return;
+    }
+
     manager->LoopProcess();
 }
 
@@ -1371,25 +1413,32 @@ const Kernel::KSharedMemory& KernelCore::GetHidBusSharedMem() const {
     return *impl->hidbus_shared_mem;
 }
 
+void KernelCore::RequestSuspendEmulation() {
+    for (auto& process : GetProcessList()) {
+        KScopedLightLock ll{process->GetListLock()};
+
+        for (auto& thread : process->GetThreadList()) {
+            thread.RequestSuspend(*this, SuspendType::System);
+        }
+    }
+}
+
 void KernelCore::SuspendEmulation(bool suspended) {
     const bool should_suspend{exception_exited || suspended};
     auto processes = GetProcessList();
 
-    for (auto& process : processes) {
-        KScopedLightLock ll{process->GetListLock()};
+    if (!should_suspend) {
+        for (auto& process : processes) {
+            KScopedLightLock ll{process->GetListLock()};
 
-        for (auto& thread : process->GetThreadList()) {
-            if (should_suspend) {
-                thread.RequestSuspend(*this, SuspendType::System);
-            } else {
+            for (auto& thread : process->GetThreadList()) {
                 thread.Resume(*this, SuspendType::System);
             }
         }
-    }
-
-    if (!should_suspend) {
         return;
     }
+
+    RequestSuspendEmulation();
 
     // Wait for process execution to stop.
     // KernelCore::SuspendEmulation must be called from locked context,

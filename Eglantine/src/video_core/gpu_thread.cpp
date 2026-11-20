@@ -10,7 +10,6 @@ namespace Eden { bool LoadingTick(VideoCore::RendererBase&, bool idle); }
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
@@ -31,9 +30,11 @@ namespace Eden { bool LoadingTick(VideoCore::RendererBase&, bool idle); }
 #include "video_core/dma_pusher.h"
 #include "video_core/front_qmd.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_trace/recorder.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_back_idle_trace.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
@@ -112,6 +113,8 @@ void ThreadManager::RunWorker(VideoCore::RendererBase& renderer, Core::Frontend:
         auto& acquire_stats = VideoCommon::g_acquire_stats;
         namespace Profile = VideoCommon::Nx2Profile;
         auto& split = VideoCommon::GpuSplit::Get();
+        namespace BackIdleTrace = VideoCommon::BackIdleTrace;
+        using FrontState = BackIdleTrace::FrontState;
         while (!stop_token.stop_requested()) {
             Profile::Report();
             split.MaybeStart(system);
@@ -132,6 +135,9 @@ void ThreadManager::RunWorker(VideoCore::RendererBase& renderer, Core::Frontend:
                     VideoCommon::FrontQmdView::Get().MaybeTakeOver(split);
                 }
                 const bool popped = state.queue.TryPop(next);
+                if (popped) {
+                    BackIdleTrace::SetFrontState(FrontState::Parse);
+                }
                 if (resumed || popped) {
                     if (last_wait == WaitEnd::PollTimedOut) {
                         VideoCommon::Count(acquire_stats.front_found_polling);
@@ -144,6 +150,11 @@ void ThreadManager::RunWorker(VideoCore::RendererBase& renderer, Core::Frontend:
                 if (!popped) {
                     if (!scheduler.HasPendingChannels()) {
                         continue;
+                    }
+                    if (BackIdleTrace::Enabled()) {
+                        BackIdleTrace::SetFrontState(scheduler.WaitsForListCopy()
+                                                         ? FrontState::PendingCopy
+                                                         : FrontState::PendingSemaphore);
                     }
                     // Mario Kart World's channels wait for semaphores its CPU releases, stores
                     // that send no wake, and the CPU usually releases soon after: for half a
@@ -208,6 +219,7 @@ void ThreadManager::RunWorker(VideoCore::RendererBase& renderer, Core::Frontend:
                 } else {
 #endif // PS5
                 Profile::Scope scope{Profile::Zone::Idle};
+                BackIdleTrace::SetFrontState(FrontState::QueueEmpty);
                 state.queue.PopWait(next, stop_token);
 #if !defined(__PROSPERO__) // not PS5
 #elif defined(EDEN_DEV_PROFILE) // PS5 development build
@@ -216,9 +228,17 @@ void ThreadManager::RunWorker(VideoCore::RendererBase& renderer, Core::Frontend:
 #else // PS5
                 }
 #endif // PS5
+                BackIdleTrace::SetFrontState(FrontState::Parse);
             }
             if (stop_token.stop_requested()) {
                 break;
+            }
+            if (VideoCommon::GpuTrace::g_requested.load(std::memory_order_relaxed) ||
+                VideoCommon::GpuTrace::g_file_trigger) {
+                const auto* const submit = std::get_if<SubmitListCommand>(&next.data);
+                VideoCommon::GpuTrace::OnCommand(
+                    system, scheduler.HasPendingChannels(), submit ? &submit->entries : nullptr,
+                    submit ? submit->channel : -1, std::holds_alternative<GPUTickCommand>(next.data));
             }
             if (split.Active()) {
                 VideoCommon::FrontQmdView::Get().MaybeTakeOver(split);

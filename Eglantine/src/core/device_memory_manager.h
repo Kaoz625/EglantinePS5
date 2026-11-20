@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -15,6 +14,7 @@
 #include <source_location>
 #include <vector>
 #include <span>
+#include <unordered_map>
 
 #include "common/common_types.h"
 #include "common/range_mutex.h"
@@ -57,6 +57,7 @@ public:
 
     /// Marks the memory behind [address, address + size) cold (Common::HostMemory::HintCold),
     /// from a low-priority thread: data the host GPU has its own copy of, e.g. uploaded textures.
+    /// Only while the host is short of RAM (Common::IsHostLowOnMemory).
     void HintCold(DAddr address, size_t size);
 
     DAddr Allocate(size_t size);
@@ -66,6 +67,16 @@ public:
     void Map(DAddr address, VAddr virtual_address, size_t size, Asid asid, bool track = false);
 
     void Unmap(DAddr address, size_t size);
+
+    /// Device pages without memory that keep the bytes written to them until Map gives them
+    /// memory, which then holds those bytes (a Switch 2 sparse block waiting for its memory).
+    /// Reads see the kept bytes meanwhile; Unmap drops them.
+    void KeepWrites(DAddr address, size_t size);
+    /// Read or write [address, +size) when it has kept pages (or pages mapped meanwhile): mapped
+    /// pages as usual, the others from the kept bytes. False, doing nothing that counts, when it
+    /// has neither.
+    bool ReadKept(DAddr address, void* dest_pointer, size_t size);
+    bool WriteKept(DAddr address, const void* src_pointer, size_t size);
 
     void TrackContinuityImpl(DAddr address, VAddr virtual_address, size_t size, Asid asid);
     void TrackContinuity(DAddr address, VAddr virtual_address, size_t size, Asid asid) {
@@ -139,6 +150,19 @@ public:
 
     Asid RegisterProcess(Memory::Memory* memory);
     void UnregisterProcess(Asid id);
+
+    /// Snapshot for unmapped-read reports: the process this device page was last mapped under
+    /// (Asid.id + 1, or 0 when no mapping was recorded). Lock-free and diagnostic-only: a stale
+    /// view would only change a log line.
+    [[nodiscard]] u32 MappingProvenanceForDiagnostics(DAddr address) const {
+        return mapping_asid_plus1.GetOrDefault(address >> page_bits)
+            .load(std::memory_order_acquire);
+    }
+
+    /// Snapshot for unmapped-read reports: how many processes are registered right now.
+    [[nodiscard]] size_t LiveProcessCountForDiagnostics() const {
+        return live_process_count.load(std::memory_order_acquire);
+    }
 
     void UpdatePagesCachedCount(DAddr addr, size_t size, s32 delta);
 
@@ -238,11 +262,21 @@ private:
     };
     Common::SparseLargeVector<u32> compressed_device_addr;
     Common::SparseLargeVector<TrackedEntry> tracked_entries;
+    /// Asid.id + 1 of the process the last Map of each device page was attributed to; 0 when no
+    /// mapping was recorded (also the value a never-committed page reads back as). Kept out of
+    /// TrackedEntry so that struct's element size stays a divisor of the host page size, which
+    /// SparseLargeVector::CommitRegion's page math assumes. Atomic because unmapped-read reports
+    /// snapshot it without mapping_guard while Map/Unmap write it holding that guard.
+    Common::SparseLargeVector<std::atomic<u32>> mapping_asid_plus1;
 
     // Process memory interfaces
 
     std::deque<size_t> id_pool;
     std::deque<Memory::Memory*> registered_processes;
+    /// How many processes are registered right now. Atomic because unmapped-read reports read it
+    /// on the read thread while nvdrv session open/close register and unregister processes
+    /// without a lock shared with these reads.
+    std::atomic<size_t> live_process_count{0};
 
     // Memory protection management
 
@@ -298,6 +332,12 @@ private:
     Common::RangeMutex counter_guard;
     std::mutex mapping_guard;
     std::atomic<u32> deferred_cached_updates{};
+
+    /// Taken before mapping_guard. The pages KeepWrites keeps, by device page; null reads zero.
+    std::mutex kept_mutex;
+    std::atomic<size_t> kept_count{};
+    using KeptPage = std::array<u8, size_t{1} << page_bits>;
+    std::unordered_map<size_t, std::unique_ptr<KeptPage>> kept_pages;
 
 
 };

@@ -2,7 +2,6 @@
 #else // PS5
 #include "common/string_util.h"
 #endif // PS5
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <fmt/ranges.h>

@@ -17,6 +17,15 @@ Before the import, `Eglantine/` was a submodule pinned at `3140648a66` with the 
 commits right after the import are the core update experiment's changes (docs/CORE-UPDATE-EXPERIMENT.md),
 applied as ordinary commits with their messages.
 
+## Core update 20 Nov 2026 (claude-egl-ps5-10)
+
+zortos293/Eglantine nx2 `5bcff5fb4` (20 Nov) was merged in as a 3-way merge: base `babdb6bb75`, ours = this
+tree at Kaoz625/EglantinePS5 e1f41f1, theirs = nx2 5bcff5fb4. Upstream's logic was taken wherever ours only
+held an older port of it; every PS5 change (the `// PS5` chains, EDEN_* switches, memory caps, GPU-split
+deadlock fixes, NFS/launch hooks, MKW mesh skip, Fritchii inline index buffer, Yoshi video scope) was kept on
+top. `src/dynarmic` stays at the old pin (headless JIT glue patches it by text). To see what upstream did
+after this: `git log --oneline 5bcff5fb4..FETCH_HEAD`.
+
 ## Upstream from here on
 
 The PS5 port's changes to the core are part of these sources too: they once were text edits the

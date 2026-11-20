@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/hex_util.h"
@@ -10,8 +9,11 @@
 #include <cstring>
 
 #include "core/core.h"
+#include "core/hle/kernel/k_event.h"
+#include "core/hle/kernel/svc_results.h"
 #include "core/hle/service/acc/profile_manager.h"
 #include "core/hle/service/ipc_helpers.h"
+#include "core/hle/service/kernel_helpers.h"
 #include "core/hle/service/prepo/prepo.h"
 #include "core/hle/service/server_manager.h"
 #include "core/hle/service/service.h"
@@ -19,34 +21,55 @@
 
 namespace Service::PlayReport {
 
-// Object returned by prepo command 10500 on Switch 2 titles (The Legend of Zelda: Ocarina of Time
-// 2.0.0 calls command 0 on it right after its intro). Its real interface is unknown: accept every
-// call so the title can go on.
-class IPlayReportSession final : public ServiceFramework<IPlayReportSession> {
+class IAsyncContext final : public ServiceFramework<IAsyncContext> {
 public:
-    explicit IPlayReportSession(Core::System& system_)
-        : ServiceFramework{system_, "prepo::IPlayReportSession"} {
+    explicit IAsyncContext(Core::System& system_)
+        : ServiceFramework{system_, "prepo:IAsyncContext"},
+          service_context{system_, "prepo:IAsyncContext"} {
         // clang-format off
         static const FunctionInfo functions[] = {
-            {0, &IPlayReportSession::Accept, "Unknown0"},
-            {1, &IPlayReportSession::Accept, "Unknown1"},
-            {2, &IPlayReportSession::Accept, "Unknown2"},
-            {3, &IPlayReportSession::Accept, "Unknown3"},
-            {4, &IPlayReportSession::Accept, "Unknown4"},
-            {5, &IPlayReportSession::Accept, "Unknown5"},
-            {10, &IPlayReportSession::Accept, "Unknown10"},
-            {100, &IPlayReportSession::Accept, "Unknown100"},
+            {0, &IAsyncContext::GetSystemEvent, "GetSystemEvent"},
+            {1, &IAsyncContext::Cancel, "Cancel"},
+            {2, &IAsyncContext::Done, "Done"},
+            {3, &IAsyncContext::Done, "Done"},
         };
         // clang-format on
         RegisterHandlers(functions);
+        completion_event = service_context.CreateEvent("prepo:IAsyncContext:CompletionEvent");
+        if (completion_event) {
+            completion_event->Signal(system.Kernel());
+        }
+    }
+
+    ~IAsyncContext() override {
+        service_context.CloseEvent(completion_event);
+    }
+
+    bool HasEvent() const {
+        return completion_event != nullptr;
     }
 
 private:
-    void Accept(HLERequestContext& ctx) {
-        LOG_WARNING(Service_PREPO, "(STUBBED) session command {} called", ctx.GetCommand());
+    void GetSystemEvent(HLERequestContext& ctx) {
+        IPC::ResponseBuilder rb{ctx, 2, 1};
+        rb.Push(ResultSuccess);
+        rb.PushCopyObjects(ctx, completion_event->GetReadableEvent());
+    }
+
+    void Cancel(HLERequestContext& ctx) {
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
+
+    // Return success and a done flag for either command; prepo's ordering is unknown.
+    void Done(HLERequestContext& ctx) {
+        IPC::ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push<u32>(1);
+    }
+
+    KernelHelpers::ServiceContext service_context;
+    Kernel::KEvent* completion_event{};
 };
 
 class PlayReport final : public ServiceFramework<PlayReport> {
@@ -153,15 +176,6 @@ private:
         rb.Push(status);
     }
 
-    // Newer firmware play-report command (switchbrew: SendReportWithUser, 15.0.0+). Ocarina of
-    // Time 2.0.0 sends a request to an object right after it, so it returns one.
-    void Unknown10500(HLERequestContext& ctx) {
-        LOG_WARNING(Service_PREPO, "(STUBBED) called, returning a session");
-        IPC::ResponseBuilder rb{ctx, 2, 0, 1};
-        rb.Push(ResultSuccess);
-        rb.PushIpcInterface<IPlayReportSession>(ctx, system);
-    }
-
     void GetSystemSessionId(HLERequestContext& ctx) {
         LOG_WARNING(Service_PREPO, "(STUBBED) called");
 
@@ -169,6 +183,20 @@ private:
         IPC::ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
         rb.Push(system_session_id);
+    }
+
+    void Unknown10500(HLERequestContext& ctx) {
+        LOG_DEBUG(Service_PREPO, "(STUBBED) called");
+
+        auto async_context = std::make_shared<IAsyncContext>(system);
+        if (!async_context->HasEvent()) {
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(Kernel::ResultOutOfResource);
+            return;
+        }
+        IPC::ResponseBuilder rb{ctx, 2, 0, 1};
+        rb.Push(ResultSuccess);
+        rb.PushIpcInterface(ctx, std::move(async_context));
     }
 
     void SaveSystemReportOld(HLERequestContext& ctx) {
@@ -256,19 +284,16 @@ private:
     }
 };
 
+std::shared_ptr<ServiceFrameworkBase> CreateService(const char* name, Core::System& system) {
+    return std::make_shared<PlayReport>(name, system);
+}
+
 void LoopProcess(Core::System& system) {
     auto server_manager = std::make_unique<ServerManager>(system);
 
-    server_manager->RegisterNamedService("prepo:a",
-                                         std::make_shared<PlayReport>("prepo:a", system));
-    server_manager->RegisterNamedService("prepo:a2",
-                                         std::make_shared<PlayReport>("prepo:a2", system));
-    server_manager->RegisterNamedService("prepo:m",
-                                         std::make_shared<PlayReport>("prepo:m", system));
-    server_manager->RegisterNamedService("prepo:s",
-                                         std::make_shared<PlayReport>("prepo:s", system));
-    server_manager->RegisterNamedService("prepo:u",
-                                         std::make_shared<PlayReport>("prepo:u", system));
+    for (const char* name : {"prepo:a", "prepo:a2", "prepo:m", "prepo:s", "prepo:u"}) {
+        server_manager->RegisterNamedService(name, CreateService(name, system));
+    }
     ServerManager::RunServer(std::move(server_manager));
 }
 

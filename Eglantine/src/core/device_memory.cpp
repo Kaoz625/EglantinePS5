@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #ifdef _WIN32
@@ -6,9 +5,16 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <new>
 
 #include "common/logging.h"
+#include "common/memory_detect.h"
 #include "common/thread.h"
+#endif
+
+#ifdef HAS_NCE
+#include "common/logging.h"
+#include "common/settings.h"
 #endif
 
 #include "core/device_memory.h"
@@ -31,6 +37,31 @@ DeviceMemory::DeviceMemory()
 }
 
 DeviceMemory::~DeviceMemory() = default;
+
+#ifdef HAS_NCE
+u64 DeviceMemory::PrepareNativeExecution(bool has_39bit_address_space) {
+    const bool requested = Settings::values.cpu_backend.GetValue() == Settings::CpuBackend::Nce;
+#ifndef __ANDROID__
+    if (requested && (!Settings::values.use_multi_core.GetValue() ||
+                      Settings::values.cpu_clock.GetValue() != Settings::CpuClock::Normal ||
+                      Settings::values.sync_core_speed.GetValue() ||
+                      Settings::values.use_gdbstub.GetValue())) {
+        Settings::SetNceEnabled(false);
+        LOG_WARNING(Core, "NCE requires multicore, the normal CPU clock, independent speed "
+                          "control, and no debugger; falling back to Dynarmic");
+        return 0;
+    }
+#endif
+    const bool enabled = requested && has_39bit_address_space && Settings::IsFastmemEnabled() &&
+                         buffer.EnableDirectMappedAddress();
+    Settings::SetNceEnabled(enabled);
+    if (requested && !enabled) {
+        LOG_WARNING(Core, "NCE requires a 64-bit program and a shared 4 KiB fastmem arena inside "
+                          "the 39-bit address space; falling back to Dynarmic");
+    }
+    return enabled ? reinterpret_cast<u64>(buffer.VirtualBasePointer()) : 0;
+}
+#endif
 
 #ifdef _WIN32
 // Windows can't punch holes in the guest memory section, so pages holding only zeros (games clear
@@ -70,7 +101,22 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
             }
         }
         const auto start = std::chrono::steady_clock::now();
-        const auto [resident, trimmed] = buffer.TrimZeroPages();
+        std::pair<size_t, size_t> result;
+        try {
+            result = buffer.TrimZeroPages();
+        } catch (const std::bad_alloc&) {
+            // A pass needs 32 MiB and more of scratch. When Windows runs out of commit, the
+            // exception leaving this thread ended the emulator (#1346); the pass is only a saving.
+            interval = std::chrono::seconds{60};
+            const Common::ProcessMemoryUsage usage = Common::GetProcessMemoryUsage();
+            LOG_WARNING(HW_Memory,
+                        "Skipped trimming all-zero guest pages: out of memory. Windows commit is "
+                        "{} of {} MiB (this process {} MiB); the limit is RAM plus the page file",
+                        usage.system_commit >> 20, usage.system_commit_limit >> 20,
+                        usage.commit >> 20);
+            continue;
+        }
+        const auto [resident, trimmed] = result;
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - start)
                             .count();

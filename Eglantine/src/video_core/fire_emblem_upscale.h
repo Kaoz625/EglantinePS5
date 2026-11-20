@@ -21,6 +21,7 @@ constexpr u64 PrepassProgramKey = 0x4cbf6eff32525aecULL;
 constexpr u64 PrepassProgramKeyV111 = 0x5e8d8dc58bed8ba4ULL;
 constexpr u64 StarFoxProgramId = 0x0400E88025B1A000ULL;
 constexpr u64 StarFoxPrepassProgramKey = 0xd686ca0b9fad9e6dULL;
+constexpr u64 StarFoxCutscenePrepassProgramKey = 0xebab31dd6f0fc08dULL;
 constexpr u64 StarFoxOutputProgramKey = 0x7d3764ff101bec27ULL;
 constexpr u64 DuskbloodsProgramId = 0x0400D1D02399A000ULL;
 constexpr u64 DuskbloodsPrepassProgramKey = 0xe5efe04581720f15ULL;
@@ -47,12 +48,14 @@ struct Passes {
     }
 };
 
+/// Return validated prepass/output fingerprints only for the supported game titles.
 constexpr std::optional<Passes> CapturedPasses(u64 program_id) {
     if (program_id == ProgramId) {
         return Passes{PrepassProgramKey, OutputProgramKey, false, false, PrepassProgramKeyV111};
     }
     if (program_id == StarFoxProgramId) {
-        return Passes{StarFoxPrepassProgramKey, StarFoxOutputProgramKey, true};
+        return Passes{StarFoxPrepassProgramKey, StarFoxOutputProgramKey, true, false,
+                      StarFoxCutscenePrepassProgramKey};
     }
     if (program_id == DuskbloodsProgramId) {
         return Passes{DuskbloodsPrepassProgramKey, DuskbloodsOutputProgramKey, false, true};
