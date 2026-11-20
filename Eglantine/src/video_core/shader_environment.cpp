@@ -808,6 +808,10 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(
                       dev_before ? *dev_before + 1 : 0,
                       (dev_page && dev_before && *dev_page != *dev_before + 1) ? " (NOT contiguous)" : "",
                       host ? "yes" : "NO", again[0], again[1], again[2], again[3]);
+            if (dev_page) {
+                LOG_ERROR(HW_GPU, "Native program {:#x}: bad page {}", program_base,
+                          gpu_memory->DeviceMemory().DescribePageForDiagnostics(*dev_page));
+            }
         }
         throw Shader::RuntimeError(
             "Native shader at {:#x}, instruction {:#x}: {} [op {:03x} {:08x} {:08x} {:08x} {:08x}]",

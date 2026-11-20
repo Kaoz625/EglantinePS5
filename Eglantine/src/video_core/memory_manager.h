@@ -90,6 +90,9 @@ public:
     template <typename T>
     void Write(GPUVAddr addr, T data);
 
+    /// The device (SMMU) memory this address space maps into.
+    [[nodiscard]] MaxwellDeviceMemoryManager& DeviceMemory() noexcept { return memory; }
+
     [[nodiscard]] u8* GetPointer(GPUVAddr addr);
     [[nodiscard]] const u8* GetPointer(GPUVAddr addr) const;
 

@@ -3,7 +3,9 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <atomic>
+#include <cstring>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -554,6 +556,35 @@ void DeviceMemoryManager<Traits>::KeepWrites(DAddr address, size_t size) {
         }
     }
     kept_count.store(kept_pages.size(), std::memory_order_release);
+}
+
+template <typename Traits>
+std::string DeviceMemoryManager<Traits>::DescribePageForDiagnostics(DAddr address) {
+    const size_t page = address >> Memory::LICHII_PAGEBITS;
+    std::scoped_lock lk(mapping_guard);
+    const auto phys = tracked_entries[page].compressed_physical_ptr;
+    const u8* const smmu = phys != 0 ? GetPointerFromRaw<u8>(PAddr(phys - 1) << Memory::LICHII_PAGEBITS)
+                                     : nullptr;
+    const auto [asid, vaddr] = ExtractCPUBacking(page);
+    const u8* process = nullptr;
+    if (asid.id < registered_processes.size() && registered_processes[asid.id] != nullptr && vaddr != 0) {
+        process = registered_processes[asid.id]->GetPointerSilent(Common::ProcessAddress(vaddr));
+    }
+    std::array<u32, 4> smmu_words{}, process_words{};
+    size_t smmu_nonzero = 0, process_nonzero = 0;
+    if (smmu) {
+        std::memcpy(smmu_words.data(), smmu, sizeof(smmu_words));
+        for (size_t i = 0; i < Memory::LICHII_PAGESIZE; ++i) smmu_nonzero += smmu[i] != 0;
+    }
+    if (process) {
+        std::memcpy(process_words.data(), process, sizeof(process_words));
+        for (size_t i = 0; i < Memory::LICHII_PAGESIZE; ++i) process_nonzero += process[i] != 0;
+    }
+    return fmt::format("smmu page {:#x} host {} ({} nonzero bytes, {:08x} {:08x}); process asid {} va {:#x} host {} ({} nonzero bytes, {:08x} {:08x}){}",
+                       page << Memory::LICHII_PAGEBITS, fmt::ptr(smmu), smmu_nonzero, smmu_words[0],
+                       smmu_words[1], asid.id, vaddr, fmt::ptr(process), process_nonzero,
+                       process_words[0], process_words[1],
+                       smmu != process ? " - SMMU POINTS ELSEWHERE THAN THE PROCESS" : "");
 }
 
 template <typename Traits>

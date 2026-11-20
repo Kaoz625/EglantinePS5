@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <string>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -158,6 +159,10 @@ public:
         return mapping_asid_plus1.GetOrDefault(address >> page_bits)
             .load(std::memory_order_acquire);
     }
+
+    /// Diagnostic: what the SMMU holds for a device page against what the process that mapped
+    /// it holds there now (a page whose process memory moved after the map reads stale data).
+    [[nodiscard]] std::string DescribePageForDiagnostics(DAddr address);
 
     /// Snapshot for unmapped-read reports: how many processes are registered right now.
     [[nodiscard]] size_t LiveProcessCountForDiagnostics() const {
