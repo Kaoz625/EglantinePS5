@@ -45,6 +45,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/nx2_page_history.h"
 #include "video_core/native_lowering.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/pipeline_cache_files.h"
@@ -632,7 +633,7 @@ public:
             }
         }
         static std::atomic<u32> logged{0};
-        if ((differ != 0 || must_buffer || must_texture) && logged.fetch_add(1) < 400) {
+        if (differ != 0 && logged.fetch_add(1) < 300) {
             u32 raw_word = 0;
             u32 flushed_word = 0;
             if (first < length && first + 4 <= length) {
@@ -645,6 +646,8 @@ public:
                         address, length, device.value_or(0), must_buffer, must_texture, differ,
                         first == length ? 0 : first, raw_word, flushed_word, raw_nonzero,
                         flushed_nonzero, RawReads() ? " (raw read used)" : "");
+            LOG_WARNING(HW_GPU, "Native code read {:#x}: page history{}", address,
+                        VideoCommon::PageHistory::Describe(device.value_or(0)));
         }
     }
 
@@ -904,6 +907,11 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(
                           "Native program {:#x}: raw now: first page {:#x} {} nonzero bytes (GPU caches: buffer {}, texture {}), bad page {} nonzero (buffer {}, texture {}); captured {} instructions",
                           program_base, program_page, nonzero(first_page), buffer_first, texture_first,
                           nonzero(bad_page), buffer_bad, texture_bad, native.size());
+                const auto first_dev = gpu_memory->GpuToCpuAddress(program_page);
+                LOG_ERROR(HW_GPU, "Native program {:#x}: page history: first page dev {:#x}:{} | bad page dev {:#x}:{}",
+                          program_base, first_dev.value_or(0),
+                          VideoCommon::PageHistory::Describe(first_dev.value_or(0)),
+                          dev_page.value_or(0), VideoCommon::PageHistory::Describe(dev_page.value_or(0)));
             }
         }
         throw Shader::RuntimeError(

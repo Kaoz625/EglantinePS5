@@ -2232,6 +2232,7 @@ Common::RangeSet<DAddr> BufferCache<P>::PendingCpuWriteRanges() {
 template <class P>
 void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written,
                                            DAddr device_addr, const u8* data, u64 size) {
+    VideoCommon::PageHistory::Record(device_addr, size, VideoCommon::PageHistory::Event::Downloaded);
     // EDEN_NX2_READ_CHECK: newer GPU bytes than an early download brought before.
     if (!early_landed.empty()) {
         ForgetEarlyLanded(device_addr, size);

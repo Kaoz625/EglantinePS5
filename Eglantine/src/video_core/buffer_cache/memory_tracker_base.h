@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "common/alignment.h"
+#include "video_core/nx2_page_history.h"
 #include "common/common_types.h"
 #include "video_core/buffer_cache/word_manager.h"
 #include "video_core/page_filter.h"
@@ -73,6 +74,7 @@ public:
 
     /// Mark region as CPU modified, notifying the device_tracker about this change
     void MarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size) {
+        VideoCommon::PageHistory::Record(dirty_cpu_addr, query_size, VideoCommon::PageHistory::Event::CpuMarked);
         ForgetSynchronized(dirty_cpu_addr, query_size);
         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
             manager->ChangeRegionState(Type::CPU, true, manager->cpu_addr + offset, size);
@@ -91,6 +93,7 @@ public:
 
     /// Unmark region as CPU modified, notifying the device_tracker about this change
     void UnmarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size) {
+        VideoCommon::PageHistory::Record(dirty_cpu_addr, query_size, VideoCommon::PageHistory::Event::Uploaded);
         ever_synchronized_pages.Mark(dirty_cpu_addr, query_size);
         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
             manager->ChangeRegionState(Type::CPU, false, manager->cpu_addr + offset, size);
@@ -99,6 +102,7 @@ public:
 
     /// Mark region as modified from the host GPU
     void MarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
+        VideoCommon::PageHistory::Record(dirty_cpu_addr, query_size, VideoCommon::PageHistory::Event::GpuMarked);
         ever_synchronized_pages.Mark(dirty_cpu_addr, query_size);
         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
             manager->ChangeRegionState(Type::GPU, true, manager->cpu_addr + offset, size);
@@ -115,6 +119,7 @@ public:
 
     /// Unmark region as modified from the host GPU
     void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
+        VideoCommon::PageHistory::Record(dirty_cpu_addr, query_size, VideoCommon::PageHistory::Event::GpuCleared);
         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
             manager->ChangeRegionState(Type::GPU, false, manager->cpu_addr + offset, size);
         });

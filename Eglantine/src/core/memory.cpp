@@ -47,6 +47,7 @@
 #include "core/hle/kernel/nx2_thread_stats.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
+#include "video_core/nx2_page_history.h"
 #include "video_core/gpu_trace/recorder.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
@@ -1250,6 +1251,7 @@ struct Memory::Impl {
                     return;
                 }
             }
+            VideoCommon::PageHistory::Record(address, size, VideoCommon::PageHistory::Event::CpuWrite);
             gpu_dirty_managers[core].Collect(address, size);
             // A download writing to guest memory here may have looked at the collected writes
             // before this one: its bytes would land over the ones stored after this returns.

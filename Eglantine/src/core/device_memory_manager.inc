@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <limits>
+#include "video_core/nx2_page_history.h"
 #include <memory>
 #include <mutex>
 #include <source_location>
@@ -341,6 +342,7 @@ void DeviceMemoryManager<Traits>::Free(DAddr start, size_t size) {
 template <typename Traits>
 void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size_t size, Asid asid,
                                       bool track) {
+    VideoCommon::PageHistory::Record(address, size, VideoCommon::PageHistory::Event::SmmuMapped);
     Core::Memory::Memory* process_memory = registered_processes[asid.id];
     size_t start_page_d = address >> Memory::LICHII_PAGEBITS;
     size_t num_pages = Common::AlignUp(size, Memory::LICHII_PAGESIZE) >> Memory::LICHII_PAGEBITS;
@@ -394,6 +396,7 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
 
 template <typename Traits>
 void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
+    VideoCommon::PageHistory::Record(address, size, VideoCommon::PageHistory::Event::SmmuUnmapped);
     size_t start_page_d = address >> Memory::LICHII_PAGEBITS;
     size_t num_pages = Common::AlignUp(size, Memory::LICHII_PAGESIZE) >> Memory::LICHII_PAGEBITS;
     device_inter->InvalidateRegion(address, size);
