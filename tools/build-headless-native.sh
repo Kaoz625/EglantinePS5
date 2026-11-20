@@ -72,7 +72,8 @@ cmake -S "$scratch/source" -B "$scratch/native-local" -G Ninja \
     -DSDL_UNIX_CONSOLE_BUILD=ON -DSDL_OPENGL=OFF -DSDL_OPENGLES=OFF -DSDL_RENDER=OFF -DSDL_GPU=OFF
 python3 -B "$root/headless/check_slab_lifetime.py" "$scratch/source/src/core/hle/kernel/slab_helpers.h"
 echo "Building Eden with $jobs parallel jobs"
-cmake --build "$scratch/native-local" --target eden-headless core -j "$jobs"
+# -k 0: a failing build reports every broken source in one pass (it still fails).
+cmake --build "$scratch/native-local" --target eden-headless core -j "$jobs" -- -k 0
 if [[ "${EDEN_PS5_VULKAN:-OFF}" == ON ]]; then
     for check in check-vulkan-handoff check-gpu-time-probe; do
         python3 -B "$root/tools/$check.py"
