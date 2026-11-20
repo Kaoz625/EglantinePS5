@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -247,8 +248,23 @@ struct DeferredWrite {
 struct DeferredQueue {
     std::mutex mutex;
     std::vector<DeferredWrite> writes;
+    /// Taken by the GPU thread and not yet collected or applied (FlushCaching), still pending.
+    std::vector<DeferredWrite> replaying;
     unsigned taken = 0;  // Takes so far, under mutex.
 };
+// Deferred writes count as pending CPU writes (GPU::ForEachPendingCpuWrite): a download landing
+// in guest memory before their replay keeps their bytes instead of writing the GPU's older ones
+// over them, and the write waits for a landing in progress (DownloadLanding::Await) before the
+// guest stores its bytes. Without this a write deferred while a download held the buffer cache's
+// lock lost its bytes to it, and the replay then uploaded the stale guest copy for good (Yoshi:
+// shader code pages read all zero, 20 Nov). EDEN_NX2_DEFER_FIX=0 restores the old behaviour.
+inline bool DeferFixEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_DEFER_FIX");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
 inline std::array<DeferredQueue, kGuestCores> deferred_queues;
 inline thread_local unsigned long long deferred_page = ~0ULL;
 inline thread_local unsigned deferred_take = ~0U;
@@ -285,7 +301,32 @@ inline std::vector<DeferredWrite> TakeDeferredWrites(unsigned core) {
     std::scoped_lock lock{queue.mutex};
     taken.swap(queue.writes);
     ++queue.taken;
+    if (DeferFixEnabled()) {
+        queue.replaying.insert(queue.replaying.end(), taken.begin(), taken.end());
+    }
     return taken;
+}
+/// The GPU thread collected or applied the writes it took from `core`'s queue.
+inline void FinishDeferredWrites(unsigned core) {
+    auto& queue = deferred_queues[core];
+    std::scoped_lock lock{queue.mutex};
+    queue.replaying.clear();
+}
+/// Each deferred write not yet collected or applied (queued or being replayed).
+template <typename Callback>
+inline void ForEachDeferredWrite(Callback&& callback) {
+    if (!DeferFixEnabled()) {
+        return;
+    }
+    for (auto& queue : deferred_queues) {
+        std::scoped_lock lock{queue.mutex};
+        for (const auto& write : queue.writes) {
+            callback(write.address, write.end - write.address);
+        }
+        for (const auto& write : queue.replaying) {
+            callback(write.address, write.end - write.address);
+        }
+    }
 }
 // A read of a GPU-tracked page whose texture cache lock is held answers "no download" without
 // waiting, as an empty area the read does not remember, so the next read checks again. A first read

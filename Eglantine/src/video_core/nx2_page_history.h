@@ -35,6 +35,7 @@ enum class Event : u8 {
     CpuApplied,   ///< Buffer cache: a CPU write applied (WriteMemory)
     EngineWrite,  ///< Buffer cache: a GPU engine write into guest memory applied (WriteMemory)
     Inline,       ///< Buffer cache: bytes uploaded inline into the host buffer
+    Deferred,     ///< A guest CPU write queued while a GPU cache lock was busy
 };
 
 inline const char* Name(Event event) {
@@ -50,6 +51,7 @@ inline const char* Name(Event event) {
     case Event::CpuApplied: return "cpu-applied";
     case Event::EngineWrite: return "engine-write";
     case Event::Inline: return "inline";
+    case Event::Deferred: return "deferred";
     default: return "-";
     }
 }

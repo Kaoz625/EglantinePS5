@@ -1202,6 +1202,7 @@ void MemoryManager::FlushCaching() {
                     }
                 }
             }
+            ::Eden::Performance::FinishDeferredWrites(core);
         }
     }
     // Flush from the invalidate accumulator

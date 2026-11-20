@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include "performance.h"
+#include "video_core/nx2_page_history.h"
 #include "image_pages.h"
 #include "dev_vulkan.h"
 #include "diagnostics.h"
@@ -529,6 +530,13 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
       frame_dump(device, memory_allocator, scheduler) {
     scheduler.SetQueryCache(query_cache);
+    // EDEN_NX2_CPU_WRITE_DEFER=0: guest writes wait for a busy GPU cache lock, as upstream.
+    if (const char* value = std::getenv("EDEN_NX2_CPU_WRITE_DEFER"); value != nullptr && value[0] == '0') {
+        ::Eden::Performance::cpu_write_defer = false;
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_CPU_WRITE_DEFER=0: guest writes wait for the GPU cache locks");
+    }
+    LOG_INFO(Render_Vulkan, "Deferred CPU writes pending for downloads: {}",
+             ::Eden::Performance::DeferFixEnabled() ? "yes" : "no (EDEN_NX2_DEFER_FIX=0)");
     buffer_cache.SetPendingCpuWrites(
         [this](const std::function<void(DAddr, size_t)>& callback) {
             gpu.ForEachPendingCpuWrite(callback);
@@ -3157,15 +3165,24 @@ void RasterizerVulkan::InvalidateCachedWrites(
 bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     ::Eden::Performance::Timer guest_write_timer(::Eden::Performance::guest_cpu_write);
     DEBUG_ASSERT(addr != 0 || size != 0);
+    // A deferred write is pending (ForEachPendingCpuWrite) before the guest stores its bytes:
+    // a download landing over it now finishes first, a later one keeps them (performance.h).
+    const auto deferred = [addr, size] {
+        VideoCommon::PageHistory::Record(addr, size, VideoCommon::PageHistory::Event::Deferred);
+        if (::Eden::Performance::DeferFixEnabled()) {
+            VideoCore::DownloadLanding::Await(addr, size);
+        }
+        return false;
+    };
     if (::Eden::Performance::cpu_write_defer.load(std::memory_order_relaxed) &&
         !::Eden::Performance::deferred_replay &&
         ::Eden::Performance::ExtendDeferredWrite(addr, size, ::Eden::Performance::cpu_write_core)) {
-        return false;
+        return deferred();
     }
     {
         if (!::Eden::Performance::GuestCacheLockOrDefer(buffer_cache.mutex)) {
             ::Eden::Performance::DeferWrite(addr, size, ::Eden::Performance::cpu_write_core);
-            return false;
+            return deferred();
         }
         // The pages the write untracks change their host protection after the lock is dropped:
         // drawing waited for those system calls (~1 µs each, thousands a second at Ocarina of
@@ -3215,7 +3232,7 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     if (texture_cache.page_filter.Any(addr, size)) {
         if (!::Eden::Performance::GuestCacheLockOrDefer(texture_cache.mutex)) {
             ::Eden::Performance::DeferWrite(addr, size, ::Eden::Performance::cpu_write_core);
-            return false;
+            return deferred();
         }
         std::lock_guard lock{texture_cache.mutex, std::adopt_lock};
         texture_cache.WriteMemory(addr, size);

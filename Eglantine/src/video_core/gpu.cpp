@@ -228,6 +228,11 @@ struct GPU::Impl {
                 callback(address, size);
             }
         }
+        // Writes a busy cache lock deferred (performance.h): their bytes are in guest memory.
+        ::Eden::Performance::ForEachDeferredWrite(
+            [&callback](unsigned long long address, unsigned long long size) {
+                callback(static_cast<DAddr>(address), static_cast<size_t>(size));
+            });
     }
 
     /// Signal the ending of command list.
