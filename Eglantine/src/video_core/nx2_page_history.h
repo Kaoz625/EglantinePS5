@@ -32,6 +32,9 @@ enum class Event : u8 {
     Downloaded,   ///< Buffer cache: host buffer bytes written into guest memory
     SmmuMapped,   ///< SMMU: device page mapped to guest memory
     SmmuUnmapped, ///< SMMU: device page unmapped
+    CpuApplied,   ///< Buffer cache: a CPU write applied (WriteMemory)
+    EngineWrite,  ///< Buffer cache: a GPU engine write into guest memory applied (WriteMemory)
+    Inline,       ///< Buffer cache: bytes uploaded inline into the host buffer
 };
 
 inline const char* Name(Event event) {
@@ -44,12 +47,15 @@ inline const char* Name(Event event) {
     case Event::Downloaded: return "downloaded";
     case Event::SmmuMapped: return "smmu-map";
     case Event::SmmuUnmapped: return "smmu-unmap";
+    case Event::CpuApplied: return "cpu-applied";
+    case Event::EngineWrite: return "engine-write";
+    case Event::Inline: return "inline";
     default: return "-";
     }
 }
 
 inline constexpr size_t SlotBits = 18; // 256 Ki pages tracked (~9 MiB)
-inline constexpr size_t EventsPerSlot = 6;
+inline constexpr size_t EventsPerSlot = 12;
 
 struct Slot {
     std::array<std::atomic<u64>, EventsPerSlot> events{};
@@ -88,6 +94,14 @@ inline void Record(u64 device_address, u64 size, Event event) {
     const u64 time = NowMs();
     for (u64 page = first; page < first + count; ++page) {
         Slot& slot = table[page & ((u64{1} << SlotBits) - 1)];
+        const u64 word = ((page & 0xFFFFFFF) << 36) | (u64(event) << 32);
+        // A repeat of the page's last event only moves its time (draws mark pages every frame).
+        auto& last = slot.events[(slot.next.load(std::memory_order_relaxed) + EventsPerSlot - 1) %
+                                 EventsPerSlot];
+        if ((last.load(std::memory_order_relaxed) >> 32) == (word >> 32)) {
+            last.store(word | time, std::memory_order_relaxed);
+            continue;
+        }
         const u32 index = slot.next.fetch_add(1, std::memory_order_relaxed) % EventsPerSlot;
         slot.events[index].store(((page & 0xFFFFFFF) << 36) | (u64(event) << 32) | time,
                                  std::memory_order_relaxed);

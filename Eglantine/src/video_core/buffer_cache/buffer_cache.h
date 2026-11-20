@@ -31,6 +31,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
+#include "video_core/nx2_page_history.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/texture_cache/util.h"
@@ -244,6 +245,9 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
 template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data,
                                  bool engine_write) {
+    VideoCommon::PageHistory::Record(device_addr, size, engine_write
+                                         ? VideoCommon::PageHistory::Event::EngineWrite
+                                         : VideoCommon::PageHistory::Event::CpuApplied);
     Nx2NoteListHostWrite(device_addr, size);
     NoteUniformWrite(device_addr, size);
     // EDEN_NX2_READ_CHECK: a newer value where an early download landed, as ClearDownload
@@ -4128,6 +4132,7 @@ bool BufferCache<P>::InlineMemory(DAddr dest_address, size_t copy_size,
 template <class P>
 void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                                 std::span<const u8> inlined_buffer) {
+    VideoCommon::PageHistory::Record(dest_address, copy_size, VideoCommon::PageHistory::Event::Inline);
     ClearDownload(dest_address, copy_size);
     gpu_modified_ranges.Subtract(dest_address, copy_size);
     MarkVertexBuffersStale(dest_address, copy_size);
