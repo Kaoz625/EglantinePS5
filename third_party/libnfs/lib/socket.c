@@ -1395,6 +1395,9 @@ rpc_timeout_scan(struct rpc_context *rpc)
 		((rpc->last_successful_rpc_response == 0) ? -1 :
 		 (t - rpc->last_successful_rpc_response));
 	bool_t need_reconnect = FALSE;
+	struct rpc_queue timedout;
+
+	rpc_reset_queue(&timedout);
 
         /*
          * Only scan once per second.
@@ -1460,11 +1463,8 @@ rpc_timeout_scan(struct rpc_context *rpc)
                                 rpc->stats.outqueue_len--;
                         }
 			rpc_set_error_locked(rpc, "command timed out");
-                        if (pdu->cb) {
-                                pdu->cb(rpc, RPC_STATUS_TIMEOUT,
-                                        NULL, pdu->private_data);
-                        }
-			rpc_free_pdu(rpc, pdu);
+                        /* The callback runs after rpc_mutex is dropped (below). */
+                        rpc_enqueue(&timedout, pdu);
 		}
 	}
 
@@ -1532,14 +1532,8 @@ rpc_timeout_scan(struct rpc_context *rpc)
 				/* queue it back to outqueue for retransmit */
 				rpc_return_to_outqueue(rpc, pdu);
 			} else {
-				// qqq move to a temporary queue and process after
-				// we drop the mutex
 				rpc_set_error_locked(rpc, "command timed out");
-                                if (pdu->cb) {
-                                        pdu->cb(rpc, RPC_STATUS_TIMEOUT,
-                                                NULL, pdu->private_data);
-                                }
-				rpc_free_pdu(rpc, pdu);
+				rpc_enqueue(&timedout, pdu);
 			}
 		}
 	}
@@ -1548,6 +1542,23 @@ rpc_timeout_scan(struct rpc_context *rpc)
                 nfs_mt_mutex_unlock(&rpc->rpc_mutex);
         }
 #endif /* HAVE_MULTITHREADING */
+
+        /*
+         * Callbacks of the timed-out requests run only now, with rpc_mutex
+         * dropped: they end up in nfs_set_error(), which takes rpc_mutex
+         * itself, and relocking the error-checking mutex failed with EDEADLK
+         * ("pthread_mutex_lock() failed: 11") and left the waiting reads
+         * stuck (EglantinePS5, Yoshi streamed over a slow link, 20 Nov 2026).
+         * The pdus were taken off every queue above, so the list is private.
+         */
+	while ((pdu = timedout.head) != NULL) {
+		timedout.head = pdu->next;
+		pdu->next = NULL;
+		if (pdu->cb) {
+			pdu->cb(rpc, RPC_STATUS_TIMEOUT, NULL, pdu->private_data);
+		}
+		rpc_free_pdu(rpc, pdu);
+	}
 
 	if (need_reconnect) {
 		RPC_LOG(rpc, 2, "rpc_timeout_scan: Recovery action needed for fd %d",

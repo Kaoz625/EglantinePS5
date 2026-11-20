@@ -1165,8 +1165,15 @@ Block fetch_block(File *f, uint64_t number)
                 const char *e = nfs_get_error(s->ctx);
                 why = e && *e ? e : strerror(-rc);
             }
+            // The watchdog times reads that make no progress, not a busy connection: with several files reading ahead
+            // the count of reads in flight never fell to 0, so read_since stayed at the first read of the group and
+            // the watchdog shut a healthy connection after 15 s of steady streaming (Yoshi on DIGI5's ~7.5 MB/s
+            // Wi-Fi: "a read took over 15 s" after ~113 MB = 15 s of data, 20 Nov 2026). A read that brought data
+            // starts the clock of the ones still in flight again.
             if (s->reads_in_flight.fetch_sub(1) == 1)
                 s->read_since = 0;
+            else if (rc > 0)
+                s->read_since = now_ms();
         }
         if (rc > 0)
         {
