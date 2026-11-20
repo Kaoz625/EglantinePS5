@@ -238,6 +238,7 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                 GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, native ? shader_addr : base_addr, start_address,
                                         {}, shader_cache_v2};
                 shader_info = MakeShaderInfo(env, *cpu_shader_addr);
+                NoteAccepted(*cpu_shader_addr);
             } catch (const Shader::Exception&) {
                 RememberRejection(*cpu_shader_addr);
                 // Once per program: which stage slot it is bound to, its header and the slot's
@@ -353,6 +354,7 @@ const ShaderInfo* ShaderCache::ComputeShader() {
             ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start, {},
                                    shader_cache_v2};
             shader = MakeShaderInfo(env, *cpu_shader_addr);
+            NoteAccepted(*cpu_shader_addr);
         } catch (const Shader::Ampere::TrapGuardError&) {
             // Constants can become valid on the next dispatch; do not cache this rejection.
             throw;
@@ -379,31 +381,84 @@ const ShaderInfo* ShaderCache::ComputeShader() {
     return shader;
 }
 
+namespace {
+// Retry a rejected native program after 0.25, 0.5, 1, 2, 4, 8, 8, 8 ... s, at most this many times.
+constexpr u32 MaxRejectionRetries = 12;
+std::chrono::steady_clock::duration RejectionRetryDelay(u32 attempts) {
+    return std::chrono::milliseconds{250} << (std::min)(attempts, 5U);
+}
+bool RejectionRetriesEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_REJECT_RETRY");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+} // Anonymous namespace
+
 void ShaderCache::RethrowIfRejected(VAddr addr) {
     std::scoped_lock lock{rejected_mutex};
     if (const auto it = rejected_native.find(addr); it != rejected_native.end()) {
-        std::rethrow_exception(it->second);
+        if (RejectionRetriesEnabled() && it->second.attempts < MaxRejectionRetries &&
+            std::chrono::steady_clock::now() >= it->second.retry_at) {
+            return; // due for another capture
+        }
+        std::rethrow_exception(it->second.error);
     }
 }
 
 bool ShaderCache::IsRejected(VAddr addr) {
     std::scoped_lock lock{rejected_mutex};
-    return rejected_native.contains(addr);
+    const auto it = rejected_native.find(addr);
+    if (it == rejected_native.end()) {
+        return false;
+    }
+    if (RejectionRetriesEnabled() && it->second.attempts < MaxRejectionRetries &&
+        std::chrono::steady_clock::now() >= it->second.retry_at) {
+        return false; // capture it again: its code may have arrived since
+    }
+    return true;
 }
 
 void ShaderCache::RememberRejection(VAddr addr) {
     std::scoped_lock lock{rejected_mutex};
-    if (rejected_native.contains(addr)) {
+    const auto now = std::chrono::steady_clock::now();
+    if (const auto it = rejected_native.find(addr); it != rejected_native.end()) {
         // Called from a catch block: keep the first exception for that address instead of
-        // capturing and inserting a new one on every rejected dispatch.
+        // capturing a new one on every rejected dispatch; a failed retry waits longer.
+        if (now >= it->second.retry_at) {
+            ++it->second.attempts;
+            it->second.retry_at = now + RejectionRetryDelay(it->second.attempts);
+            if (it->second.attempts == MaxRejectionRetries) {
+                LOG_WARNING(HW_GPU, "Native program at {:#x} still rejected after {} retries",
+                            addr, it->second.attempts);
+            }
+        }
         return;
     }
-    rejected_native.emplace(addr, std::current_exception());
+    const u32 earlier = ++rejected_before[addr];
+    rejected_native.emplace(addr, Rejection{std::current_exception(),
+                                            now + RejectionRetryDelay(0), 0});
+    if (earlier > 1) {
+        LOG_INFO(HW_GPU, "Native program at {:#x} rejected again after its memory was written ({} times)",
+                 addr, earlier);
+    }
     page_filter.Mark(addr, 1); // InnerInvalidation reaches InvalidatePagesInRegion for it
     rejected_lowest.store((std::min)(rejected_lowest.load(std::memory_order_relaxed), addr),
                           std::memory_order_relaxed);
     rejected_highest.store((std::max)(rejected_highest.load(std::memory_order_relaxed), addr),
                            std::memory_order_relaxed);
+}
+
+void ShaderCache::NoteAccepted(VAddr addr) {
+    std::scoped_lock lock{rejected_mutex};
+    const auto it = rejected_native.find(addr);
+    if (it == rejected_native.end()) {
+        return;
+    }
+    LOG_INFO(HW_GPU, "Native program at {:#x} accepted on retry {} (it was rejected before)", addr,
+             it->second.attempts + 1);
+    rejected_native.erase(it);
 }
 
 void ShaderCache::GetGraphicsEnvironments(GraphicsEnvironments& result,

@@ -791,6 +791,24 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(
     if (!found.code && !lowered) {
         const size_t failed = lowered.error_offset / sizeof(Shader::Ampere::Instruction);
         const auto words = failed < native.size() ? native[failed].words : std::array<u32, 4>{};
+        {
+            // Where the bad code starts: a page whose device address does not follow the one
+            // before it, or a page without host memory, points at the mapping; the same page
+            // holding code now points at timing (the code arrived after the bind).
+            const GPUVAddr bad = program_base + native_header_size + lowered.error_offset;
+            const GPUVAddr page = bad & ~GPUVAddr{0xfff};
+            const auto dev_page = gpu_memory->GpuToCpuAddress(page);
+            const auto dev_before = page != 0 ? gpu_memory->GpuToCpuAddress(page - 1) : std::nullopt;
+            std::array<u32, 4> again{};
+            gpu_memory->ReadBlock(bad, again.data(), sizeof(again));
+            const bool host = gpu_memory->GetPointer(page) != nullptr;
+            LOG_ERROR(HW_GPU,
+                      "Native program {:#x}: bad code at {:#x} (page +{:#x}), dev {:#x}, page before ends at dev {:#x}{}, host memory {}, read again {:08x} {:08x} {:08x} {:08x}",
+                      program_base, bad, bad - page, dev_page.value_or(0),
+                      dev_before ? *dev_before + 1 : 0,
+                      (dev_page && dev_before && *dev_page != *dev_before + 1) ? " (NOT contiguous)" : "",
+                      host ? "yes" : "NO", again[0], again[1], again[2], again[3]);
+        }
         throw Shader::RuntimeError(
             "Native shader at {:#x}, instruction {:#x}: {} [op {:03x} {:08x} {:08x} {:08x} {:08x}]",
             program_base, lowered.error_offset, lowered.error, words[0] & 0xfff, words[0],

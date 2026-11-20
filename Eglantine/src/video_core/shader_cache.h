@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <array>
 #include <atomic>
 #include <exception>
@@ -194,6 +195,8 @@ private:
     bool IsRejected(VAddr addr);
     /// Remembers the exception being handled as this address's rejection.
     void RememberRejection(VAddr addr);
+    /// A program captured after it was rejected before: logs the recovery, drops the rejection.
+    void NoteAccepted(VAddr addr);
     /// Hash of the state task and mesh programs are translated with.
     u64 MeshStateHash() const;
 
@@ -210,7 +213,17 @@ private:
     /// Native programs the lowering rejected, by address, so each draw or dispatch rethrows the
     /// first error instead of lowering again; dropped when guest memory there is written.
     std::mutex rejected_mutex;
-    ::Common::unordered_map<u64, std::exception_ptr> rejected_native;
+    /// A program can be rejected because its code was not in memory yet when it was first bound
+    /// (Yoshi and the Mysterious Book: a valid header, then zeros from a 4 KiB page boundary on).
+    /// Such a rejection is tried again a few times, later, instead of skipping its draws for good.
+    struct Rejection {
+        std::exception_ptr error;
+        std::chrono::steady_clock::time_point retry_at;
+        u32 attempts{};
+    };
+    ::Common::unordered_map<u64, Rejection> rejected_native;
+    /// Addresses that were rejected at least once: a later success is logged as a recovery.
+    ::Common::unordered_map<u64, u32> rejected_before;
     /// Bounds of every address ever rejected (never shrinks): a quick test for invalidations.
     std::atomic<VAddr> rejected_lowest{~VAddr{}};
     std::atomic<VAddr> rejected_highest{};
