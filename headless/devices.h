@@ -144,6 +144,9 @@ public:
     void Finalize() override;
     void AppendBuffer(AudioCore::Sink::SinkBuffer&, std::span<s16>) override;
     bool Healthy() const { return !failed; }
+    // Switch 2 sysmix streams (nx2:audsmx, e.g. Star Fox) open only when the host stream reports
+    // ready; the base class answers false, so every OpenStream failed (0x499) and the game was silent.
+    bool IsReady() const override { return handle >= 0 && !failed; }
 private:
     int handle = -1;
     std::atomic<bool> failed = false;
