@@ -872,8 +872,12 @@ private:
     /// Re-dirties repacked vertex buffers whose source data was written since they were bound.
     void RefreshRepackedVertexBuffers();
 
+    /// `guest_written`: the caller wrote `inlined_buffer` to guest memory before taking the lock
+    /// (inline-to-memory). A read download landing over the range here then writes the bytes
+    /// there again, since that download may have been recorded before the inline write.
     void InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
-                                    std::span<const u8> inlined_buffer);
+                                    std::span<const u8> inlined_buffer,
+                                    bool guest_written = false);
 
     Tegra::MaxwellDeviceMemoryManager& device_memory;
 
@@ -904,6 +908,7 @@ private:
     std::array<GeometrySync, NUM_VERTEX_BUFFERS + 1> geometry_syncs{};
     /// Counts DeleteBuffer calls: a buffer id older than this count may have been freed or reused.
     u64 buffer_deletions = 0;
+    u64 inline_relands = 0;
     /// EDEN_NX2_BUFFER_TRACE: buffers created (with the buffers they joined) and collected, logged
     /// every 10 s, and each creation of 64 MiB or more with the line that asked for it.
     struct CreateTrace {

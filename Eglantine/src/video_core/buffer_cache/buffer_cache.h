@@ -4124,16 +4124,41 @@ bool BufferCache<P>::InlineMemory(DAddr dest_address, size_t copy_size,
     }
 
     NoteUniformWrite(dest_address, copy_size);
-    InlineMemoryImplementation(dest_address, copy_size, inlined_buffer);
+    InlineMemoryImplementation(dest_address, copy_size, inlined_buffer, true);
 
     return true;
 }
 
 template <class P>
 void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
-                                                std::span<const u8> inlined_buffer) {
+                                                std::span<const u8> inlined_buffer,
+                                                bool guest_written) {
     VideoCommon::PageHistory::Record(dest_address, copy_size, VideoCommon::PageHistory::Event::Inline);
-    ClearDownload(dest_address, copy_size);
+    // ClearDownload, keeping inline-to-memory bytes: the engine wrote them to guest memory before
+    // this lock, and a guest read in between may have recorded a read download of the GPU's older
+    // bytes there (the range was still GPU-modified). Landing it now wrote those older bytes over
+    // the new ones, and the range is no longer GPU-modified after this, so guest memory kept them
+    // for good: Yoshi's shader code read back as zeros/data (page history "inline -> downloaded ->
+    // gpu-cleared"). EDEN_NX2_INLINE_RELAND=0 = the old behaviour.
+    static const bool reland = [] {
+        const char* value = std::getenv("EDEN_NX2_INLINE_RELAND");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (const std::optional<u64> waited = FinishReadDownloads(dest_address, copy_size)) {
+        VideoCore::AsyncReadback::CountClearLanding(*waited);
+        if (guest_written && reland) {
+            device_memory.WriteBlockUnsafe(dest_address, inlined_buffer.data(), copy_size);
+            VideoCommon::PageHistory::Record(dest_address, copy_size,
+                                             VideoCommon::PageHistory::Event::Inline);
+            if (++inline_relands <= 32) {
+                LOG_WARNING(HW_GPU,
+                            "Inline write {:#x} size {} written again after a read download "
+                            "landed over it ({} so far)",
+                            dest_address, copy_size, inline_relands);
+            }
+        }
+    }
+    ClearReplacedDownload(dest_address, copy_size);
     gpu_modified_ranges.Subtract(dest_address, copy_size);
     MarkVertexBuffersStale(dest_address, copy_size);
 
