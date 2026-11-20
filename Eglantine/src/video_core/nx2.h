@@ -23,6 +23,15 @@
 
 namespace Tegra {
 
+/// A relaxed atomic read of a guest word (std::atomic_ref is missing from the PS5 libc++).
+inline u32 Nx2LoadRelaxed(const u32* word) {
+#if !defined(__PROSPERO__) // not PS5
+    return std::atomic_ref<u32>{*const_cast<u32*>(word)}.load(std::memory_order_relaxed);
+#else // PS5
+    return __atomic_load_n(word, __ATOMIC_RELAXED);
+#endif // PS5
+}
+
 // Set once a Switch 2 (Ampere, NVN2) driver is talking to the GPU. Its command streams use
 // Ampere classes and the Turing+ macro ISA, which Eden's Maxwell engines don't implement.
 inline std::atomic<bool> g_nx2_ampere{false};
@@ -597,7 +606,7 @@ public:
         free_slot->operation = operation;
         free_slot->word = word;
         free_slot->seen =
-            word != nullptr ? std::atomic_ref<u32>{*word}.load(std::memory_order_relaxed) : 0;
+            word != nullptr ? Nx2LoadRelaxed(word) : 0;
         free_slot->latched.store(false, std::memory_order_relaxed);
         free_slot->owner.store(owner, std::memory_order_relaxed);
         count.fetch_add(1, std::memory_order_release);
@@ -641,7 +650,7 @@ public:
             if (slot.word == nullptr || slot.owner.load(std::memory_order_relaxed) == nullptr) {
                 continue;
             }
-            const u32 current = std::atomic_ref<u32>{*slot.word}.load(std::memory_order_relaxed);
+            const u32 current = Nx2LoadRelaxed(slot.word);
             if (current != slot.seen) {
                 slot.seen = current;
                 stored = true;

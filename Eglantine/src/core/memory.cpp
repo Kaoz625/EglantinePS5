@@ -622,8 +622,8 @@ struct Memory::Impl {
     void LazyMarkCached(u64 vaddr, u64 size, bool cached) {
         static constexpr u64 kLazyDelay = 250'000'000;   // ns a page may stay protected uncached
         static constexpr u64 kSweepPeriod = 50'000'000;  // ns between sweeps
-        const u64 first = vaddr >> YUZU_PAGEBITS;
-        const u64 end = (vaddr + size + YUZU_PAGEMASK) >> YUZU_PAGEBITS;
+        const u64 first = vaddr >> LICHII_PAGEBITS;
+        const u64 end = (vaddr + size + LICHII_PAGEMASK) >> LICHII_PAGEBITS;
         const u64 now = LazyNow();
         std::scoped_lock lk{lazy_mutex};
         if (cached) {
@@ -631,7 +631,7 @@ struct Memory::Impl {
             u64 run_pages = 0;
             const auto protect_run = [&] {
                 if (run_pages > 0) {
-                    host_buffer->Protect(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
+                    host_buffer->Protect(run_begin << LICHII_PAGEBITS, run_pages << LICHII_PAGEBITS,
                                          Common::MemoryPermission{});
                     run_pages = 0;
                 }
@@ -670,7 +670,7 @@ struct Memory::Impl {
         u64 run_pages = 0;
         const auto unprotect_run = [&] {
             if (run_pages > 0) {
-                host_buffer->Protect(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
+                host_buffer->Protect(run_begin << LICHII_PAGEBITS, run_pages << LICHII_PAGEBITS,
                                      Common::MemoryPermission::ReadWrite);
                 run_pages = 0;
             }
@@ -701,8 +701,8 @@ struct Memory::Impl {
         if (lazy_pending.empty()) {
             return;
         }
-        const u64 first = vaddr >> YUZU_PAGEBITS;
-        const u64 end = (vaddr + size + YUZU_PAGEMASK) >> YUZU_PAGEBITS;
+        const u64 first = vaddr >> LICHII_PAGEBITS;
+        const u64 end = (vaddr + size + LICHII_PAGEMASK) >> LICHII_PAGEBITS;
         if (end - first > lazy_pending.size()) {
             std::erase_if(lazy_pending, [&](const auto& entry) {
                 return entry.first >= first && entry.first < end;

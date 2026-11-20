@@ -364,7 +364,6 @@ bool Maxwell3D::IsFastDrawParameter(u32 method) {
     case MAXWELL3D_REG_INDEX(vertex_id_base):
     case MAXWELL3D_REG_INDEX(global_base_vertex_index):
     case MAXWELL3D_REG_INDEX(global_base_instance_index):
-    case MAXWELL3D_REG_INDEX(vertex_id_base):
     case MAXWELL3D_REG_INDEX(index_buffer.start_addr_high):
     case MAXWELL3D_REG_INDEX(index_buffer.start_addr_low):
     case MAXWELL3D_REG_INDEX(index_buffer.limit_addr_high):
