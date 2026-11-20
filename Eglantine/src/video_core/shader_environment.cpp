@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <fstream>
 #include <memory>
 #include <optional>
@@ -43,6 +44,7 @@
 #include "shader_recompiler/frontend/ampere/program_address_map.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/memory_manager.h"
+#include "video_core/rasterizer_interface.h"
 #include "video_core/native_lowering.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/pipeline_cache_files.h"
@@ -579,10 +581,74 @@ private:
         page_begin = address;
         page_end = address;
         if (length >= sizeof(Instruction) && gpu_memory.IsFullyMappedRange(address, length)) {
-            gpu_memory.ReadBlock(address, page.data(), length);
+            ReadCodeBlock(gpu_memory, address, page.data(), length);
             page_end = next_page;
         }
     }
+
+public:
+    // EDEN_NX2_NATIVE_CODE_READ=raw: read native code as guest memory holds it, without first
+    // writing the GPU caches' copy of the range back over it (A/B aid for Yoshi's rejects).
+    static bool RawReads() {
+        static const bool raw = [] {
+            const char* value = std::getenv("EDEN_NX2_NATIVE_CODE_READ");
+            return value != nullptr && std::string_view{value} == "raw";
+        }();
+        return raw;
+    }
+
+    // Reads code the way the capture does, and logs when the flush before the read changes what
+    // guest memory held: GPU caches writing stale or other data over code the CPU wrote (or the
+    // code reaching guest memory only through that flush).
+    static void ReadCodeBlock(Tegra::MemoryManager& gpu_memory, GPUVAddr address, void* out,
+                              size_t length) {
+        std::array<u8, PageSize> raw{};
+        length = (std::min)(length, raw.size());
+        gpu_memory.ReadBlockUnsafe(address, raw.data(), length);
+        bool must_buffer = false;
+        bool must_texture = false;
+        const auto device = gpu_memory.GpuToCpuAddress(address);
+        if (auto* const rasterizer = gpu_memory.Rasterizer(); rasterizer != nullptr && device) {
+            must_buffer = rasterizer->MustFlushRegion(*device, length, VideoCommon::CacheType::BufferCache);
+            must_texture = rasterizer->MustFlushRegion(*device, length, VideoCommon::CacheType::TextureCache);
+        }
+        if (RawReads()) {
+            std::memcpy(out, raw.data(), length);
+        } else {
+            gpu_memory.ReadBlock(address, out, length);
+        }
+        const u8* const flushed = static_cast<const u8*>(out);
+        size_t differ = 0;
+        size_t raw_nonzero = 0;
+        size_t flushed_nonzero = 0;
+        size_t first = length;
+        if (!RawReads()) {
+            for (size_t i = 0; i < length; ++i) {
+                raw_nonzero += raw[i] != 0;
+                flushed_nonzero += flushed[i] != 0;
+                if (raw[i] != flushed[i]) {
+                    if (differ++ == 0) first = i;
+                }
+            }
+        }
+        static std::atomic<u32> logged{0};
+        if ((differ != 0 || must_buffer || must_texture) && logged.fetch_add(1) < 400) {
+            u32 raw_word = 0;
+            u32 flushed_word = 0;
+            if (first < length && first + 4 <= length) {
+                const size_t aligned = first & ~size_t{3};
+                std::memcpy(&raw_word, raw.data() + aligned, 4);
+                std::memcpy(&flushed_word, flushed + aligned, 4);
+            }
+            LOG_WARNING(HW_GPU,
+                        "Native code read {:#x}+{:#x} (dev {:#x}): GPU caches hold it (buffer {}, texture {}); flush changed {} bytes, first at +{:#x} {:08x} -> {:08x}; nonzero raw {} flushed {}{}",
+                        address, length, device.value_or(0), must_buffer, must_texture, differ,
+                        first == length ? 0 : first, raw_word, flushed_word, raw_nonzero,
+                        flushed_nonzero, RawReads() ? " (raw read used)" : "");
+        }
+    }
+
+private:
 
     Tegra::MemoryManager& gpu_memory;
     std::array<Instruction, PageSize / sizeof(Instruction)> page;
@@ -637,7 +703,7 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(
                 if (!native.empty()) break;
                 throw Shader::RuntimeError("Unmapped native shader instruction at {:#x}", address);
             }
-            gpu_memory->ReadBlock(address, &instruction, sizeof(instruction));
+            NativeInstructionReader::ReadCodeBlock(*gpu_memory, address, &instruction, sizeof(instruction));
         }
         native.push_back(instruction);
         const auto status = capture.Observe(instruction, index);
@@ -811,6 +877,33 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(
             if (dev_page) {
                 LOG_ERROR(HW_GPU, "Native program {:#x}: bad page {}", program_base,
                           gpu_memory->DeviceMemory().DescribePageForDiagnostics(*dev_page));
+            }
+            {
+                // The program's first page and the bad page as guest memory holds them now, and
+                // whether the GPU caches hold either (their flush writes over guest memory).
+                std::array<u8, 0x1000> first_page{};
+                std::array<u8, 0x1000> bad_page{};
+                const GPUVAddr program_page = program_base & ~GPUVAddr{0xfff};
+                gpu_memory->ReadBlockUnsafe(program_page, first_page.data(), first_page.size());
+                gpu_memory->ReadBlockUnsafe(page, bad_page.data(), bad_page.size());
+                const auto nonzero = [](const std::array<u8, 0x1000>& bytes) {
+                    return std::ranges::count_if(bytes, [](u8 b) { return b != 0; });
+                };
+                bool buffer_first = false, texture_first = false, buffer_bad = false, texture_bad = false;
+                if (auto* const rasterizer = gpu_memory->Rasterizer()) {
+                    if (const auto dev = gpu_memory->GpuToCpuAddress(program_page)) {
+                        buffer_first = rasterizer->MustFlushRegion(*dev, 0x1000, VideoCommon::CacheType::BufferCache);
+                        texture_first = rasterizer->MustFlushRegion(*dev, 0x1000, VideoCommon::CacheType::TextureCache);
+                    }
+                    if (dev_page) {
+                        buffer_bad = rasterizer->MustFlushRegion(*dev_page, 0x1000, VideoCommon::CacheType::BufferCache);
+                        texture_bad = rasterizer->MustFlushRegion(*dev_page, 0x1000, VideoCommon::CacheType::TextureCache);
+                    }
+                }
+                LOG_ERROR(HW_GPU,
+                          "Native program {:#x}: raw now: first page {:#x} {} nonzero bytes (GPU caches: buffer {}, texture {}), bad page {} nonzero (buffer {}, texture {}); captured {} instructions",
+                          program_base, program_page, nonzero(first_page), buffer_first, texture_first,
+                          nonzero(bad_page), buffer_bad, texture_bad, native.size());
             }
         }
         throw Shader::RuntimeError(
