@@ -21,6 +21,7 @@
 #include <vector>
 #include <utility>
 
+#include "headless/performance.h"
 #include "common/assert.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
