@@ -10,7 +10,7 @@ code=r'''
 #include <algorithm>
 #include <limits>
 #define LOG_ERROR(...) ((void)0)
-namespace Core::Memory { constexpr unsigned YUZU_PAGEMASK = 4095; }
+namespace Core::Memory { constexpr unsigned LICHII_PAGEMASK = 4095; }
 #include <cstdio>
 #include <array>
 #include <vector>

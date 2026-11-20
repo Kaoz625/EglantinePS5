@@ -946,7 +946,13 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
     if (!impl || !impl->window) return NoWindow("protect");
     impl->window->Protect(virtual_offset, length, Access(perms));
 }
-void HostMemory::EnableDirectMappedAddress() {
-    throw std::logic_error("NCE unavailable in x64 backing-only adapter");
+#ifdef HAS_NCE
+bool HostMemory::EnableDirectMappedAddress() {
+    return false; // NCE unavailable in the x64 backing-only adapter
 }
+#endif
+// Upstream (zortos nx2) unmaps the whole guest window when a process is torn down. The PS5
+// windows were never reset before this call existed (the page table's own unmaps clear them), and a
+// whole-window walk of the 64-bit window would be slow at every close: kept a no-op.
+void HostMemory::ResetVirtualMappings() {}
 } // namespace Common

@@ -8,7 +8,7 @@ root = Path(__file__).resolve().parents[1]
 macro = (root / 'headless/jit_assert.inc').read_text()
 source = r'''
 #include <cassert>
-#define YUZU_NO_INLINE __attribute__((noinline))
+#define LICHII_NO_INLINE __attribute__((noinline))
 static int evaluated, formatted, logged, failed;
 static int argument() { return ++formatted; }
 static void log(const char*, int) { ++logged; }

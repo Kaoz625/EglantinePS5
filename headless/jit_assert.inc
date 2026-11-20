@@ -6,7 +6,7 @@
     ([&]() {                                                           \
         auto&& assert_condition = (condition);                         \
         if (!(assert_condition)) [[unlikely]] {                        \
-            [&]() YUZU_NO_INLINE {                                     \
+            [&]() LICHII_NO_INLINE {                                     \
                 LOG_CRITICAL(Debug, __FILE__ ": assert " __VA_ARGS__); \
                 AssertFailSoftImpl();                                  \
             }();                                                       \
