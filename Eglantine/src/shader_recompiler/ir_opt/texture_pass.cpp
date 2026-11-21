@@ -4,6 +4,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <atomic>
 #include <queue>
 #include <unordered_map>
@@ -96,7 +98,28 @@ IR::Value ResolveConditionalPhi(IR::Value value, const IR::Block* block) {
 
 constexpr u32 DESCRIPTOR_SIZE = 8;
 constexpr u32 DESCRIPTOR_SIZE_SHIFT = u32(std::countr_zero(DESCRIPTOR_SIZE));
-constexpr u32 DESCRIPTOR_MAX_COUNT = 1024;
+constexpr u32 DESCRIPTOR_MAX_COUNT_DEFAULT = 1024;
+
+// The most elements a texture array the shader indexes from a constant buffer gets. The count is
+// what fits in the rest of the buffer, up to this; a Switch shader reading handles by a dynamic
+// index makes 1024-element arrays, a set of a pipeline with four of them is ~395 KB on RADV, and
+// one set per draw filled the PS5's shared pool (Kirby Air Riders, BLZ-0161). An index past the
+// cap takes the last element. EDEN_TEXTURE_ARRAY_MAX=N (16..1024) lowers it; unset = 1024.
+u32 DescriptorMaxCount() {
+    static const u32 value = [] {
+        const char* env = std::getenv("EDEN_TEXTURE_ARRAY_MAX");
+        u32 v = DESCRIPTOR_MAX_COUNT_DEFAULT;
+        if (env && *env) {
+            const long n = std::strtol(env, nullptr, 10);
+            if (n >= 16 && n <= long(DESCRIPTOR_MAX_COUNT_DEFAULT)) {
+                v = u32(n);
+            }
+        }
+        std::fprintf(stderr, "EDEN_TEXTURE_ARRAY_MAX max=%u\n", v);
+        return v;
+    }();
+    return value;
+}
 
 u32 DynamicDescriptorSizeShift(const IR::U32& dynamic_offset) {
     const IR::Inst* const inst = dynamic_offset.InstRecursive();
@@ -190,7 +213,7 @@ u32 DynamicSampledTextureCap(const Info& info, const HostTranslateInfo& host_inf
         auto const resource_cap = resource_budget / dynamic_arrays;
         return (std::max)(1U, (std::min)(sampled_cap, resource_cap));
     }
-    return (std::min)({DESCRIPTOR_MAX_COUNT, sampled_limit, sampler_limit, resource_limit});
+    return (std::min)({DescriptorMaxCount(), sampled_limit, sampler_limit, resource_limit});
 }
 
 // Whether opcode is an instruction past the texture pass reading a texture (or a texel buffer).
@@ -1317,7 +1340,7 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
         .secondary_shift_left = 0,
         .dynamic_offset = dynamic_offset,
         .count = (std::min)(DynamicDescriptorCount(base_offset, size_shift,
-                                                   (std::min)({DESCRIPTOR_MAX_COUNT, sampled_limit,
+                                                   (std::min)({DescriptorMaxCount(), sampled_limit,
                                                                resource_limit})),
                             DynamicDescriptorIndexLimit(dynamic_offset, size_shift)),
         .has_secondary = false,
