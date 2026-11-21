@@ -143,6 +143,7 @@ static int eden_heap_scratch_key_valid;
 static atomic_uchar eden_heap_slot_scratch[EDEN_HEAP_SLOTS]; /* 1: the slot's arena is a scratch arena */
 static uintptr_t eden_heap_ralloc_low, eden_heap_ralloc_size; /* RADV ralloc's code; size 0: off */
 static atomic_ulong eden_heap_scratch_requests;              /* requests routed (a measurement) */
+static atomic_int eden_heap_scratch_enabled = 1;               /* EDEN_HEAP_RALLOC_SCRATCH, after env.txt */
 /* Mesa's ralloc.c in the private RADV build (tools/isolate-radv.py renames it): its functions are
  * the only callers of malloc/calloc/realloc there, and the linker keeps one object's functions
  * together. Weak: a build without RADV has none, and routing stays off. */
@@ -185,12 +186,13 @@ static void eden_heap_ralloc_range(void) {
 static inline int eden_heap_scratch_caller(uintptr_t caller) {
   if (eden_heap_ralloc_size == 0 || caller - eden_heap_ralloc_low >= eden_heap_ralloc_size)
     return 0;
-  static int enabled = -1;
-  if (enabled < 0) {
-    const char *setting = getenv("EDEN_HEAP_RALLOC_SCRATCH");
-    enabled = !(setting != NULL && setting[0] == '0');
-  }
-  return enabled && eden_heap_scratch_key_valid;
+  return atomic_load_explicit(&eden_heap_scratch_enabled, memory_order_relaxed) && eden_heap_scratch_key_valid;
+}
+/* Set from main.cpp once env.txt is applied (EDEN_HEAP_RALLOC_SCRATCH=0: off). The old switch read
+ * the variable at the first ralloc request, which came before env.txt, so =0 never took effect.
+ * Switching mid-run is safe: a free finds its arena from the address, wherever it was made. */
+void eden_heap_set_ralloc_scratch(int enabled) {
+  atomic_store_explicit(&eden_heap_scratch_enabled, enabled != 0, memory_order_relaxed);
 }
 static atomic_flag eden_heap_arena_create_lock = ATOMIC_FLAG_INIT;
 /* Who holds the creation lock and how many threads wait for it (read by the development stall
@@ -447,7 +449,7 @@ void eden_heap_slack(size_t *tcache, size_t *arenas, unsigned *threads_with_aren
   /* The compiler scratch arenas (eden_heap_scratch_caller) and the arenas that exist now (the list
    * keeps the places of arenas given back, which `arenas=` in EDEN_HEAP_SLACK still counts). */
   fprintf(stderr, "EDEN_HEAP_SCRATCH routing=%s arenas_now=%u (%u MiB) scratch=%u (%u MiB, live %ld MiB, %u empty) requests=%lu given_back=%zu MiB\n",
-          eden_heap_ralloc_size != 0 ? "on" : "off", present, present * 2u, scratch, scratch * 2u,
+          eden_heap_ralloc_size == 0 ? "off" : atomic_load_explicit(&eden_heap_scratch_enabled, memory_order_relaxed) ? "on" : "off(env)", present, present * 2u, scratch, scratch * 2u,
           (scratch_live > 0 ? scratch_live : 0) >> 20, scratch_empty,
           atomic_load_explicit(&eden_heap_scratch_requests, memory_order_relaxed),
           atomic_load_explicit(&eden_heap_arenas_released, memory_order_relaxed) >> 20);

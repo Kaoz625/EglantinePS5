@@ -561,6 +561,8 @@ static void ReportFileHandles() {
 static std::atomic<unsigned long long> largest_free_block{0};
 // The driver's own buffer bytes (RADV's PS5 winsys counter, renamed by tools/isolate-radv.py).
 extern "C" unsigned long long eden_radv_private_radv_ps5_allocated_bytes __attribute__((weak));
+// Who holds the pool, against what the system says is taken (src/direct_memory.c).
+extern "C" void eden_direct_census(FILE* out, const char* why) __attribute__((weak));
 static void RefreshFreeMemory() {
 #if defined(PS5_NATIVE) || defined(__linux__)
     Eden::HangStacks::Beat();
@@ -596,6 +598,7 @@ static void RefreshFreeMemory() {
                          ? __atomic_load_n(&eden_radv_private_radv_ps5_allocated_bytes, __ATOMIC_RELAXED) >> 20 : 0ULL,
                      guest_held >> 20, guest_span >> 20);
         ReportHeap("every 20 s");
+        if (eden_direct_census) eden_direct_census(stderr, view.short_memory ? "short" : "every 10 s");
         ReportFileHandles();
         ::Kernel::Svc::MemoryStats::Report(stderr);
         if (const auto pools = guest_pool_report.load(std::memory_order_relaxed)) pools();

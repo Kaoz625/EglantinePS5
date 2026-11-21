@@ -39,8 +39,152 @@ static void eden_direct_acquire(void) {
 }
 static void eden_direct_release(void) { atomic_flag_clear_explicit(&eden_direct_lock, memory_order_release); }
 
+/* Who holds the pool (Kirby Air Riders, 21 Nov 2026: ~3 GB of the 12 GiB pool at the out-of-memory
+ * was in none of the reports - driver, guest, heap, JIT). Every block taken through this file is
+ * charged to its caller (the return address of the call into it) until it goes back, and
+ * eden_direct_census prints the callers next to what the system says is taken in all: the
+ * difference is memory taken by code that does not come through here. A measurement only. */
+#include <stdio.h>
+struct DirectMemoryRegion { int64_t start, end; int32_t type; };
+int sceKernelDirectMemoryQuery(int64_t, int, struct DirectMemoryRegion *, size_t);
+#define EDEN_CENSUS_OWNERS 96u
+#define EDEN_CENSUS_BLOCKS 65536u /* power of two */
+static struct { uintptr_t caller; int64_t bytes, peak; unsigned blocks; unsigned char via; } eden_census_owner[EDEN_CENSUS_OWNERS];
+static unsigned eden_census_owner_count;
+static struct { int64_t key; int64_t size; unsigned short owner; } eden_census_block[EDEN_CENSUS_BLOCKS]; /* key: start + 1, 0 empty */
+static int64_t eden_census_lost_bytes, eden_census_unmatched_bytes;
+static unsigned eden_census_lost, eden_census_unmatched;
+static atomic_flag eden_census_lock = ATOMIC_FLAG_INIT;
+static void eden_census_acquire(void) {
+  while (atomic_flag_test_and_set_explicit(&eden_census_lock, memory_order_acquire)) {}
+}
+static void eden_census_release(void) { atomic_flag_clear_explicit(&eden_census_lock, memory_order_release); }
+static unsigned eden_census_slot(int64_t key) {
+  return (unsigned)(((uint64_t)key >> 14) * 0x9E3779B97F4A7C15ull >> 48) & (EDEN_CENSUS_BLOCKS - 1);
+}
+static void eden_census_insert(int64_t start, int64_t size, unsigned owner) {
+  unsigned at = eden_census_slot(start + 1);
+  for (unsigned probes = 0; probes < EDEN_CENSUS_BLOCKS; ++probes, at = (at + 1) & (EDEN_CENSUS_BLOCKS - 1))
+    if (eden_census_block[at].key == 0) {
+      eden_census_block[at].key = start + 1;
+      eden_census_block[at].size = size;
+      eden_census_block[at].owner = (unsigned short)owner;
+      return;
+    }
+  ++eden_census_lost;
+  eden_census_lost_bytes += size;
+}
+/* Linear probing, deletion by moving later entries back (no tombstones). */
+static int eden_census_remove(int64_t start, int64_t *size, unsigned *owner) {
+  unsigned at = eden_census_slot(start + 1);
+  for (unsigned probes = 0; probes < EDEN_CENSUS_BLOCKS; ++probes, at = (at + 1) & (EDEN_CENSUS_BLOCKS - 1)) {
+    if (eden_census_block[at].key == 0) return 0;
+    if (eden_census_block[at].key != start + 1) continue;
+    *size = eden_census_block[at].size;
+    *owner = eden_census_block[at].owner;
+    unsigned hole = at;
+    for (unsigned next = (at + 1) & (EDEN_CENSUS_BLOCKS - 1); eden_census_block[next].key != 0;
+         next = (next + 1) & (EDEN_CENSUS_BLOCKS - 1)) {
+      const unsigned home = eden_census_slot(eden_census_block[next].key);
+      /* Move it back if its home is not in (hole, next]. */
+      if (((next - home) & (EDEN_CENSUS_BLOCKS - 1)) >= ((next - hole) & (EDEN_CENSUS_BLOCKS - 1))) {
+        eden_census_block[hole] = eden_census_block[next];
+        hole = next;
+      }
+    }
+    eden_census_block[hole].key = 0;
+    return 1;
+  }
+  return 0;
+}
+/* via: 0 the wrapped system call, 1 eden_direct_high, 2 eden_direct_low. */
+static void eden_census_take(uintptr_t caller, unsigned char via, int64_t start, size_t size) {
+  eden_census_acquire();
+  unsigned owner = 0;
+  while (owner < eden_census_owner_count &&
+         (eden_census_owner[owner].caller != caller || eden_census_owner[owner].via != via))
+    ++owner;
+  if (owner == eden_census_owner_count) {
+    if (owner < EDEN_CENSUS_OWNERS) {
+      eden_census_owner[owner].caller = caller;
+      eden_census_owner[owner].via = via;
+      ++eden_census_owner_count;
+    } else
+      owner = EDEN_CENSUS_OWNERS - 1; /* the last entry takes everyone after it */
+  }
+  eden_census_owner[owner].bytes += (int64_t)size;
+  if (eden_census_owner[owner].bytes > eden_census_owner[owner].peak)
+    eden_census_owner[owner].peak = eden_census_owner[owner].bytes;
+  ++eden_census_owner[owner].blocks;
+  eden_census_insert(start, (int64_t)size, owner);
+  eden_census_release();
+}
+static void eden_census_give(int64_t start, size_t size) {
+  eden_census_acquire();
+  int64_t held = 0;
+  unsigned owner = 0;
+  if (eden_census_remove(start, &held, &owner)) {
+    const int64_t given = (int64_t)size < held ? (int64_t)size : held;
+    eden_census_owner[owner].bytes -= given;
+    if (given == held) --eden_census_owner[owner].blocks;
+    else eden_census_insert(start + given, held - given, owner); /* the front went back */
+  } else {
+    ++eden_census_unmatched; /* a part from the middle or the end of a block, or one taken elsewhere */
+    eden_census_unmatched_bytes += (int64_t)size;
+  }
+  eden_census_release();
+}
+/* EDEN_DMEM_CENSUS: taken (the system's view, all of the pool), tracked (through here) and the
+ * difference; then each caller holding 8 MiB or more. Addresses are printed against
+ * eden_direct_census's own address, so one build's lines compare with each other. */
+static uintptr_t eden_direct_census_base;
+void eden_direct_census(FILE *out, const char *why) {
+  if (!eden_direct_census_base) eden_direct_census_base = (uintptr_t)&eden_direct_census;
+  const int64_t total = sceKernelGetDirectMemorySize();
+  int64_t taken = 0, offset = 0;
+  unsigned regions = 0;
+  struct DirectMemoryRegion region;
+  while (offset < total && regions < 65536 &&
+         sceKernelDirectMemoryQuery(offset, 1, &region, sizeof(region)) == 0 && region.end > offset) {
+    taken += region.end - (region.start > offset ? region.start : offset);
+    offset = region.end;
+    ++regions;
+  }
+  /* Copied under the lock and printed after it: printing may grow the heap, which comes here. */
+  struct { uintptr_t caller; int64_t bytes, peak; unsigned blocks; unsigned char via; } owners[EDEN_CENSUS_OWNERS];
+  eden_census_acquire();
+  const unsigned count = eden_census_owner_count;
+  for (unsigned i = 0; i < count; ++i) {
+    owners[i].caller = eden_census_owner[i].caller;
+    owners[i].bytes = eden_census_owner[i].bytes;
+    owners[i].peak = eden_census_owner[i].peak;
+    owners[i].blocks = eden_census_owner[i].blocks;
+    owners[i].via = eden_census_owner[i].via;
+  }
+  const unsigned lost = eden_census_lost, unmatched = eden_census_unmatched;
+  const int64_t lost_bytes = eden_census_lost_bytes, unmatched_bytes = eden_census_unmatched_bytes;
+  eden_census_release();
+  int64_t tracked = 0;
+  for (unsigned i = 0; i < count; ++i) tracked += owners[i].bytes;
+  fprintf(out, "EDEN_DMEM_CENSUS why=%s total_mib=%lld taken_mib=%lld tracked_mib=%lld untracked_mib=%lld regions=%u owners=%u lost=%u/%lldMiB unmatched=%u/%lldMiB base=%p\n",
+          why, (long long)(total >> 20), (long long)(taken >> 20), (long long)(tracked >> 20),
+          (long long)((taken - tracked) >> 20), regions, count, lost, (long long)(lost_bytes >> 20), unmatched,
+          (long long)(unmatched_bytes >> 20), (void *)eden_direct_census_base);
+  static const char *const via_names[] = {"sys", "high", "low"};
+  extern void eden_radv_private_radv_ps5_memory_alloc(void) __attribute__((weak));
+  const uintptr_t radv = (uintptr_t)&eden_radv_private_radv_ps5_memory_alloc;
+  for (unsigned i = 0; i < count; ++i) {
+    if (owners[i].bytes < ((int64_t)8 << 20) && owners[i].peak < ((int64_t)64 << 20)) continue;
+    const uintptr_t caller = owners[i].caller;
+    fprintf(out, "EDEN_DMEM_OWNER via=%s caller=%+lld%s mib=%lld peak_mib=%lld blocks=%u\n", via_names[owners[i].via],
+            (long long)(caller - eden_direct_census_base),
+            radv && caller >= radv && caller < radv + 2048 ? " (radv_ps5_memory_alloc)" : "",
+            (long long)(owners[i].bytes >> 20), (long long)(owners[i].peak >> 20), owners[i].blocks);
+  }
+}
+
 /* Memory from as high in the pool as there is room; from anywhere when the top has none. */
-int eden_direct_high(size_t size, size_t alignment, int type, int64_t *start) {
+static int eden_direct_high_take(size_t size, size_t alignment, int type, int64_t *start) {
   const int64_t total = sceKernelGetDirectMemorySize();
   const int64_t bytes = (int64_t)size;
   if (bytes <= 0 || total <= 0) return __real_sceKernelAllocateDirectMemory(0, total, size, alignment, type, start);
@@ -69,8 +213,15 @@ int eden_direct_high(size_t size, size_t alignment, int type, int64_t *start) {
 }
 
 /* As the system places it: for what a session takes and gives back. */
+int eden_direct_high(size_t size, size_t alignment, int type, int64_t *start) {
+  const int result = eden_direct_high_take(size, alignment, type, start);
+  if (result == 0 && start) eden_census_take((uintptr_t)__builtin_return_address(0), 1, *start, size);
+  return result;
+}
 int eden_direct_low(size_t size, size_t alignment, int type, int64_t *start) {
-  return __real_sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, alignment, type, start);
+  const int result = __real_sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, alignment, type, start);
+  if (result == 0 && start) eden_census_take((uintptr_t)__builtin_return_address(0), 2, *start, size);
+  return result;
 }
 
 /* The Vulkan driver makes its command ring (16 MiB) and, right after it, the ring's marker page
@@ -99,15 +250,19 @@ int __wrap_sceKernelAllocateDirectMemory(int64_t from, int64_t to, size_t size, 
                                          int64_t *start) {
   /* A thread's stack or the driver's zero block, asked for anywhere in the pool; and the
    * driver's command ring and marker page. */
-  if (from == 0 && start && to >= sceKernelGetDirectMemorySize() &&
-      (size == EDEN_DIRECT_SMALL || eden_direct_driver_keeps(size, __builtin_return_address(0))))
-    return eden_direct_high(size, alignment, type, start);
-  return __real_sceKernelAllocateDirectMemory(from, to, size, alignment, type, start);
+  const uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+  const int result = from == 0 && start && to >= sceKernelGetDirectMemorySize() &&
+                             (size == EDEN_DIRECT_SMALL || eden_direct_driver_keeps(size, (const void *)caller))
+                         ? eden_direct_high_take(size, alignment, type, start)
+                         : __real_sceKernelAllocateDirectMemory(from, to, size, alignment, type, start);
+  if (result == 0 && start) eden_census_take(caller, 0, *start, size);
+  return result;
 }
 
 int __wrap_sceKernelReleaseDirectMemory(int64_t start, size_t size) {
   const int result = __real_sceKernelReleaseDirectMemory(start, size);
   if (result != 0) return result;
+  eden_census_give(start, size);
   eden_direct_acquire();
   if (size == EDEN_DIRECT_SMALL && eden_direct_floor != 0 && start >= eden_direct_floor &&
       eden_direct_hole_count < sizeof(eden_direct_holes) / sizeof(eden_direct_holes[0]))

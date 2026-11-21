@@ -25,6 +25,7 @@
 #include <cstring>
 #include <sys/stat.h>
 extern "C" size_t eden_heap_last_failure(unsigned*, size_t*);
+extern "C" void eden_heap_set_ralloc_scratch(int) __attribute__((weak));
 #endif
 #ifdef EDEN_DEV_VULKAN
 #include "sdk_audit.h"
@@ -557,6 +558,12 @@ int main(int argc, char** argv) {
                 setenv(entry.substr(0, split).c_str(), entry.c_str() + split + 1, 1);
                 std::printf("EDEN_ENV %s\n", entry.c_str());
             }
+        }
+        // EDEN_HEAP_RALLOC_SCRATCH=0 turns the compiler scratch arenas off; read here, after env.txt.
+        if (const char* scratch = std::getenv("EDEN_HEAP_RALLOC_SCRATCH");
+            scratch != nullptr && eden_heap_set_ralloc_scratch != nullptr) {
+            eden_heap_set_ralloc_scratch(scratch[0] != '0');
+            std::fprintf(stderr, "EDEN_HEAP_SCRATCH switch=%s (env)\n", scratch[0] != '0' ? "on" : "off");
         }
         // The console's defaults for the core's switches (env.txt above wins). Without a fastmem
         // arena every guest read of a GPU-tracked page is a call; a Switch 2 title's reads of
