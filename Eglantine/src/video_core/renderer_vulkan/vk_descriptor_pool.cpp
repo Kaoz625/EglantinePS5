@@ -17,8 +17,10 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 #if defined(__PROSPERO__) // PS5
+#include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <thread>
 // The app heap (headless/heap_arenas.inc): gives its empty arenas and spaces back; the bytes.
 extern "C" std::size_t eden_heap_trim(void) __attribute__((weak));
@@ -67,10 +69,63 @@ static DescriptorBankInfo MakeBankInfo(std::span<const Shader::Info> infos, bool
     return bank;
 }
 
+#if defined(__PROSPERO__) // PS5
+// Kirby Air Riders (21 Nov 2026): the driver's descriptor and upload memory (RADV priority 30) was
+// 860 MiB in 91 buffers before the first race and 1,032 MiB at the out-of-memory, in the 12 GiB
+// pool the CPU shares with the GPU. Every bank made a pool of 96 sets at once (sets per pool on
+// AMD), whether or not a draw ever used it, and a Switch 2 shader's set can hold many descriptors.
+// A pool is now sized in bytes: as many sets as fit EDEN_DESCRIPTOR_POOL_KIB (default 512), at
+// least one batch (SETS_GROW_RATE) and at most the device's count, and a bank's first pool is made
+// at its first sets, not with the bank. EDEN_DESCRIPTOR_POOL_KIB=0: as before (96 sets, at once).
+static std::size_t PoolBudgetBytes() {
+    static const std::size_t budget = [] {
+        const char* value = std::getenv("EDEN_DESCRIPTOR_POOL_KIB");
+        const long kib = value != nullptr ? std::strtol(value, nullptr, 10) : 512;
+        return kib > 0 ? std::size_t(kib) << 10 : std::size_t{0};
+    }();
+    return budget;
+}
+// RADV's bytes for one set of the bank (radv_descriptor_pool.c sizes; images at their largest).
+static std::size_t SetBytes(const DescriptorBankInfo& info) {
+    return 16 * std::size_t(info.uniform_buffers + info.storage_buffers + info.texture_buffers +
+                            info.image_buffers + info.samplers) +
+           32 * std::size_t(info.images) + 64 * std::size_t(info.sampled_images) +
+           96 * std::size_t(info.textures);
+}
+static std::atomic<u64> pools_made{0}, pool_bytes_made{0};
+#endif
+
 static void AllocatePool(const Device& device, DescriptorBank& bank) {
     std::array<VkDescriptorPoolSize, 8> pool_sizes;
     size_t pool_cursor{};
+#if defined(__PROSPERO__) // PS5
+    const u32 device_sets = device.GetSetsPerPool();
+    const std::size_t set_bytes = std::max<std::size_t>(SetBytes(bank.info), 16);
+    const std::size_t budget = PoolBudgetBytes();
+    const u32 sets_per_pool =
+        budget == 0 ? device_sets
+                    : u32(std::clamp<std::size_t>(budget / set_bytes, SETS_GROW_RATE,
+                                                  std::max<std::size_t>(device_sets, SETS_GROW_RATE)));
+    {
+        const u64 made = pools_made.fetch_add(1, std::memory_order_relaxed) + 1;
+        const u64 bytes = pool_bytes_made.fetch_add(u64(set_bytes) * sets_per_pool,
+                                                    std::memory_order_relaxed) +
+                          u64(set_bytes) * sets_per_pool;
+        if (made <= 64 || made % 32 == 0) {
+            std::fprintf(stderr,
+                         "EDEN_DESCRIPTOR_POOL made=%llu sets=%u set_bytes=%zu pool_kib=%zu "
+                         "total_mib=%llu (ub=%u sb=%u tb=%u ib=%u tex=%u img=%u si=%u smp=%u uab=%d)\n",
+                         (unsigned long long)made, sets_per_pool, set_bytes,
+                         (set_bytes * sets_per_pool) >> 10, (unsigned long long)(bytes >> 20),
+                         bank.info.uniform_buffers, bank.info.storage_buffers,
+                         bank.info.texture_buffers, bank.info.image_buffers, bank.info.textures,
+                         bank.info.images, bank.info.sampled_images, bank.info.samplers,
+                         int(bank.info.update_after_bind));
+        }
+    }
+#else
     const u32 sets_per_pool = device.GetSetsPerPool();
+#endif
     const auto add = [&](VkDescriptorType type, u32 count) {
         if (count > 0) {
             pool_sizes[pool_cursor++] = {
@@ -149,10 +204,17 @@ vk::DescriptorSets DescriptorAllocator::AllocateDescriptors(size_t count) {
     VkDescriptorSetAllocateInfo allocate_info{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .pNext = nullptr,
-        .descriptorPool = *bank->pools.back(),
+        .descriptorPool = bank->pools.empty() ? VkDescriptorPool{} : *bank->pools.back(),
         .descriptorSetCount = static_cast<u32>(count),
         .pSetLayouts = layouts.data(),
     };
+#if defined(__PROSPERO__) // PS5
+    if (bank->pools.empty()) {
+        // The bank's first pool, at its first sets (PoolBudgetBytes).
+        AllocatePool(*device, *bank);
+    }
+    allocate_info.descriptorPool = *bank->pools.back();
+#endif
     vk::DescriptorSets new_sets = bank->pools.back().Allocate(allocate_info);
     if (!new_sets.IsOutOfPoolMemory()) {
         return new_sets;
@@ -198,7 +260,13 @@ DescriptorBank& DescriptorPool::Bank(const Device& device, const DescriptorBankI
 
     auto& bank = *banks.emplace_back(std::make_unique<DescriptorBank>());
     bank.info = reqs;
+#if defined(__PROSPERO__) // PS5
+    if (PoolBudgetBytes() == 0) {
+        AllocatePool(device, bank);
+    }
+#else
     AllocatePool(device, bank);
+#endif
     return bank;
 }
 
