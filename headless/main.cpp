@@ -876,6 +876,12 @@ int main(int argc, char** argv) {
         // every frame (20-25 FPS). Eden's larger integrated budget (6 GiB) holds it at 30 FPS
         // with ~0.9 GB of direct memory to spare.
         Settings::values.vram_usage_mode.SetValue(Settings::VramUsageMode::Aggressive);
+        // env.txt EDEN_VRAM_MODE=conservative: Eden's 4 GiB texture budget (the texture collector
+        // starts earlier). Kirby Air Riders filled the pool at load with RADV at 3.5 GB (H14-kb1).
+        if (const char* vram = std::getenv("EDEN_VRAM_MODE"); vram != nullptr &&
+                                                              std::string_view{vram} == "conservative") {
+            Settings::values.vram_usage_mode.SetValue(Settings::VramUsageMode::Conservative);
+        }
 #else
         Settings::values.renderer_backend = Settings::RendererBackend::Null;
 #endif
