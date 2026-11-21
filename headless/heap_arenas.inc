@@ -100,7 +100,9 @@ static void *_Atomic eden_heap_slots[EDEN_HEAP_SLOTS]; /* arena mspace owning ea
 static atomic_long eden_heap_slot_live[EDEN_HEAP_SLOTS];
 static uintptr_t eden_heap_slot(const void *address);
 static void eden_heap_slot_count(const void *address, long sign);
-static void *eden_heap_emptiest_arena(const void *except);
+static void *eden_heap_emptiest_arena(const void *except, int scratch);
+/* 1: the arena (or a block in it) is a scratch arena. */
+static int eden_heap_arena_scratch(const void *arena);
 static void *_Atomic eden_heap_arena_list[EDEN_HEAP_MAX_ARENAS]; /* atomic: released places are reused */
 /* Empty arenas given back (eden_heap_release_arenas). A thread counts itself in an arena's slot
  * around every call into its mspace (allocation, free, resize); a released arena's slot is retired
@@ -125,6 +127,71 @@ static unsigned eden_heap_first_arenas; /* first arenas made (under the creation
 static atomic_uint eden_heap_next_shared;
 static pthread_key_t eden_heap_arena_key;
 static int eden_heap_arena_key_valid;
+/* Compiler scratch arenas (Kirby Air Riders, 20 Nov 2026: VK_ERROR_OUT_OF_DEVICE_MEMORY at load).
+ * RADV's compiler memory (Mesa ralloc: NIR, ~32 GB allocated per cold load) and RADV's long-lived
+ * objects (radv_shader from the pipeline cache, set layouts, prologs) came from the same thread
+ * arenas, interleaved: when a build ended its ralloc blocks were freed but each 2 MiB arena kept a
+ * few long-lived blocks, so none emptied. Kirby's 8 VkShaderDriver threads held 623 arenas
+ * (1246 MiB) for 164 MiB live; the heap held 3.3 GB for 1.5 GB in use and the pool shared with the
+ * GPU ran out (largest free block 13-23 MiB). Requests made from inside RADV's ralloc code now go to
+ * a second set of arenas of their own (a second record per thread, "scratch"), which empty when
+ * the builds that used them end and go back with eden_heap_release_arenas. Where a block lives
+ * changes nothing else: a free finds its arena from the address as before.
+ * EDEN_HEAP_RALLOC_SCRATCH=0: off (all requests in the thread's arenas, as before). */
+static pthread_key_t eden_heap_scratch_key;
+static int eden_heap_scratch_key_valid;
+static atomic_uchar eden_heap_slot_scratch[EDEN_HEAP_SLOTS]; /* 1: the slot's arena is a scratch arena */
+static uintptr_t eden_heap_ralloc_low, eden_heap_ralloc_size; /* RADV ralloc's code; size 0: off */
+static atomic_ulong eden_heap_scratch_requests;              /* requests routed (a measurement) */
+/* Mesa's ralloc.c in the private RADV build (tools/isolate-radv.py renames it): its functions are
+ * the only callers of malloc/calloc/realloc there, and the linker keeps one object's functions
+ * together. Weak: a build without RADV has none, and routing stays off. */
+#define EDEN_RALLOC_FUNCTIONS(X)                                                                   \
+  X(ralloc_context) X(ralloc_size) X(rzalloc_size) X(reralloc_size) X(rerzalloc_size)             \
+  X(ralloc_array_size) X(rzalloc_array_size) X(reralloc_array_size) X(ralloc_free)                \
+  X(ralloc_memdup) X(ralloc_strdup) X(ralloc_strcat) X(ralloc_asprintf) X(ralloc_vasprintf)       \
+  X(ralloc_asprintf_append) X(ralloc_vasprintf_append) X(ralloc_vasprintf_rewrite_tail)           \
+  X(gc_context) X(gc_alloc_size) X(gc_zalloc_size) X(gc_free) X(linear_alloc_child)               \
+  X(linear_context) X(linear_context_with_opts) X(linear_zalloc_child) X(linear_free_context)     \
+  X(linear_strdup) X(linear_asprintf) X(linear_alloc_child_array) X(linear_zalloc_child_array)
+#define EDEN_RALLOC_DECLARE(name) extern void eden_radv_private_##name(void) __attribute__((weak));
+EDEN_RALLOC_FUNCTIONS(EDEN_RALLOC_DECLARE)
+#undef EDEN_RALLOC_DECLARE
+/* The span from the first to the last of those functions, plus room for the last one's body. A
+ * span over 64 KiB means the object was split (or some are missing): routing stays off. */
+static void eden_heap_ralloc_range(void) {
+  uintptr_t low = (uintptr_t)-1, high = 0;
+  unsigned found = 0, missing = 0;
+#define EDEN_RALLOC_SPAN(name)                                                                     \
+  {                                                                                                \
+    const uintptr_t at = (uintptr_t)&eden_radv_private_##name;                                     \
+    if (at == 0)                                                                                   \
+      ++missing;                                                                                   \
+    else {                                                                                         \
+      ++found;                                                                                     \
+      low = at < low ? at : low;                                                                   \
+      high = at > high ? at : high;                                                                \
+    }                                                                                              \
+  }
+  EDEN_RALLOC_FUNCTIONS(EDEN_RALLOC_SPAN)
+#undef EDEN_RALLOC_SPAN
+  high += 1024; /* the last function's body (linear_zalloc_child_array: 157 bytes in H13) */
+  if (missing == 0 && found != 0 && high - low <= 65536u) {
+    eden_heap_ralloc_low = low;
+    eden_heap_ralloc_size = high - low;
+  }
+}
+/* 1: a request from `caller` (a return address) goes to this thread's scratch arenas. */
+static inline int eden_heap_scratch_caller(uintptr_t caller) {
+  if (eden_heap_ralloc_size == 0 || caller - eden_heap_ralloc_low >= eden_heap_ralloc_size)
+    return 0;
+  static int enabled = -1;
+  if (enabled < 0) {
+    const char *setting = getenv("EDEN_HEAP_RALLOC_SCRATCH");
+    enabled = !(setting != NULL && setting[0] == '0');
+  }
+  return enabled && eden_heap_scratch_key_valid;
+}
 static atomic_flag eden_heap_arena_create_lock = ATOMIC_FLAG_INIT;
 /* Who holds the creation lock and how many threads wait for it (read by the development stall
  * watchdog, headless/stall_watchdog.h). */
@@ -239,6 +306,7 @@ struct eden_heap_thread {
   void *bins[EDEN_TCACHE_BINS];
   unsigned char counts[EDEN_TCACHE_BINS];
   char name[16]; /* research/heap-memory: the thread's name when it made its second arena */
+  unsigned char scratch; /* 1: a thread's scratch record (its arenas are scratch arenas) */
 };
 #define EDEN_HEAP_THREADS 512u
 static struct eden_heap_thread eden_heap_threads[EDEN_HEAP_THREADS];
@@ -359,17 +427,30 @@ void eden_heap_slack(size_t *tcache, size_t *arenas, unsigned *threads_with_aren
   }
   *tcache = cached;
   *arena_count = atomic_load_explicit(&eden_heap_arena_count, memory_order_relaxed);
-  long live = 0;
-  unsigned empty = 0, quarter = 0;
+  long live = 0, scratch_live = 0;
+  unsigned empty = 0, quarter = 0, present = 0, scratch = 0, scratch_empty = 0;
   for (unsigned i = 0; i < *arena_count && i < EDEN_HEAP_MAX_ARENAS; ++i) {
     const void *arena = eden_heap_arena_list[i];
     if (arena == NULL)
       continue;
     const long bytes = atomic_load_explicit(&eden_heap_slot_live[eden_heap_slot(arena)], memory_order_relaxed);
+    ++present;
     live += bytes;
     empty += bytes <= 0;
     quarter += bytes < (long)(EDEN_HEAP_ARENA_PAYLOAD / 4);
+    if (eden_heap_arena_scratch(arena)) {
+      ++scratch;
+      scratch_live += bytes;
+      scratch_empty += bytes <= 0;
+    }
   }
+  /* The compiler scratch arenas (eden_heap_scratch_caller) and the arenas that exist now (the list
+   * keeps the places of arenas given back, which `arenas=` in EDEN_HEAP_SLACK still counts). */
+  fprintf(stderr, "EDEN_HEAP_SCRATCH routing=%s arenas_now=%u (%u MiB) scratch=%u (%u MiB, live %ld MiB, %u empty) requests=%lu given_back=%zu MiB\n",
+          eden_heap_ralloc_size != 0 ? "on" : "off", present, present * 2u, scratch, scratch * 2u,
+          (scratch_live > 0 ? scratch_live : 0) >> 20, scratch_empty,
+          atomic_load_explicit(&eden_heap_scratch_requests, memory_order_relaxed),
+          atomic_load_explicit(&eden_heap_arenas_released, memory_order_relaxed) >> 20);
   eden_heap_arena_live = live > 0 ? (size_t)live : 0;
   eden_heap_arena_empty = empty;
   eden_heap_arena_quarter = quarter;
@@ -489,6 +570,8 @@ static int ps5_heap_ready(void) {
   atomic_store_explicit(&eden_heap_space_count, 1, memory_order_release);
   /* libthr keeps specific data in its own storage; no recursion into malloc. */
   eden_heap_arena_key_valid = pthread_key_create(&eden_heap_arena_key, eden_heap_thread_exit) == 0;
+  eden_heap_scratch_key_valid = pthread_key_create(&eden_heap_scratch_key, eden_heap_thread_exit) == 0;
+  eden_heap_ralloc_range();
 
   atomic_store_explicit(&ps5_heap_state, 2, memory_order_release);
   return 1;
@@ -541,6 +624,15 @@ static void *eden_heap_arena_owner(const void *address) {
   if (((uintptr_t)address & (EDEN_HEAP_ARENA_SIZE - 1u)) >= EDEN_HEAP_ARENA_PAYLOAD)
     return NULL;
   return atomic_load_explicit(&eden_heap_slots[eden_heap_slot(address)], memory_order_acquire);
+}
+
+static int eden_heap_arena_scratch(const void *arena) {
+  return atomic_load_explicit(&eden_heap_slot_scratch[eden_heap_slot(arena)], memory_order_relaxed) != 0;
+}
+/* A freed block of a scratch arena: kept only in the scratch record's cache (never handed to a
+ * request of the thread's own, which would keep the scratch arena from emptying). */
+static int eden_heap_block_scratch(const void *address) {
+  return eden_heap_arena_owner(address) != NULL && eden_heap_arena_scratch(address);
 }
 
 /* The mspace owning an owned block: its slot's arena, else the space of its piece. */
@@ -856,7 +948,7 @@ static void *eden_heap_main(int kind, size_t a, size_t b) {
 
 /* Allocate and register one arena block from the heap (NULL on failure, or at the limit: of first
  * arenas for a thread's first, of all arenas for another). */
-static void *eden_heap_create_arena(int first) {
+static void *eden_heap_create_arena(int first, int scratch) {
   eden_heap_create_acquire();
   void *arena = NULL;
   const unsigned count = atomic_load_explicit(&eden_heap_arena_count, memory_order_relaxed);
@@ -881,6 +973,7 @@ static void *eden_heap_create_arena(int first) {
       if (arena != NULL) {
         const uintptr_t slot = eden_heap_slot(block);
         atomic_store_explicit(&eden_heap_slot_retired[slot], 0, memory_order_seq_cst);
+        atomic_store_explicit(&eden_heap_slot_scratch[slot], (unsigned char)(scratch != 0), memory_order_relaxed);
         eden_heap_arena_list[index] = arena;
         eden_heap_arena_blocks_probe[index] = block;
         atomic_fetch_add_explicit(&eden_heap_arena_backing_probe, sceLibcMspaceMallocUsableSize(block), memory_order_relaxed);
@@ -899,24 +992,35 @@ static void *eden_heap_create_arena(int first) {
   return arena;
 }
 
-/* This thread's record, claimed on its first allocation. NULL: none free (process-wide counters). */
-static struct eden_heap_thread *eden_heap_self(void) {
-  if (!eden_heap_arena_key_valid)
+/* This thread's record (scratch: its scratch record), claimed on its first allocation. NULL: none
+ * free (process-wide counters). A free record that holds arenas is taken only for the same kind, so
+ * scratch arenas stay scratch arenas. */
+static struct eden_heap_thread *eden_heap_self_kind(int scratch) {
+  const pthread_key_t key = scratch ? eden_heap_scratch_key : eden_heap_arena_key;
+  if (!(scratch ? eden_heap_scratch_key_valid : eden_heap_arena_key_valid))
     return NULL;
-  struct eden_heap_thread *self = pthread_getspecific(eden_heap_arena_key);
+  struct eden_heap_thread *self = pthread_getspecific(key);
   if (self != NULL)
     return self;
   for (unsigned i = 0; i < EDEN_HEAP_THREADS; ++i) {
+    if (eden_heap_threads[i].owned != 0 && eden_heap_threads[i].scratch != (unsigned char)scratch)
+      continue;
     unsigned char expected = 0;
     if (!atomic_compare_exchange_strong_explicit(&eden_heap_thread_used[i], &expected, 1,
                                                  memory_order_acquire, memory_order_relaxed))
       continue;
     self = &eden_heap_threads[i];
+    if (self->owned != 0 && self->scratch != (unsigned char)scratch) {
+      /* Made arenas of the other kind meanwhile (another thread had it): not this one. */
+      atomic_store_explicit(&eden_heap_thread_used[i], 0, memory_order_release);
+      continue;
+    }
+    self->scratch = (unsigned char)scratch;
     self->live = 0;
     self->blocks = 0;
     self->pending = 0;
     self->retry = 0;  /* its arenas (own) stay: this thread uses them */
-    if (pthread_setspecific(eden_heap_arena_key, self) != 0) {
+    if (pthread_setspecific(key, self) != 0) {
       atomic_store_explicit(&eden_heap_thread_used[i], 0, memory_order_release);
       return NULL;
     }
@@ -924,6 +1028,7 @@ static struct eden_heap_thread *eden_heap_self(void) {
   }
   return NULL;
 }
+static struct eden_heap_thread *eden_heap_self(void) { return eden_heap_self_kind(0); }
 
 static void eden_heap_charge(struct eden_heap_thread *self, long bytes, long blocks) {
   self->live += bytes;
@@ -950,28 +1055,34 @@ static void *eden_heap_record(void *address, size_t bytes) {
   return address;
 }
 
-/* This thread's arena, created on its first small allocation. NULL = the heap's own spaces. */
-static void *eden_heap_thread_arena(void) {
-  struct eden_heap_thread *self = eden_heap_self();
+/* This thread's arena (scratch: its scratch arena), created on its first small allocation. NULL =
+ * the heap's own spaces. */
+static void *eden_heap_thread_arena(int scratch) {
+  struct eden_heap_thread *self = eden_heap_self_kind(scratch);
   if (self == NULL)
     return NULL;
   if (self->arena != NULL && !eden_heap_arena_retired(self->arena))
     return self->arena;
   self->arena = NULL;
-  void *arena = eden_heap_emptiest_arena(NULL);
+  void *arena = eden_heap_emptiest_arena(NULL, scratch);
   if (arena != NULL) {
     self->arena = arena;
     return arena;
   }
-  arena = eden_heap_create_arena(1);
+  /* A scratch arena is not one of the first arenas (EDEN_HEAP_FIRST_ARENAS): those are for the
+   * threads' own first arenas. */
+  arena = eden_heap_create_arena(!scratch, scratch);
   if (arena == NULL) {
     /* Arena limit reached: share the existing arenas round-robin. */
     const unsigned count = atomic_load_explicit(&eden_heap_arena_count, memory_order_acquire);
     if (count == 0)
       return NULL;
     arena = NULL;
-    for (unsigned tries = 0; arena == NULL && tries < count; ++tries)
+    for (unsigned tries = 0; arena == NULL && tries < count; ++tries) {
       arena = eden_heap_arena_list[atomic_fetch_add_explicit(&eden_heap_next_shared, 1, memory_order_relaxed) % count];
+      if (arena != NULL && eden_heap_arena_scratch(arena) != scratch)
+        arena = NULL; /* scratch and other blocks never share an arena */
+    }
     if (arena == NULL)
       return NULL;
   } else if (self->owned < EDEN_HEAP_THREAD_ARENAS) {
@@ -1006,7 +1117,7 @@ static void *eden_heap_arena_try(void *arena, size_t count, size_t size, int zer
  * come and go left arenas empty or nearly so while others kept making new ones (MKW: 802 MiB of
  * arenas holding 368 MiB, 44 of them empty). Their mspaces are shared safely (as at the arena
  * limit). EDEN_HEAP_ARENA_REUSE=0 makes new arenas as before. */
-static void *eden_heap_emptiest_arena(const void *except) {
+static void *eden_heap_emptiest_arena(const void *except, int scratch) {
   const char *setting = getenv("EDEN_HEAP_ARENA_REUSE");
   if (setting != NULL && setting[0] == '0')
     return NULL;
@@ -1015,7 +1126,8 @@ static void *eden_heap_emptiest_arena(const void *except) {
   long best_live = (long)(EDEN_HEAP_ARENA_PAYLOAD / 2);
   for (unsigned i = 0; i < count && i < EDEN_HEAP_MAX_ARENAS; ++i) {
     void *arena = eden_heap_arena_list[i];
-    if (arena == NULL || arena == except || eden_heap_arena_retired(arena))
+    if (arena == NULL || arena == except || eden_heap_arena_retired(arena) ||
+        eden_heap_arena_scratch(arena) != scratch)
       continue;
     const long live = atomic_load_explicit(&eden_heap_slot_live[eden_heap_slot(arena)], memory_order_relaxed);
     if (live < best_live) {
@@ -1028,14 +1140,14 @@ static void *eden_heap_emptiest_arena(const void *except) {
   return best;
 }
 
-static void *eden_heap_arena_allocate(size_t count, size_t size, int zero) {
-  void *arena = eden_heap_thread_arena();
+static void *eden_heap_arena_allocate(size_t count, size_t size, int zero, int scratch) {
+  void *arena = eden_heap_thread_arena(scratch);
   if (arena == NULL)
     return NULL;
   void *address = eden_heap_arena_try(arena, count, size, zero);
   if (address != NULL)
     return address;
-  struct eden_heap_thread *self = eden_heap_self();
+  struct eden_heap_thread *self = eden_heap_self_kind(scratch);
   if (self == NULL)
     return NULL;
   if (self->retry != 0) {
@@ -1059,7 +1171,7 @@ static void *eden_heap_arena_allocate(size_t count, size_t size, int zero) {
   }
   if (count * size >= EDEN_HEAP_ARENA_GROW_REQUEST)
     return NULL;
-  void *reuse = eden_heap_emptiest_arena(arena);
+  void *reuse = eden_heap_emptiest_arena(arena, scratch);
   if (reuse != NULL) {
     address = eden_heap_arena_try(reuse, count, size, zero);
     if (address != NULL) {
@@ -1077,8 +1189,14 @@ static void *eden_heap_arena_allocate(size_t count, size_t size, int zero) {
     self->name[sizeof(self->name) - 1] = 0;
     if (self->name[0] == 0)
       self->name[0] = '?';
+    if (scratch) {
+      /* The report tells a thread's scratch record by a leading '~'. */
+      memmove(self->name + 1, self->name, sizeof(self->name) - 2);
+      self->name[0] = '~';
+      self->name[sizeof(self->name) - 1] = 0;
+    }
   }
-  void *fresh = self->owned < EDEN_HEAP_THREAD_ARENAS ? eden_heap_create_arena(0) : NULL;
+  void *fresh = self->owned < EDEN_HEAP_THREAD_ARENAS ? eden_heap_create_arena(0, scratch) : NULL;
   if (fresh == NULL) {
     /* At a limit, or no memory for one: each look through the arenas costs a request to each,
      * so the next few requests go straight to the heap's spaces. */
@@ -1132,11 +1250,11 @@ static void eden_heap_release(void *address) {
 }
 
 /* A cached block for bytes (0 < bytes <= 16 * (EDEN_TCACHE_BINS - 1)), charged as allocated. */
-static void *eden_tcache_take(size_t bytes) {
+static void *eden_tcache_take(size_t bytes, int scratch) {
   const size_t bin = (bytes + 15) >> 4;
   if (bytes == 0 || bin >= EDEN_TCACHE_BINS)
     return NULL;
-  struct eden_heap_thread *self = eden_heap_self();
+  struct eden_heap_thread *self = eden_heap_self_kind(scratch);
   if (self == NULL || self->bins[bin] == NULL)
     return NULL;
   void *block = self->bins[bin];
@@ -1151,7 +1269,11 @@ static int eden_tcache_keep(void *address, size_t usable) {
   const size_t bin = usable >> 4;
   if (bin == 0 || bin >= EDEN_TCACHE_BINS)
     return 0;
-  struct eden_heap_thread *self = eden_heap_self();
+  struct eden_heap_thread *self;
+  if (eden_heap_block_scratch(address))
+    self = eden_heap_scratch_key_valid ? pthread_getspecific(eden_heap_scratch_key) : NULL;
+  else
+    self = eden_heap_self();
   if (self == NULL || self->counts[bin] >= EDEN_TCACHE_LIMIT)
     return 0;
   ((void **)address)[0] = self->bins[bin];
@@ -1446,7 +1568,7 @@ void eden_heap_sites_report(void) {
   eden_heap_research_report();
 }
 
-static void *eden_heap_allocate(size_t count, size_t size, int zero) {
+static void *eden_heap_allocate(size_t count, size_t size, int zero, int scratch) {
   const size_t bytes = count * size;
   if (bytes >= EDEN_HEAP_LARGE_REQUEST && eden_heap_grows) {
     /* Memory of its own (it arrives zeroed). With every entry taken, or no memory left to take,
@@ -1456,7 +1578,7 @@ static void *eden_heap_allocate(size_t count, size_t size, int zero) {
       return block;
   }
   if (bytes < EDEN_HEAP_SMALL_REQUEST) {
-    void *address = eden_heap_arena_allocate(count, size, zero);
+    void *address = eden_heap_arena_allocate(count, size, zero, scratch);
     return address != NULL ? address : eden_heap_spill(count, size, zero);
   }
   return zero ? eden_heap_main(EDEN_HEAP_CALLOC, count, size) : eden_heap_main(EDEN_HEAP_MALLOC, bytes, 0);
@@ -1465,8 +1587,11 @@ static void *eden_heap_allocate(size_t count, size_t size, int zero) {
 void *__wrap_malloc(size_t size) {
   if (!ps5_heap_ready())
     return __real_malloc(size);
-  void *cached = eden_tcache_take(size);
-  void *block = cached != NULL ? cached : eden_heap_record(eden_heap_allocate(1, size, 0), size);
+  const int scratch = eden_heap_scratch_caller((uintptr_t)__builtin_return_address(0));
+  if (scratch)
+    atomic_fetch_add_explicit(&eden_heap_scratch_requests, 1, memory_order_relaxed);
+  void *cached = eden_tcache_take(size, scratch);
+  void *block = cached != NULL ? cached : eden_heap_record(eden_heap_allocate(1, size, 0, scratch), size);
   eden_site_alloc(block, size);
   return block;
 }
@@ -1478,19 +1603,20 @@ void *__wrap_calloc(size_t count, size_t size) {
     eden_heap_failed((size_t)-1, EDEN_HEAP_WHY_OVERFLOW);
     return NULL;
   }
-  void *cached = eden_tcache_take(count * size);
+  const int scratch = eden_heap_scratch_caller((uintptr_t)__builtin_return_address(0));
+  void *cached = eden_tcache_take(count * size, scratch);
   if (cached != NULL) {
     eden_site_alloc(cached, count * size);
     return memset(cached, 0, count * size);
   }
-  void *block = eden_heap_record(eden_heap_allocate(count, size, 1), count * size);
+  void *block = eden_heap_record(eden_heap_allocate(count, size, 1, scratch), count * size);
   eden_site_alloc(block, count * size);
   return block;
 }
 
-static void *eden_realloc_inner(void *address, size_t size) {
+static void *eden_realloc_inner(void *address, size_t size, int scratch) {
   if (address == NULL)
-    return __wrap_malloc(size);
+    return eden_heap_record(eden_heap_allocate(1, size, 0, scratch), size);
   const int in_range = eden_heap_in_range(address);
   const int large = in_range ? -1 : eden_heap_large_find(address);
   if (!in_range && large < 0)
@@ -1530,7 +1656,7 @@ static void *eden_realloc_inner(void *address, size_t size) {
   }
   /* The block cannot stay where it is (its arena or its piece of the heap is full, or it
    * crosses the size at which blocks get memory of their own): move it. */
-  void *moved = eden_heap_allocate(1, size, 0);
+  void *moved = eden_heap_allocate(1, size, 0, scratch);
   if (moved == NULL) {
     eden_heap_failed(size, atomic_load_explicit(&eden_heap_grow_why, memory_order_relaxed));
     return NULL;
@@ -1545,11 +1671,17 @@ static void *eden_realloc_inner(void *address, size_t size) {
 }
 
 void *__wrap_realloc(void *address, size_t size) {
-  if (address == NULL)
-    return __wrap_malloc(size);
+  const int scratch = eden_heap_scratch_caller((uintptr_t)__builtin_return_address(0));
+  if (address == NULL) {
+    if (!scratch || !ps5_heap_ready())
+      return __wrap_malloc(size);
+    void *block = eden_heap_record(eden_heap_allocate(1, size, 0, 1), size);
+    eden_site_alloc(block, size);
+    return block;
+  }
   if (ps5_heap_owns(address))
     eden_site_free(address, eden_heap_usable(address));
-  void *result = eden_realloc_inner(address, size);
+  void *result = eden_realloc_inner(address, size, scratch);
   eden_site_alloc(result, size);
   return result;
 }
@@ -1581,7 +1713,7 @@ int __wrap_posix_memalign(void **address, size_t alignment, size_t size) {
     return EINVAL;
   int result = ENOMEM;
   if (size < EDEN_HEAP_SMALL_REQUEST && alignment <= 4096) {
-    void *arena = eden_heap_thread_arena();
+    void *arena = eden_heap_thread_arena(0);
     if (arena != NULL) {
       /* Counted in the arena like any of its blocks (it was not: the arena's live count missed
        * these, and an arena given back while it held one would have taken it with it). */

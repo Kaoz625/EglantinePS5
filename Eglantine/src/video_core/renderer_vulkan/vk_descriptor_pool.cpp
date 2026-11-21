@@ -16,6 +16,14 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
+#if defined(__PROSPERO__) // PS5
+#include <chrono>
+#include <cstdio>
+#include <thread>
+// The app heap (headless/heap_arenas.inc): gives its empty arenas and spaces back; the bytes.
+extern "C" std::size_t eden_heap_trim(void) __attribute__((weak));
+#endif
+
 namespace Vulkan {
 
 // Prefer small grow rates to avoid saturating the descriptor pool with barely used pipelines
@@ -80,7 +88,7 @@ static void AllocatePool(const Device& device, DescriptorBank& bank) {
     add(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, info.images);
     add(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, info.sampled_images);
     add(VK_DESCRIPTOR_TYPE_SAMPLER, info.samplers);
-    bank.pools.push_back(device.GetLogical().CreateDescriptorPool({
+    const VkDescriptorPoolCreateInfo create_info{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .pNext = nullptr,
         .flags = info.update_after_bind
@@ -89,7 +97,37 @@ static void AllocatePool(const Device& device, DescriptorBank& bank) {
         .maxSets = sets_per_pool,
         .poolSizeCount = static_cast<u32>(pool_cursor),
         .pPoolSizes = std::data(pool_sizes),
-    }));
+    };
+#if defined(__PROSPERO__) // PS5
+    // Kirby Air Riders (20 Nov 2026) ended at load: this pool's memory was refused once
+    // (VK_ERROR_OUT_OF_DEVICE_MEMORY, largest free block of the pool shared with the CPU 13-23 MiB)
+    // and the exception closed the app. The heap gives its empty arenas and spaces back when asked,
+    // and the texture collector and the shader builds free memory meanwhile: ask, wait, try again
+    // (up to ~8 s) before giving up as before.
+    for (int attempt = 0;; ++attempt) {
+        try {
+            bank.pools.push_back(device.GetLogical().CreateDescriptorPool(create_info));
+            if (attempt != 0) {
+                std::fprintf(stderr, "EDEN_DESCRIPTOR_POOL_RETRY created after %d refusals\n", attempt);
+            }
+            return;
+        } catch (const vk::Exception& exception) {
+            const VkResult result = exception.GetResult();
+            if ((result != VK_ERROR_OUT_OF_DEVICE_MEMORY && result != VK_ERROR_OUT_OF_HOST_MEMORY) ||
+                attempt >= 40) {
+                throw;
+            }
+            const std::size_t returned = eden_heap_trim ? eden_heap_trim() : 0;
+            std::fprintf(stderr,
+                         "EDEN_DESCRIPTOR_POOL_RETRY refused (%d), attempt %d: heap gave back %zu MiB, "
+                         "waiting 200 ms\n",
+                         int(result), attempt + 1, returned >> 20);
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    }
+#else
+    bank.pools.push_back(device.GetLogical().CreateDescriptorPool(create_info));
+#endif
 }
 
 DescriptorAllocator::DescriptorAllocator(const Device& device_, MasterSemaphore& master_semaphore_,

@@ -864,10 +864,20 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         device.SupportsTransformFeedbackProvokingVertexPreservation();
 
     const size_t cpu_threads = GetTotalPipelineWorkers();
-    const size_t driver_threads =
+    size_t driver_threads =
         device.HasBrokenParallelShaderCompiling()
             ? 1
             : std::min(cpu_threads, std::max<size_t>(std::thread::hardware_concurrency() / 2, 2));
+#if defined(__PROSPERO__) // PS5
+    // EDEN_SHADER_DRIVER_THREADS=N: driver build threads (each grows its own heap arenas while it
+    // compiles; fewer = less compile memory at once, slower cold loads). Unset: as above.
+    if (const char* setting = std::getenv("EDEN_SHADER_DRIVER_THREADS"); setting != nullptr) {
+        const long wanted = std::strtol(setting, nullptr, 10);
+        if (wanted >= 1 && wanted <= 32) {
+            driver_threads = static_cast<size_t>(wanted);
+        }
+    }
+#endif
     shader_jobs.emplace(VideoCommon::ShaderJobConfig{
         .cpu_threads = cpu_threads,
         .driver_threads = driver_threads,
