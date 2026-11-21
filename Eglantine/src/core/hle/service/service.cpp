@@ -28,6 +28,9 @@
 #include "core/hle/ipc.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_thread.h"
+#include "core/arm/debug.h"
 #include "core/hle/service/am/am_types.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/kernel_helpers.h"
@@ -275,6 +278,59 @@ void CountRequest(const std::string& service, u32 command, u32 type, u32 result)
     LOG_INFO(Service, "ipc summary ({} kinds){}", lines.size(), text);
     counts.clear();
 }
+
+// EDEN_NX2_THREAD_DUMP=<seconds>: every that many seconds (min 10), log every guest thread of the
+// application: state, wait reason, priority, core, pc/lr/sp, x0-x3 (a blocked SVC's arguments; the
+// value at x0 for an address wait) and its frame-pointer backtrace with module offsets. Finds what
+// a game that keeps presenting but never leaves a loading screen waits for. Diagnostics only.
+void DumpGuestThreads(Core::System& system) {
+    static const long period = [] {
+        const char* v = std::getenv("EDEN_NX2_THREAD_DUMP");
+        return v ? std::max(10L, std::strtol(v, nullptr, 10)) : 0L;
+    }();
+    if (period == 0) {
+        return;
+    }
+    static std::mutex mutex;
+    static auto last = std::chrono::steady_clock::now();
+    std::unique_lock lock{mutex, std::try_to_lock};
+    if (!lock.owns_lock()) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds{period}) {
+        return;
+    }
+    last = now;
+    Kernel::KProcess* const process = system.ApplicationProcess();
+    if (process == nullptr) {
+        return;
+    }
+    auto& memory = process->GetMemory();
+    size_t index = 0;
+    for (auto& thread : process->GetThreadList()) {
+        const auto& ctx = thread.GetContext();
+        std::string arg0;
+        if (ctx.r[0] != 0 && (ctx.r[0] % 4) == 0 && memory.IsValidVirtualAddressRange(ctx.r[0], 8)) {
+            arg0 = fmt::format(" [x0]={:#x}", memory.Read64(ctx.r[0]));
+        }
+        std::string frames;
+        for (const auto& entry : Core::GetBacktraceFromContext(process, ctx)) {
+            if (entry.module.empty()) {
+                frames += fmt::format(" {:#x}", entry.original_address);
+            } else {
+                frames += fmt::format(" {}+{:#x}{}{}", entry.module, entry.offset,
+                                      entry.name.empty() ? "" : ":", entry.name);
+            }
+        }
+        LOG_INFO(Kernel, "EDEN_THREAD_DUMP #{} tid {} state {:#x} wait {} prio {} core {} pc {:#x} "
+                 "lr {:#x} sp {:#x} x0 {:#x} x1 {:#x} x2 {:#x} x3 {:#x}{} |{}",
+                 index++, thread.GetThreadId(), static_cast<u32>(thread.GetState()),
+                 static_cast<u32>(thread.GetWaitReasonForDebugging()), thread.GetPriority(),
+                 thread.GetActiveCore(), ctx.pc, ctx.lr, ctx.sp, ctx.r[0], ctx.r[1], ctx.r[2],
+                 ctx.r[3], arg0, frames);
+    }
+}
 } // Anonymous namespace
 
 Result ServiceFrameworkBase::HandleSyncRequest(Kernel::KServerSession& session,
@@ -295,6 +351,7 @@ Result ServiceFrameworkBase::HandleSyncRequest(Kernel::KServerSession& session,
             }
         }
         CountRequest(service_name, ctx.GetCommand(), type, result_word);
+        DumpGuestThreads(system);
     };
 
     Result result = ResultSuccess;
