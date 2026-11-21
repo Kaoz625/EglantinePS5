@@ -172,6 +172,11 @@ constexpr std::size_t MaxSpillDecoders = 2;
 /// Members from this size on are kept decoded in the cache directory, named after their SHA-256,
 /// and read from there by later launches instead of being decoded again.
 constexpr u64 PersistMinBytes = 4 * 1024 * 1024;
+/// What a member read from its kept file is charged against the memory cap: its open file only.
+/// Loading kept members whole made Hyrule Warriors: Age of Imprisonment's loads thrash on the
+/// PS5: its 25-257 MiB members evicted each other from the 512 MiB cache, so a 16 KiB read
+/// re-read a whole member from the drive (0.25-2.8 s each, the load never finished).
+constexpr std::size_t FileBackedCharge = 64 * 1024;
 
 std::string Hex(const std::array<u8, 0x20>& bytes) {
     std::string text;
@@ -226,6 +231,9 @@ struct NupMember {
     std::mutex file_mutex;
     std::filesystem::path path;
     Common::FS::IOFile file;
+    // A member up to half the cache cap that an earlier launch kept: read from its kept file
+    // like a spilled one instead of being loaded whole into memory.
+    std::atomic<bool> file_backed{};
     // SHA-256 of the spilled output so far, from its first byte.
     std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> hash{nullptr, &EVP_MD_CTX_free};
 };
@@ -314,6 +322,18 @@ struct NupDecompressCache {
         it->second->charge -= DecoderCharge;
         bytes -= DecoderCharge;
     }
+
+    /// Charges a member read from its kept file FileBackedCharge instead of its size.
+    void ChargeFileBacked(std::size_t file_index, const NupMember& member) {
+        std::scoped_lock lock{mutex};
+        const auto it = index.find(file_index);
+        if (it == index.end() || it->second->member.get() != &member) {
+            return;
+        }
+        bytes -= it->second->charge;
+        it->second->charge = FileBackedCharge;
+        bytes += FileBackedCharge;
+    }
 };
 
 namespace {
@@ -371,7 +391,7 @@ public:
                 return 0;
             }
         }
-        if (!spilled) {
+        if (!spilled && !member->file_backed.load(std::memory_order_acquire)) {
             std::memcpy(data, member->data.get() + offset, length);
             return length;
         }
@@ -579,19 +599,16 @@ private:
                 return false;
             }
         } else {
-            Common::FS::IOFile file{kept, Common::FS::FileAccessMode::Read};
-            if (!file.IsOpen()) {
+            std::scoped_lock file_lock{member.file_mutex};
+            member.file.Open(kept, Common::FS::FileAccessMode::Read);
+            if (!member.file.IsOpen()) {
                 return false;
             }
-            member.data =
-                std::make_unique_for_overwrite<u8[]>(static_cast<std::size_t>(uncompressed_size));
-            if (file.ReadSpan(std::span{member.data.get(),
-                                        static_cast<std::size_t>(uncompressed_size)}) !=
-                uncompressed_size) {
-                member.data.reset();
-                return false;
-            }
+            member.file_backed.store(true, std::memory_order_release);
+            cache->ChargeFileBacked(cache_index, member);
         }
+        LOG_DEBUG(Loader, "NUP member {} ({} KiB) served from its kept copy", name,
+                  uncompressed_size / 1024);
         member.decoded.store(uncompressed_size, std::memory_order_release);
         return true;
     }

@@ -30,6 +30,7 @@
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
+#include "core/arm/debug.h"
 #include "core/hle/service/am/am_types.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/kernel_helpers.h"
