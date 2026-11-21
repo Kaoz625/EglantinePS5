@@ -1252,9 +1252,12 @@ static void eden_heap_release(void *address) {
 /* A cached block for bytes (0 < bytes <= 16 * (EDEN_TCACHE_BINS - 1)), charged as allocated. */
 static void *eden_tcache_take(size_t bytes, int scratch) {
   const size_t bin = (bytes + 15) >> 4;
-  if (bytes == 0 || bin >= EDEN_TCACHE_BINS)
+  /* Scratch blocks are never cached: a cached block counts as live in its arena, and the threads'
+   * caches (up to 64 blocks a size) kept 191 scratch arenas from emptying (H14-kb1, Kirby: 8 MiB
+   * live in 382 MiB of scratch arenas). */
+  if (bytes == 0 || bin >= EDEN_TCACHE_BINS || scratch)
     return NULL;
-  struct eden_heap_thread *self = eden_heap_self_kind(scratch);
+  struct eden_heap_thread *self = eden_heap_self();
   if (self == NULL || self->bins[bin] == NULL)
     return NULL;
   void *block = self->bins[bin];
@@ -1269,11 +1272,9 @@ static int eden_tcache_keep(void *address, size_t usable) {
   const size_t bin = usable >> 4;
   if (bin == 0 || bin >= EDEN_TCACHE_BINS)
     return 0;
-  struct eden_heap_thread *self;
   if (eden_heap_block_scratch(address))
-    self = eden_heap_scratch_key_valid ? pthread_getspecific(eden_heap_scratch_key) : NULL;
-  else
-    self = eden_heap_self();
+    return 0; /* straight back to its arena (eden_tcache_take) */
+  struct eden_heap_thread *self = eden_heap_self();
   if (self == NULL || self->counts[bin] >= EDEN_TCACHE_LIMIT)
     return 0;
   ((void **)address)[0] = self->bins[bin];
