@@ -563,6 +563,10 @@ static std::atomic<unsigned long long> largest_free_block{0};
 extern "C" unsigned long long eden_radv_private_radv_ps5_allocated_bytes __attribute__((weak));
 // Who holds the pool, against what the system says is taken (src/direct_memory.c).
 extern "C" void eden_direct_census(FILE* out, const char* why) __attribute__((weak));
+// RADV's live buffers by priority (tools/patch-radv-memory-report.py; prints with
+// RADV_PS5_MEMORY_REPORT=1, at most every 10 s). RADV calls it only from the budget query, which
+// Eden makes once, so the summary calls it too.
+extern "C" void eden_radv_private_radv_ps5_memory_report(std::uint64_t, std::uint64_t, std::uint64_t) __attribute__((weak));
 static void RefreshFreeMemory() {
 #if defined(PS5_NATIVE) || defined(__linux__)
     Eden::HangStacks::Beat();
@@ -599,6 +603,10 @@ static void RefreshFreeMemory() {
                      guest_held >> 20, guest_span >> 20);
         ReportHeap("every 20 s");
         if (eden_direct_census) eden_direct_census(stderr, view.short_memory ? "short" : "every 10 s");
+        if (eden_radv_private_radv_ps5_memory_report && &eden_radv_private_radv_ps5_allocated_bytes != nullptr)
+            eden_radv_private_radv_ps5_memory_report(
+                static_cast<std::uint64_t>(total > 0 ? total : 0), largest,
+                __atomic_load_n(&eden_radv_private_radv_ps5_allocated_bytes, __ATOMIC_RELAXED));
         ReportFileHandles();
         ::Kernel::Svc::MemoryStats::Report(stderr);
         if (const auto pools = guest_pool_report.load(std::memory_order_relaxed)) pools();
