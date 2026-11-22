@@ -1621,7 +1621,20 @@ void TextureCache<P>::TickFrame() {
         {
             u64 astc_bc{}, astc_rgba{}, gpu_rt{}, bcn{}, other{}, costly{}, decoding{};
             size_t n_astc_bc{}, n_astc_rgba{}, n_rt{};
+            // H29: memory bound to the layers of sparse layered images (an Unbacked image has no
+            // other; MKW's ~1.75 GB of driver memory at its race load was not in this census).
+            u64 sparse_bound{}, sparse_bound_unbacked{};
+            size_t n_sparse{};
             for (const auto [image_id, image] : slot_images) {
+                if constexpr (requires(const Image& i) { i.SparseBoundBytes(); }) {
+                    if (const u64 bound = image->SparseBoundBytes(); bound != 0) {
+                        sparse_bound += bound;
+                        ++n_sparse;
+                        if (True(image->flags & ImageFlagBits::Unbacked)) {
+                            sparse_bound_unbacked += bound;
+                        }
+                    }
+                }
                 if (True(image->flags & ImageFlagBits::Unbacked)) {
                     continue;
                 }
@@ -1667,11 +1680,13 @@ void TextureCache<P>::TickFrame() {
             LOG_INFO(HW_GPU,
                      "Memory census: host {} MiB = ASTC as BC {} MiB ({}), ASTC as RGBA8 {} MiB ({}), "
                      "GPU-written {} MiB ({}), BCn {} MiB, other {} MiB; costly {} MiB, decoding {} "
-                     "MiB; unused 1 s {} MiB, 10 s {} MiB, 60 s {} MiB; fps-window 1 s = {} frames",
+                     "MiB; unused 1 s {} MiB, 10 s {} MiB, 60 s {} MiB; fps-window 1 s = {} frames; "
+                     "sparse-bound {} MiB in {} images ({} MiB of unbacked ones)",
                      (astc_bc + astc_rgba + gpu_rt + bcn + other) >> 20, astc_bc >> 20, n_astc_bc,
                      astc_rgba >> 20, n_astc_rgba, gpu_rt >> 20, n_rt, bcn >> 20, other >> 20,
                      costly >> 20, decoding >> 20, older[0] >> 20, older[1] >> 20, older[2] >> 20,
-                     FramesWithin(std::chrono::seconds{1}));
+                     FramesWithin(std::chrono::seconds{1}), sparse_bound >> 20, n_sparse,
+                     sparse_bound_unbacked >> 20);
         }
         if constexpr (requires { runtime.LogMemoryTrace(); }) {
             runtime.LogMemoryTrace();
