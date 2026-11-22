@@ -77,6 +77,11 @@ public:
     /// code only when a later boot load does
     void KeepStalePrograms();
 
+    /// Gives back the boot table of programs (their native and lowered code); later lookups miss
+    /// and lower again. FindProgram calls it once when the pool shared with the GPU is critical
+    /// on the PS5 (EDEN_PROGRAM_TABLE_DROP=0: never). Returns the programs dropped.
+    size_t DropLoadedPrograms(const char* why);
+
 private:
     /// A record of this build's lowering, its code moved out into `code`
     struct LoadedProgram {
@@ -93,8 +98,11 @@ private:
     std::mutex mutex;
     std::unordered_map<u64, u64> programs; ///< Record key -> lowering stamp
     bool keep_stale{};                     ///< Under mutex
-    /// Written by LoadPrograms only before `loaded_ready` is set, then never changed
-    std::unordered_map<u64, LoadedProgram> loaded;
+    using LoadedTable = std::unordered_map<u64, LoadedProgram>;
+    /// Set by LoadPrograms, then never changed until DropLoadedPrograms empties it (under
+    /// loaded_mutex: a lookup copies the pointer, so a table being dropped stays valid for it)
+    std::shared_ptr<const LoadedTable> loaded;
+    std::mutex loaded_mutex;
     std::atomic<bool> loaded_ready{};
     std::array<ProgramCounts, static_cast<size_t>(ProgramLookup::Count)> counts;
     CacheWriter writer;

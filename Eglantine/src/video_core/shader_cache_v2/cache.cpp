@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "common/assert.h"
@@ -11,9 +13,29 @@
 #include "video_core/shader_cache_v2/cache.h"
 #include "video_core/shader_cache_v2/cache_format.h"
 #include "video_core/shader_cache_v2/records.h"
+#include "performance.h"
 
 namespace VideoCommon::ShaderCacheV2 {
 namespace {
+
+/// PS5: the boot table of programs (Kirby Air Riders: ~4,100 programs, 276 MiB of native and
+/// lowered code, 21 Nov 2026 EDEN_HEAP_SITE) is given back the first time a lookup finds the pool
+/// shared with the GPU critical, which is where that game ran out of memory and closed.
+/// EDEN_PROGRAM_TABLE_DROP=0: kept for the whole session, as before.
+void MaybeDropForPool(Cache& cache) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_PROGRAM_TABLE_DROP");
+        return value == nullptr || value[0] != '0';
+    }();
+    static std::atomic<bool> dropped{false};
+    if (!enabled || dropped.load(std::memory_order_relaxed) ||
+        !::Eden::Performance::GraphicsMemoryIsCritical()) {
+        return;
+    }
+    if (!dropped.exchange(true)) {
+        cache.DropLoadedPrograms("the pool is critical");
+    }
+}
 
 /// Whether a record holds these inputs: a key that matches by chance never gives another
 /// program's code
@@ -88,16 +110,49 @@ void Cache::LoadPrograms(std::span<const LogRecord> live) {
         std::shared_ptr<const LoweredNativeCode> code = TakeProgramCode(*record);
         table.insert_or_assign(entry.key, LoadedProgram{std::move(*record), std::move(code)});
     }
-    loaded = std::move(table);
+    {
+        std::scoped_lock lock{loaded_mutex};
+        loaded = std::make_shared<const LoadedTable>(std::move(table));
+    }
     loaded_ready.store(true, std::memory_order_release);
+}
+
+size_t Cache::DropLoadedPrograms(const char* why) {
+    std::shared_ptr<const LoadedTable> table;
+    {
+        std::scoped_lock lock{loaded_mutex};
+        table = std::move(loaded);
+        loaded.reset();
+    }
+    if (!table) {
+        return 0;
+    }
+    size_t bytes = 0;
+    for (const auto& [key, program] : *table) {
+        bytes += program.record.native.size() * sizeof(program.record.native[0]);
+        if (program.code) {
+            bytes += program.code->code.size() * sizeof(program.code->code[0]);
+        }
+    }
+    std::fprintf(stderr, "EDEN_PROGRAM_TABLE dropped %zu programs (~%zu MiB native+lowered) because %s\n",
+                 table->size(), bytes >> 20, why);
+    return table->size();
 }
 
 FoundProgram Cache::FindProgram(const ProgramKeyInputs& inputs) {
     const u64 key = ProgramKey(inputs);
     if (loaded_ready.load(std::memory_order_acquire)) {
-        if (const auto it = loaded.find(key);
-            it != loaded.end() && HoldsInputs(it->second.record, inputs)) {
-            return {ProgramLookup::Hit, it->second.code};
+        MaybeDropForPool(*this);
+        std::shared_ptr<const LoadedTable> table;
+        {
+            std::scoped_lock lock{loaded_mutex};
+            table = loaded;
+        }
+        if (table) {
+            if (const auto it = table->find(key);
+                it != table->end() && HoldsInputs(it->second.record, inputs)) {
+                return {ProgramLookup::Hit, it->second.code};
+            }
         }
     }
     std::scoped_lock lock{mutex};
