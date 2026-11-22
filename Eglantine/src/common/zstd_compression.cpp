@@ -24,8 +24,16 @@ std::vector<u8> CompressDataZSTD(const u8* source, std::size_t source_size, s32 
         return {};
     }
 
+    // resize() keeps the capacity (ZSTD_compressBound: a bit more than the input), so a kept
+    // result held the whole uncompressed size. The compute pipelines' kept SPIR-V
+    // (vk_pipeline_cache.cpp EmitComputeModule) did: Kirby Air Riders on PS5 held 551 MiB in
+    // 1536 such blocks of ~367 KiB when the pool shared with the GPU ran out (21 Nov 2026,
+    // EDEN_HEAP_SITE). A copy of exactly the compressed size is returned instead.
+    if (compressed.capacity() > compressed_size) {
+        return std::vector<u8>(compressed.begin(),
+                               compressed.begin() + static_cast<std::ptrdiff_t>(compressed_size));
+    }
     compressed.resize(compressed_size);
-
     return compressed;
 }
 
