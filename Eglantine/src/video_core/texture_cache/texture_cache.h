@@ -274,7 +274,8 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     };
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode, &CanEvict,
                           &evict_bad_overlaps, &keep, &keep_ticks, out_of_memory,
-                          &overlap_downloads, download_overlaps, async_downloads](ImageId image_id) {
+                          &overlap_downloads, download_overlaps, async_downloads,
+                          memory_short](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
         }
