@@ -60,12 +60,12 @@ const char* KindName(HangWorkKind kind) {
 // One line to the log file and, on the console, straight to klog: the log thread's buffer can be
 // lost when the system ends the app.
 void Say(const char* line) {
-    std::fputs(line, stderr);
 #if defined(__PROSPERO__)
     if (sceKernelDebugOutText != nullptr) {
         sceKernelDebugOutText(0, line);
     }
 #endif
+    std::fputs(line, stderr);
 }
 
 } // namespace
@@ -178,23 +178,43 @@ void GpuHangWatch::NoteSubmitted(u64 tick) noexcept {
 }
 
 void GpuHangWatch::Watch(std::stop_token token) {
+    // With markers the watch reads only the marker words: no driver call and no lock, since the
+    // submitting thread can sit inside the driver behind the stuck work (21 Nov: every other log
+    // line of the app stopped the moment the GPU hung). Without markers it falls back to the
+    // timeline and only reports.
     using Clock = std::chrono::steady_clock;
     u64 last_gpu = 0;
+    u32 last_finished = 0;
     auto progress = Clock::now();
+    auto last_look = progress;
     bool reported = false;
     while (!token.stop_requested()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        const u64 submitted = submitted_tick.load(std::memory_order_acquire);
-        try {
-            master_semaphore.Refresh();
-        } catch (...) {
-            return; // device lost: reported elsewhere
-        }
-        const u64 gpu = master_semaphore.KnownGpuTick();
         const auto now = Clock::now();
-        if (gpu >= submitted || gpu != last_gpu) {
-            // Idle, or the GPU finished something since the last look.
+        // A look long after the one before: this thread did not run (the app was suspended).
+        // The clock starts again, so the gap is not counted as a stall.
+        const bool resumed = now - last_look > std::chrono::milliseconds(1000);
+        last_look = now;
+        const u64 submitted = submitted_tick.load(std::memory_order_acquire);
+        bool moving;
+        u64 gpu = master_semaphore.KnownGpuTick();
+        if (markers != nullptr) {
+            const u32 reached = markers[0];
+            const u32 finished = markers[1];
+            // Nothing in flight (idle, or waiting before the next work), or work finished.
+            moving = reached == finished || finished != last_finished;
+            last_finished = finished;
+        } else {
+            try {
+                master_semaphore.Refresh();
+            } catch (...) {
+                return; // device lost: reported elsewhere
+            }
+            gpu = master_semaphore.KnownGpuTick();
+            moving = gpu >= submitted || gpu != last_gpu;
             last_gpu = gpu;
+        }
+        if (moving || resumed) {
             progress = now;
             reported = false;
             continue;
@@ -206,17 +226,12 @@ void GpuHangWatch::Watch(std::stop_token token) {
         }
         reported = true;
         Report(gpu, submitted, stalled_ms);
-        // Ending the app only for a draw or dispatch the GPU started and never finished. A stall
-        // with nothing in flight (a submission waiting on a semaphore, e.g. for presentation)
-        // is only reported.
-        const bool work_stuck = markers != nullptr && markers[0] != markers[1];
-        if (exit_on_hang && work_stuck) {
-            std::fflush(stderr);
-            std::fflush(stdout);
+        // Only a draw or dispatch the GPU started and never finished ends the app; without
+        // markers the stall is only reported.
+        if (exit_on_hang && markers != nullptr) {
 #if defined(__PROSPERO__)
             if (eden_exit_app != nullptr) {
                 Say("EDEN_GPU_HANG ending the app (EDEN_GPU_HANG_EXIT=0 keeps it running)\n");
-                std::fflush(stderr);
                 eden_exit_app();
                 Say("EDEN_GPU_HANG exit was refused\n");
             }
@@ -236,7 +251,6 @@ void GpuHangWatch::Report(u64 gpu_tick, u64 submitted, u64 stalled_ms) {
     Say(line);
     if (markers == nullptr) {
         Say("EDEN_GPU_HANG markers off: no work list (EDEN_GPU_HANG_TRACE, VK_AMD_buffer_marker)\n");
-        std::fflush(stderr);
         return;
     }
     // The work around the stuck one: a few that finished, then everything the command processor
@@ -260,7 +274,6 @@ void GpuHangWatch::Report(u64 gpu_tick, u64 submitted, u64 stalled_ms) {
                       work.fragment_hash, work.size[0], work.size[1], work.size[2]);
         Say(line);
     }
-    std::fflush(stderr);
 }
 
 } // namespace Vulkan
