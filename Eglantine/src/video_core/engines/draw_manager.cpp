@@ -3,6 +3,8 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <tuple>
@@ -354,6 +356,41 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
                 ++logged;
                 LOG_ERROR(HW_GPU, "Indexed draw dropped: first={:#x} count={:#x} reach {} MiB",
                           index_buffer.first, index_buffer.count, end >> 20);
+            }
+            return;
+        }
+    }
+    // Kirby Air Riders (22 Nov 2026, PHAT5): twice, right where the pool ran short, one indexed
+    // draw went out with instances = index count + 1 (194823 x 194824, 70528 x 70529: 38e9 and
+    // 5e9 vertices). The GPU never finished it, the hang watch named it, and the system killed
+    // Shell UI. No game draws a billion vertices in one call: it is state gone wrong (the instance
+    // loop's count, DrawDeferred), and it is dropped and logged with the draw manager's state.
+    // EDEN_DRAW_MAX_MVERTICES (default 1024; 0 = no limit) sets the limit in millions.
+    if (instance_count > 1) {
+        static const u64 limit = [] {
+            const char* value = std::getenv("EDEN_DRAW_MAX_MVERTICES");
+            const long long mega = value != nullptr ? std::strtoll(value, nullptr, 10) : 1024;
+            return mega > 0 ? u64(mega) * 1000000ULL : 0ULL;
+        }();
+        const u64 elements = draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
+        if (limit != 0 && elements * instance_count > limit) [[unlikely]] {
+            static u32 logged{};
+            if (logged < 16) {
+                ++logged;
+                const auto& regs = maxwell3d.regs;
+                const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
+                const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
+                std::fprintf(stderr,
+                             "EDEN_DRAW_DROPPED elements=%llu instances=%u indexed=%d mode=%u "
+                             "loop_count=%u drawn=%u base_instance=%u first=%u topology=%u "
+                             "inline=%zu begin=%#x vs=%#llx ps=%#llx\n",
+                             (unsigned long long)elements, instance_count, int(draw_indexed),
+                             static_cast<u32>(draw_state.draw_mode), draw_state.instance_count,
+                             draw_state.drawn_instances, draw_state.base_instance,
+                             draw_indexed ? draw_state.index_buffer.first : draw_state.vertex_buffer.first,
+                             static_cast<u32>(draw_state.topology),
+                             draw_state.inline_index_draw_indexes.size(), regs.draw.begin,
+                             (unsigned long long)vs, (unsigned long long)ps);
             }
             return;
         }

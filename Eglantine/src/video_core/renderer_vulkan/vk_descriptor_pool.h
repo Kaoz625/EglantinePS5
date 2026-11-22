@@ -64,6 +64,7 @@ private:
     const Device* device{};
     DescriptorBank* bank{};
     VkDescriptorSetLayout layout{};
+    size_t batch{16}; ///< Sets per Allocate (the pool's grow step)
 
     std::vector<vk::DescriptorSets> sets;
 };

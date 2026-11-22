@@ -93,6 +93,26 @@ static std::size_t SetBytes(const DescriptorBankInfo& info) {
            96 * std::size_t(info.textures);
 }
 static std::atomic<u64> pools_made{0}, pool_bytes_made{0};
+// Kirby Air Riders (22 Nov 2026): a Switch 2 stage binds ~2,050 textures, so one set is ~197 KiB
+// (~394 KiB with two stages), and every pipeline's allocator took its sets 16 at a time: ~3-6 MiB
+// per pipeline, never given back. Descriptor pools (RADV priority 30) grew from 170 MiB to
+// 0.8-1.05 GiB while the race loaded its pipelines (256 pools, one per 16-set batch) and the app
+// ran out of memory. A set of EDEN_DESCRIPTOR_BIG_SET_KIB (default 32) or more is now taken
+// EDEN_DESCRIPTOR_BIG_SETS (default 2) at a time; a pipeline that draws more grows by that much
+// again. EDEN_DESCRIPTOR_BIG_SETS=0 (or 16): as before.
+static std::size_t BatchSets(const DescriptorBankInfo& info) {
+    static const std::size_t big_bytes = [] {
+        const char* value = std::getenv("EDEN_DESCRIPTOR_BIG_SET_KIB");
+        const long kib = value != nullptr ? std::strtol(value, nullptr, 10) : 32;
+        return std::size_t(kib > 0 ? kib : 32) << 10;
+    }();
+    static const std::size_t big_sets = [] {
+        const char* value = std::getenv("EDEN_DESCRIPTOR_BIG_SETS");
+        const long sets = value != nullptr ? std::strtol(value, nullptr, 10) : 2;
+        return sets > 0 && sets < long(SETS_GROW_RATE) ? std::size_t(sets) : SETS_GROW_RATE;
+    }();
+    return SetBytes(info) >= big_bytes ? big_sets : SETS_GROW_RATE;
+}
 #endif
 
 static void AllocatePool(const Device& device, DescriptorBank& bank) {
@@ -102,10 +122,11 @@ static void AllocatePool(const Device& device, DescriptorBank& bank) {
     const u32 device_sets = device.GetSetsPerPool();
     const std::size_t set_bytes = std::max<std::size_t>(SetBytes(bank.info), 16);
     const std::size_t budget = PoolBudgetBytes();
+    const std::size_t batch = BatchSets(bank.info);
     const u32 sets_per_pool =
         budget == 0 ? device_sets
-                    : u32(std::clamp<std::size_t>(budget / set_bytes, SETS_GROW_RATE,
-                                                  std::max<std::size_t>(device_sets, SETS_GROW_RATE)));
+                    : u32(std::clamp<std::size_t>(budget / set_bytes, batch,
+                                                  std::max<std::size_t>(device_sets, batch)));
     {
         const u64 made = pools_made.fetch_add(1, std::memory_order_relaxed) + 1;
         const u64 bytes = pool_bytes_made.fetch_add(u64(set_bytes) * sets_per_pool,
@@ -187,12 +208,24 @@ static void AllocatePool(const Device& device, DescriptorBank& bank) {
 
 DescriptorAllocator::DescriptorAllocator(const Device& device_, MasterSemaphore& master_semaphore_,
                                          DescriptorBank& bank_, VkDescriptorSetLayout layout_)
-    : ResourcePool(master_semaphore_, SETS_GROW_RATE), device{&device_}, bank{&bank_},
-      layout{layout_} {}
+    : ResourcePool(master_semaphore_,
+#if defined(__PROSPERO__) // PS5
+                   BatchSets(bank_.info)
+#else
+                   SETS_GROW_RATE
+#endif
+                   ),
+      device{&device_}, bank{&bank_}, layout{layout_},
+#if defined(__PROSPERO__) // PS5
+      batch{BatchSets(bank_.info)}
+#else
+      batch{SETS_GROW_RATE}
+#endif
+{}
 
 VkDescriptorSet DescriptorAllocator::Commit() {
     const size_t index = CommitResource();
-    return sets[index / SETS_GROW_RATE][index % SETS_GROW_RATE];
+    return sets[index / batch][index % batch];
 }
 
 void DescriptorAllocator::Allocate(size_t begin, size_t end) {
