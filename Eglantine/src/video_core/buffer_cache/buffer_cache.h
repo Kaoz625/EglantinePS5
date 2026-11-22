@@ -210,7 +210,17 @@ void BufferCache<P>::TickFrame() {
         // downloading the GPU-written ones, ~5% of the GPU thread) that were recreated later.
         // Collect when the buffers themselves are large. At 1 GiB it held geometry of scenes
         // long gone: title 1's title screen grew to ~0.9 GB of buffers in ten minutes.
-        if (buffer_bytes >= 512_MiB) {
+        // EglantinePS5 H28: while the console's pool (CPU and GPU share it) is short, buffers
+        // collect from 256 MiB on, GPU-written ones too once it is critical (Kirby Air Riders held
+        // 712 MiB of buffers when the pool had 1 MiB left). EDEN_NX2_BC_POOL_GC=0: as before.
+        static const bool pool_gc = [] {
+            const char* value = std::getenv("EDEN_NX2_BC_POOL_GC");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (pool_gc && buffer_bytes >= 256_MiB && ::Eden::Performance::GraphicsMemoryIsShort()) {
+            RunGarbageCollector(buffer_bytes >= 1_GiB ||
+                                ::Eden::Performance::GraphicsMemoryIsCritical());
+        } else if (buffer_bytes >= 512_MiB) {
             RunGarbageCollector(buffer_bytes >= 1_GiB);
         }
     } else if (total_used_memory >= minimum_memory) {
