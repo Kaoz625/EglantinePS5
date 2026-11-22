@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <unordered_set>
 #include "performance.h"
 #include "dev_vulkan.h"
@@ -474,14 +475,33 @@ std::vector<u32> EmitStageSpirv(const Device& device, const Shader::Profile& pro
     return code;
 }
 
-/// Also keeps the SPIR-V, compressed, for frame dumps.
+/// Compute SPIR-V is kept (compressed) only for frame dumps: nothing else reads it. Kirby Air
+/// Riders builds ~6,500 compute pipelines and their kept SPIR-V held 269 MiB of the heap at its
+/// out-of-memory point (EDEN_HEAP_SITE, H28). It is kept when EDEN_NX2_FRAME_DUMP is set, or with
+/// EDEN_KEEP_COMPUTE_SPIRV=1 (the old behaviour).
+bool KeepComputeSpirv() {
+    static const bool keep = [] {
+        if (std::getenv("EDEN_NX2_FRAME_DUMP") != nullptr) {
+            return true;
+        }
+        const char* const value = std::getenv("EDEN_KEEP_COMPUTE_SPIRV");
+        return value != nullptr && value[0] == '1';
+    }();
+    return keep;
+}
+
+/// Also keeps the SPIR-V, compressed, for frame dumps (KeepComputeSpirv).
 vk::ShaderModule EmitComputeModule(const Device& device, const Shader::Profile& profile,
                                    Shader::IR::Program& program, u64 shader_hash,
                                    std::vector<u8>& kept_spirv,
                                    std::span<const u32> reference = {}) {
     const std::vector<u32> code{EmitComputeShader(profile, program, shader_hash, reference)};
-    kept_spirv = Common::Compression::CompressDataZSTD(reinterpret_cast<const u8*>(code.data()),
-                                                       code.size() * sizeof(u32), 1);
+    if (KeepComputeSpirv()) {
+        kept_spirv = Common::Compression::CompressDataZSTD(reinterpret_cast<const u8*>(code.data()),
+                                                           code.size() * sizeof(u32), 1);
+    } else {
+        kept_spirv.clear();
+    }
     device.SaveShader(code);
     vk::ShaderModule spv_module{([&] { auto cost = Eden::Performance::VulkanTimer(23); return BuildGuestShader(device, code, shader_hash); }())};
 

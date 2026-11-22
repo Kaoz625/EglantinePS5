@@ -231,8 +231,25 @@ static size_t eden_heap_range_size;
 static atomic_uint eden_heap_space_hint; /* where the last allocation from the spaces succeeded */
 static atomic_flag eden_heap_grow_lock = ATOMIC_FLAG_INIT;
 
-/* Requests of this size or more get memory of their own (eden_heap_pages), freed with them. */
-#define EDEN_HEAP_LARGE_REQUEST ((size_t)32 << 20)
+/* Requests of this size or more get memory of their own (eden_heap_pages), freed with them.
+ * EDEN_HEAP_LARGE_MIB (1-32, default 32) lowers it: a medium block that lives a short time in a
+ * space leaves a hole there, and a space goes back only when it holds no block at all (Kirby Air
+ * Riders, H28: the spaces outside the arenas held ~1.6 GB with ~0.7 GB in use at its out-of-memory
+ * point). A switch for an A/B; EDEN_HEAP_SPACES in the heap report shows how full the spaces are. */
+static size_t eden_heap_large_request_bytes;
+static size_t eden_heap_large_request(void) {
+  size_t bytes = eden_heap_large_request_bytes;
+  if (bytes == 0) {
+    const char *value = getenv("EDEN_HEAP_LARGE_MIB");
+    long mib = value != NULL ? strtol(value, NULL, 10) : 32;
+    if (mib < 1 || mib > 32)
+      mib = 32;
+    bytes = (size_t)mib << 20;
+    eden_heap_large_request_bytes = bytes;
+  }
+  return bytes;
+}
+#define EDEN_HEAP_LARGE_REQUEST (eden_heap_large_request())
 #define EDEN_HEAP_LARGE_BLOCKS 256u
 /* The large blocks alive: address 0 marks a free entry, 1 one being filled in. */
 static struct {
@@ -453,6 +470,27 @@ void eden_heap_slack(size_t *tcache, size_t *arenas, unsigned *threads_with_aren
           (scratch_live > 0 ? scratch_live : 0) >> 20, scratch_empty,
           atomic_load_explicit(&eden_heap_scratch_requests, memory_order_relaxed),
           atomic_load_explicit(&eden_heap_arenas_released, memory_order_relaxed) >> 20);
+  /* The spaces (but the first, where the arenas start) by how many blocks hold them: a space goes
+   * back only with none, so many spaces held by a few blocks = memory a few blocks keep. */
+  {
+    const unsigned spaces = atomic_load_explicit(&eden_heap_space_count, memory_order_relaxed);
+    unsigned held = 0, by[4] = {0, 0, 0, 0};
+    size_t held_bytes = 0, few_bytes = 0;
+    for (unsigned slot = 1; slot < spaces && slot < EDEN_HEAP_PIECES; ++slot) {
+      if (eden_heap_space_span[slot] == 0)
+        continue;
+      const long blocks = atomic_load_explicit(&eden_heap_space_blocks[slot], memory_order_relaxed);
+      const size_t bytes = (size_t)eden_heap_space_span[slot] << EDEN_HEAP_PIECE_SHIFT;
+      ++held;
+      held_bytes += bytes;
+      const unsigned bucket = blocks <= 0 ? 0 : blocks <= 4 ? 1 : blocks <= 64 ? 2 : 3;
+      ++by[bucket];
+      if (bucket <= 1)
+        few_bytes += bytes;
+    }
+    fprintf(stderr, "EDEN_HEAP_SPACES spaces=%u (%zu MiB) blocks: none=%u 1-4=%u 5-64=%u more=%u; held by 0-4 blocks %zu MiB; large_request=%zu MiB\n",
+            held, held_bytes >> 20, by[0], by[1], by[2], by[3], few_bytes >> 20, EDEN_HEAP_LARGE_REQUEST >> 20);
+  }
   eden_heap_arena_live = live > 0 ? (size_t)live : 0;
   eden_heap_arena_empty = empty;
   eden_heap_arena_quarter = quarter;
