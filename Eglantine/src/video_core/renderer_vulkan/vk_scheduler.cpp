@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <array>
 #include <chrono>
@@ -330,6 +331,13 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
 
     AcquireNewChunk();
     AllocateWorkerCommandBuffer();
+    if (const char* watch = std::getenv("EDEN_GPU_HANG_WATCH"); watch == nullptr || std::strcmp(watch, "0") != 0) {
+        try {
+            hang_watch = std::make_unique<GpuHangWatch>(device, *master_semaphore);
+        } catch (const std::exception& error) {
+            LOG_WARNING(Render_Vulkan, "EDEN_GPU_HANG watch unavailable: {}", error.what());
+        }
+    }
     worker_thread = std::jthread([this](std::stop_token token) { WorkerThread(token); });
 }
 
@@ -1372,6 +1380,9 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         switch (const VkResult result = master_semaphore->SubmitQueue(
                     cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
         case VK_SUCCESS:
+            if (hang_watch) {
+                hang_watch->NoteSubmitted(signal_value);
+            }
             // Log successful queue submission
             if (GPU::Logging::IsActive() &&
                 Settings::values.gpu_log_vulkan_calls.GetValue()) {

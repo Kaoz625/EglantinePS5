@@ -1780,10 +1780,12 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                     if (scheduler.GraphicsPipelineMissing()) {
                         return;
                     }
-                    cmdbuf.DrawIndirect(indirect.buffer,
-                                        indirect.offset +
-                                            Shader::Backend::SPIRV::MESH_EMULATION_DRAW_ARGS_OFFSET,
-                                        1, 0);
+                    scheduler.TraceGpuWork(cmdbuf, 0, 0, {}, [&] {
+                        cmdbuf.DrawIndirect(indirect.buffer,
+                                            indirect.offset +
+                                                Shader::Backend::SPIRV::MESH_EMULATION_DRAW_ARGS_OFFSET,
+                                            1, 0);
+                    }, HangWorkKind::DrawMesh);
                 });
                 return;
             }
@@ -1791,7 +1793,9 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                 if (scheduler.GraphicsPipelineMissing()) {
                     return;
                 }
-                cmdbuf.Draw(vertices, 1, 0, 0);
+                scheduler.TraceGpuWork(cmdbuf, 0, 0, {vertices, 1, 0},
+                                       [&] { cmdbuf.Draw(vertices, 1, 0, 0); },
+                                       HangWorkKind::DrawMesh);
             });
             return;
         }
@@ -1800,7 +1804,9 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                 if (scheduler.GraphicsPipelineMissing()) {
                     return;
                 }
-                cmdbuf.DrawMeshTasksEXT(groups, 1, 1);
+                scheduler.TraceGpuWork(cmdbuf, 0, 0, {groups, 1, 1},
+                                       [&] { cmdbuf.DrawMeshTasksEXT(groups, 1, 1); },
+                                       HangWorkKind::DrawMesh);
             });
             return;
         }
@@ -1819,7 +1825,8 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                         cmdbuf.Draw(draw_params.num_vertices, draw_params.num_instances,
                                     draw_params.base_vertex, draw_params.base_instance);
                     }
-                });
+                },
+                draw_params.is_indexed ? HangWorkKind::DrawIndexed : HangWorkKind::Draw);
         });
 
         // Log draw call
@@ -1869,12 +1876,14 @@ void RasterizerVulkan::DrawIndirect() {
         const auto& offset = indirect_buffer.second;
         if (params.is_byte_count) {
             scheduler.Record([this, buffer_obj = buffer->Handle(), offset,
-                              stride = params.stride](vk::CommandBuffer cmdbuf) {
+                              stride = params.stride, hashes = trace_draw_hashes](vk::CommandBuffer cmdbuf) {
                 if (scheduler.GraphicsPipelineMissing()) {
                     return;
                 }
-                cmdbuf.DrawIndirectByteCountEXT(1, 0, buffer_obj, offset, 0,
-                                                static_cast<u32>(stride));
+                scheduler.TraceGpuWork(cmdbuf, hashes.first, hashes.second, {}, [&] {
+                    cmdbuf.DrawIndirectByteCountEXT(1, 0, buffer_obj, offset, 0,
+                                                    static_cast<u32>(stride));
+                }, HangWorkKind::DrawByteCount);
             });
             return;
         }
@@ -1884,10 +1893,12 @@ void RasterizerVulkan::DrawIndirect() {
             const auto& offset_base = count.second;
             scheduler.Record([this, draw_buffer_obj = draw_buffer->Handle(),
                               buffer_obj = buffer->Handle(), offset_base, offset,
-                              params](vk::CommandBuffer cmdbuf) {
+                              params, hashes = trace_draw_hashes](vk::CommandBuffer cmdbuf) {
                 if (scheduler.GraphicsPipelineMissing()) {
                     return;
                 }
+                scheduler.TraceGpuWork(cmdbuf, hashes.first, hashes.second,
+                                       {static_cast<u32>(params.max_draw_counts), 0, 0}, [&] {
                 if (params.is_indexed) {
                     cmdbuf.DrawIndexedIndirectCount(
                         buffer_obj, offset, draw_buffer_obj, offset_base,
@@ -1897,6 +1908,8 @@ void RasterizerVulkan::DrawIndirect() {
                                              static_cast<u32>(params.max_draw_counts),
                                              static_cast<u32>(params.stride));
                 }
+                }, params.is_indexed ? HangWorkKind::DrawIndexedIndirectCount
+                                     : HangWorkKind::DrawIndirectCount);
             });
             return;
         }
@@ -1915,7 +1928,7 @@ void RasterizerVulkan::DrawIndirect() {
                                         static_cast<u32>(params.max_draw_counts),
                                         static_cast<u32>(params.stride));
                 }
-            });
+            }, params.is_indexed ? HangWorkKind::DrawIndexedIndirect : HangWorkKind::DrawIndirect);
         });
 
         // Log indirect draw call
@@ -2624,7 +2637,7 @@ void RasterizerVulkan::DispatchCompute() {
             }
             scheduler.TraceGpuWork(cmdbuf, pipeline->ShaderHash(), 0, {}, [&] {
                 cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
-            });
+            }, HangWorkKind::DispatchIndirect);
             if (byte_addressed_shadow) {
                 TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, true);
             }
@@ -2660,7 +2673,7 @@ void RasterizerVulkan::DispatchCompute() {
             if (::Eden::DevVulkan::compute_barriers)
                 cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, COMPUTE_CONSUMER_STAGES, 0,
                                        COMPUTE_WRITE_BARRIER);
-            });
+            }, HangWorkKind::DispatchIndirect);
         });
         {
             VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::ComputeDownloads};
@@ -2719,7 +2732,8 @@ void RasterizerVulkan::DispatchCompute() {
             TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, false);
         }
         scheduler.TraceGpuWork(cmdbuf, pipeline->ShaderHash(), 0, dim,
-                               [&] { cmdbuf.Dispatch(dim[0], dim[1], dim[2]); });
+                               [&] { cmdbuf.Dispatch(dim[0], dim[1], dim[2]); },
+                               HangWorkKind::Dispatch);
         if (byte_addressed_shadow) {
             TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, true);
         }

@@ -30,6 +30,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/frame_pacer.h"
+#include "video_core/renderer_vulkan/vk_hang_watch.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -104,18 +105,26 @@ public:
     void TraceComputePipeline(u64 hash);
     /// Worker thread, inside a recorded command: timestamps one draw or dispatch of a sampled
     /// submission. A draw passes its vertex and fragment hashes, a dispatch its compute hash.
+    /// Also numbers the work for the GPU hang watch (vk_hang_watch.h) when its markers are on.
     template <typename Func>
     void TraceGpuWork(vk::CommandBuffer cmdbuf, u64 hash, u64 fragment_hash,
-                      std::array<u32, 3> size, Func&& work) {
+                      std::array<u32, 3> size, Func&& work,
+                      HangWorkKind kind = HangWorkKind::Unknown) {
+        const u32 hang_number =
+            hang_watch ? hang_watch->Begin(cmdbuf, hash, fragment_hash, size, kind) : 0;
         if (!trace_gpu_recording || !trace_work_pool || trace_work_count == TraceMaxWork) {
             work();
-            return;
+        } else {
+            const u32 query = trace_work_count * 2;
+            trace_work_items[trace_work_count++] = {hash, fragment_hash, size};
+            cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_work_pool, query);
+            work();
+            cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_work_pool,
+                                  query + 1);
         }
-        const u32 query = trace_work_count * 2;
-        trace_work_items[trace_work_count++] = {hash, fragment_hash, size};
-        cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_work_pool, query);
-        work();
-        cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_work_pool, query + 1);
+        if (hang_number != 0) {
+            hang_watch->End(cmdbuf, hang_number);
+        }
     }
 
     /// Sends currently recorded work to the worker thread.
@@ -633,6 +642,9 @@ private:
     std::condition_variable drain_cv;
     unsigned drain_waiters{};
     bool worker_waiting{}; ///< The worker is waiting for work (guarded by queue_mutex)
+    /// GPU hang watch (vk_hang_watch.h); null with EDEN_GPU_HANG_WATCH=0. Declared before the
+    /// worker thread so it outlives it (the worker records through it).
+    std::unique_ptr<GpuHangWatch> hang_watch;
     std::jthread worker_thread;
 
     FramePacer frame_pacer;

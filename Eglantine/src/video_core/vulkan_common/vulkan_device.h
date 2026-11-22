@@ -99,6 +99,7 @@ VK_DEFINE_HANDLE(VmaPool)
 
 // Define miscellaneous extensions which may be used by the implementation here.
 #define FOR_EACH_VK_EXTENSION(EXTENSION)                                                           \
+    EXTENSION(AMD, BUFFER_MARKER, amd_buffer_marker)                                               \
     EXTENSION(EXT, ASTC_DECODE_MODE, astc_decode_mode)                                             \
     EXTENSION(EXT, CONDITIONAL_RENDERING, conditional_rendering)                                   \
     EXTENSION(EXT, CONSERVATIVE_RASTERIZATION, conservative_rasterization)                         \
@@ -811,6 +812,11 @@ FN_MAX_LIMIT_LIST
     }
 
     /// Returns true if the device supports VK_EXT_shader_stencil_export.
+    /// VK_AMD_buffer_marker (GPU hang watch, vk_hang_watch.h).
+    bool IsAmdBufferMarkerSupported() const {
+        return extensions.amd_buffer_marker;
+    }
+
     bool IsExtShaderStencilExportSupported() const {
         return extensions.shader_stencil_export;
     }
