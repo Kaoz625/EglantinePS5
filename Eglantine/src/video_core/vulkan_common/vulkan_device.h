@@ -782,6 +782,20 @@ FN_MAX_LIMIT_LIST
 
     /// Returns true if the device supports task and mesh shaders (VK_EXT_mesh_shader).
     bool IsExtMeshShaderSupported() const {
+#if defined(__PROSPERO__)
+        // PS5: native task/mesh draws hang the GPU (21 Nov 2026, H24 hang watch on DIGI5: Switch
+        // Sports Resort's first vkCmdDrawMeshTasksEXT never finished -> Shell UI killed, app
+        // ended with CE-108255-1; Mario Kart World the same on 15 Nov). The device is treated as
+        // having no VK_EXT_mesh_shader, so mesh pipelines take the compute mesh emulation.
+        // EDEN_PS5_NATIVE_MESH=1 uses the driver's mesh shaders again.
+        static const bool native_mesh = [] {
+            const char* value = std::getenv("EDEN_PS5_NATIVE_MESH");
+            return value != nullptr && value[0] == '1';
+        }();
+        if (!native_mesh) {
+            return false;
+        }
+#endif
         return extensions.mesh_shader && features.mesh_shader.taskShader &&
                features.mesh_shader.meshShader;
     }

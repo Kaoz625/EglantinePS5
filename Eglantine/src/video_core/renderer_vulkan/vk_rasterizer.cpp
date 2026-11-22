@@ -1776,11 +1776,12 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
             }
             if (mesh_emulation_indirect.buffer) {
                 // With a task program the distribution pass wrote the vertex count.
-                scheduler.Record([this, indirect = mesh_emulation_indirect](vk::CommandBuffer cmdbuf) {
+                scheduler.Record([this, indirect = mesh_emulation_indirect,
+                                  hashes = trace_draw_hashes](vk::CommandBuffer cmdbuf) {
                     if (scheduler.GraphicsPipelineMissing()) {
                         return;
                     }
-                    scheduler.TraceGpuWork(cmdbuf, 0, 0, {}, [&] {
+                    scheduler.TraceGpuWork(cmdbuf, hashes.first, hashes.second, {}, [&] {
                         cmdbuf.DrawIndirect(indirect.buffer,
                                             indirect.offset +
                                                 Shader::Backend::SPIRV::MESH_EMULATION_DRAW_ARGS_OFFSET,
@@ -1789,22 +1790,23 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                 });
                 return;
             }
-            scheduler.Record([this, vertices](vk::CommandBuffer cmdbuf) {
+            scheduler.Record([this, vertices, hashes = trace_draw_hashes](vk::CommandBuffer cmdbuf) {
                 if (scheduler.GraphicsPipelineMissing()) {
                     return;
                 }
-                scheduler.TraceGpuWork(cmdbuf, 0, 0, {vertices, 1, 0},
+                scheduler.TraceGpuWork(cmdbuf, hashes.first, hashes.second, {vertices, 1, 0},
                                        [&] { cmdbuf.Draw(vertices, 1, 0, 0); },
                                        HangWorkKind::DrawMesh);
             });
             return;
         }
         if (mesh_draw) {
-            scheduler.Record([this, groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
+            scheduler.Record([this, groups = draw_params.num_vertices,
+                              hashes = trace_draw_hashes](vk::CommandBuffer cmdbuf) {
                 if (scheduler.GraphicsPipelineMissing()) {
                     return;
                 }
-                scheduler.TraceGpuWork(cmdbuf, 0, 0, {groups, 1, 1},
+                scheduler.TraceGpuWork(cmdbuf, hashes.first, hashes.second, {groups, 1, 1},
                                        [&] { cmdbuf.DrawMeshTasksEXT(groups, 1, 1); },
                                        HangWorkKind::DrawMesh);
             });
