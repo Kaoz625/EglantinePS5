@@ -164,6 +164,17 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
     }
 }
 
+/// Frames the short-pool collector keeps an image used at least (EDEN_NX2_TC_SHORT_MIN, default
+/// 30): the floor under its wall-time cap (H29).
+inline u64 ShortMinAge() {
+    static const u64 frames = [] {
+        const char* value = std::getenv("EDEN_NX2_TC_SHORT_MIN");
+        const u64 parsed = value != nullptr ? std::strtoull(value, nullptr, 10) : 30ULL;
+        return parsed < 2 ? u64{2} : parsed;
+    }();
+    return frames;
+}
+
 template <class P>
 void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     const StutterTrace::SiteScope site{StutterTrace::Site::TextureCollect};
@@ -217,7 +228,13 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             const u64 age = aggressive_mode ? u64{10} : short_age;
             const u64 by_time = FramesWithin(aggressive_mode ? std::chrono::seconds{1}
                                                              : std::chrono::seconds{10});
-            ticks_to_destroy = (std::max)((std::min)(age, by_time), u64{2});
+            // H29: short (not critical), the wall-time cap stops at ShortMinAge frames. Without
+            // it the cap fed on itself: a load at 0.3 fps made "10 s" 2-3 frames, the collector
+            // took everything 2 frames left unused (Switch Sports Resort's intro, H28: 2,700
+            // images deleted, 690 downloaded, 0.4-2 fps with 0.5-1.1 GB free), the game made
+            // them again and the frame rate fell further.
+            ticks_to_destroy = (std::max)((std::min)(age, by_time),
+                                          aggressive_mode ? u64{2} : ShortMinAge());
             num_iterations = aggressive_mode ? 128 : 40;
         }
     };
@@ -474,7 +491,8 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     // While the pool is short, costly images (ASTC kept as BC3) 300 frames (at most 5 s) unused
     // go too: a course or stage left behind.
     const u64 costly_age =
-        memory_short ? (std::max)((std::min)(u64{300}, FramesWithin(std::chrono::seconds{5})), u64{2})
+        memory_short ? (std::max)((std::min)(u64{300}, FramesWithin(std::chrono::seconds{5})),
+                                  memory_critical ? u64{2} : ShortMinAge())
                      : old_age;
     if ((high_priority_mode || memory_short) && costly_age != 0 && frame_tick > costly_age) {
         evict_old_costly = true;
