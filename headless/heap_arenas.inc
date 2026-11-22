@@ -249,6 +249,14 @@ static size_t eden_heap_large_request(void) {
   }
   return bytes;
 }
+/* Set from main.cpp once env.txt is applied: the first large request comes before env.txt, so the
+ * getenv above alone always saw the default (H29b, Kirby A/B: large_request stayed 32 MiB).
+ * Switching mid-run is safe: a free or realloc finds a large block by its address, not its size. */
+void eden_heap_set_large_request_mib(int mib) {
+  if (mib < 1 || mib > 32)
+    mib = 32;
+  eden_heap_large_request_bytes = (size_t)mib << 20;
+}
 #define EDEN_HEAP_LARGE_REQUEST (eden_heap_large_request())
 #define EDEN_HEAP_LARGE_BLOCKS 256u
 /* The large blocks alive: address 0 marks a free entry, 1 one being filled in. */

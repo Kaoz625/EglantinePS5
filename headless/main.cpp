@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 extern "C" size_t eden_heap_last_failure(unsigned*, size_t*);
 extern "C" void eden_heap_set_ralloc_scratch(int) __attribute__((weak));
+extern "C" void eden_heap_set_large_request_mib(int) __attribute__((weak));
 #endif
 #ifdef EDEN_DEV_VULKAN
 #include "sdk_audit.h"
@@ -564,6 +565,12 @@ int main(int argc, char** argv) {
             scratch != nullptr && eden_heap_set_ralloc_scratch != nullptr) {
             eden_heap_set_ralloc_scratch(scratch[0] != '0');
             std::fprintf(stderr, "EDEN_HEAP_SCRATCH switch=%s (env)\n", scratch[0] != '0' ? "on" : "off");
+        }
+        // EDEN_HEAP_LARGE_MIB (1-32): size from which a request gets memory of its own; after env.txt.
+        if (const char* large = std::getenv("EDEN_HEAP_LARGE_MIB");
+            large != nullptr && eden_heap_set_large_request_mib != nullptr) {
+            eden_heap_set_large_request_mib(std::atoi(large));
+            std::fprintf(stderr, "EDEN_HEAP_LARGE switch=%d MiB (env)\n", std::atoi(large));
         }
         // The console's defaults for the core's switches (env.txt above wins). Without a fastmem
         // arena every guest read of a GPU-tracked page is a call; a Switch 2 title's reads of
