@@ -1615,6 +1615,63 @@ void TextureCache<P>::TickFrame() {
                  total_used_memory >> 20, expected_memory >> 20, critical_memory >> 20,
                  sentenced >> 20, async_decodes.size(), decode_bytes >> 20,
                  (swizzle_data_buffer.capacity() + unswizzle_data_buffer.capacity()) >> 20);
+        // H28 census: host bytes (what the images' memory really is: ASTC kept as BC3 is 4x its
+        // guest size, RGBA8 16x), by kind and by how long ago they were last used.
+        {
+            u64 astc_bc{}, astc_rgba{}, gpu_rt{}, bcn{}, other{}, costly{}, decoding{};
+            size_t n_astc_bc{}, n_astc_rgba{}, n_rt{};
+            for (const auto [image_id, image] : slot_images) {
+                if (True(image->flags & ImageFlagBits::Unbacked)) {
+                    continue;
+                }
+                const u64 bytes = ImageAllocationBytes(*image);
+                if (True(image->flags & ImageFlagBits::CostlyLoad)) {
+                    costly += bytes;
+                }
+                if (True(image->flags & ImageFlagBits::IsDecoding)) {
+                    decoding += bytes;
+                }
+                if (IsPixelFormatASTC(image->info.format)) {
+                    if (True(image->flags & ImageFlagBits::TrimmedLevels) ||
+                        Settings::GetAstcRecompression() == Settings::AstcRecompression::Uncompressed ||
+                        bytes > ImageMemoryBytes(*image) + (ImageMemoryBytes(*image) >> 1)) {
+                        astc_rgba += bytes;
+                        ++n_astc_rgba;
+                    } else {
+                        astc_bc += bytes;
+                        ++n_astc_bc;
+                    }
+                } else if (True(image->flags & ImageFlagBits::GpuModified)) {
+                    gpu_rt += bytes;
+                    ++n_rt;
+                } else if (VideoCore::Surface::IsPixelFormatBCn(image->info.format)) {
+                    bcn += bytes;
+                } else {
+                    other += bytes;
+                }
+            }
+            u64 older[3]{};
+            const std::chrono::seconds windows[3]{std::chrono::seconds{1}, std::chrono::seconds{10},
+                                                  std::chrono::seconds{60}};
+            for (int w = 0; w < 3; ++w) {
+                const u64 age = FramesWithin(windows[w]);
+                if (frame_tick <= age) {
+                    continue;
+                }
+                lru_cache.ForEachItemBelow(frame_tick - age, [&](ImageId image_id) {
+                    older[w] += ImageAllocationBytes(slot_images[image_id]);
+                    return false;
+                });
+            }
+            LOG_INFO(HW_GPU,
+                     "Memory census: host {} MiB = ASTC as BC {} MiB ({}), ASTC as RGBA8 {} MiB ({}), "
+                     "GPU-written {} MiB ({}), BCn {} MiB, other {} MiB; costly {} MiB, decoding {} "
+                     "MiB; unused 1 s {} MiB, 10 s {} MiB, 60 s {} MiB; fps-window 1 s = {} frames",
+                     (astc_bc + astc_rgba + gpu_rt + bcn + other) >> 20, astc_bc >> 20, n_astc_bc,
+                     astc_rgba >> 20, n_astc_rgba, gpu_rt >> 20, n_rt, bcn >> 20, other >> 20,
+                     costly >> 20, decoding >> 20, older[0] >> 20, older[1] >> 20, older[2] >> 20,
+                     FramesWithin(std::chrono::seconds{1}));
+        }
         if constexpr (requires { runtime.LogMemoryTrace(); }) {
             runtime.LogMemoryTrace();
         }
