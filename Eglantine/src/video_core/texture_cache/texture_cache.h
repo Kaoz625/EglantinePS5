@@ -175,6 +175,20 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     u64 mode_age = 0;
     u64 ticks_to_destroy = 0;
     size_t num_iterations = 0;
+    // EglantinePS5: the console's CPU and GPU share one pool, so the pool decides
+    // (performance.h, GraphicsMemoryIsShort / GraphicsMemoryIsCritical). These rules were edits of
+    // tools/prepare-vulkan-port.py; its lenient mode skipped them once the core's collector had
+    // drifted from their anchors, so no build since the 11 Nov fold had them: the collector saw only
+    // the budget less the largest free block, and kept everything used in the last 150 frames until
+    // under ~24 MiB were free (Kirby Air Riders: 2.3 GB of images at death; Mario Kart World 5.2 GB
+    // at its menu, where 1-2 fps made 150 frames over a minute). Ages are capped by wall time too.
+    // EDEN_NX2_TC_POOL_GC=0 restores the H27 collector.
+    static const bool pool_gc = [] {
+        const char* value = std::getenv("EDEN_NX2_TC_POOL_GC");
+        return value == nullptr || value[0] != '0';
+    }();
+    const bool memory_short = pool_gc && ::Eden::Performance::GraphicsMemoryIsShort();
+    const bool memory_critical = memory_short && ::Eden::Performance::GraphicsMemoryIsCritical();
     const auto Configure = [&](bool allow_aggressive) {
         high_priority_mode = out_of_memory || total_used_memory >= expected_memory;
         aggressive_mode =
@@ -189,6 +203,23 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         ticks_to_destroy =
             EvictionAge(mode_age, min_age, total_used_memory, retention_limit, out_of_memory);
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
+        if (memory_short) {
+            // Short: what 600 frames (at most 10 s) left unused goes; a shorter age rebuilt
+            // 1,000-2,400 textures per 600 frames in Mario Kart World's races. Critical (or an
+            // image that could not be made): what 10 frames (at most 1 s) left unused, costly
+            // images included, 128 a pass.
+            static const u64 short_age = [] {
+                const char* value = std::getenv("EDEN_NX2_TC_SHORT_AGE");
+                return value != nullptr ? std::strtoull(value, nullptr, 10) : 600ULL;
+            }();
+            high_priority_mode = true;
+            aggressive_mode = allow_aggressive && (memory_critical || out_of_memory);
+            const u64 age = aggressive_mode ? u64{10} : short_age;
+            const u64 by_time = FramesWithin(aggressive_mode ? std::chrono::seconds{1}
+                                                             : std::chrono::seconds{10});
+            ticks_to_destroy = (std::max)((std::min)(age, by_time), u64{2});
+            num_iterations = aggressive_mode ? 128 : 40;
+        }
     };
     // GPU-written images that overlap others without fitting them (BadOverlap) were dropped
     // without a download, their pages marked stale. The Duskbloods renders its characters'
@@ -357,10 +388,10 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         if (out_of_memory) {
             return false;
         }
-        if (aggressive_mode && total_used_memory < critical_memory) {
+        if (aggressive_mode && !memory_short && total_used_memory < critical_memory) {
             num_iterations >>= 2;
             aggressive_mode = false;
-        } else if (high_priority_mode && total_used_memory < expected_memory) {
+        } else if (high_priority_mode && !memory_short && total_used_memory < expected_memory) {
             num_iterations >>= 1;
             high_priority_mode = false;
         }
@@ -439,15 +470,32 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         const char* value = std::getenv("EDEN_NX2_TC_OLD_AGE");
         return value != nullptr ? std::strtoull(value, nullptr, 10) : 1800ULL;
     }();
-    if (high_priority_mode && old_age != 0 && frame_tick > old_age) {
+    // While the pool is short, costly images (ASTC kept as BC3) 300 frames (at most 5 s) unused
+    // go too: a course or stage left behind.
+    const u64 costly_age =
+        memory_short ? (std::max)((std::min)(u64{300}, FramesWithin(std::chrono::seconds{5})), u64{2})
+                     : old_age;
+    if ((high_priority_mode || memory_short) && costly_age != 0 && frame_tick > costly_age) {
         evict_old_costly = true;
-        Collect(old_age);
+        Collect(costly_age);
         evict_old_costly = false;
     }
     Collect();
-    if (out_of_memory || total_used_memory >= critical_memory) {
+    if (out_of_memory || total_used_memory >= critical_memory || memory_short) {
         Configure(true);
         Collect();
+    }
+    if (memory_short) {
+        static auto logged = std::chrono::steady_clock::time_point{};
+        if (const auto now = std::chrono::steady_clock::now(); now - logged >= std::chrono::seconds{10}) {
+            logged = now;
+            LOG_INFO(HW_GPU,
+                     "PS5 pool {}: collector age {} frames (costly {}), {} images held, {} deleted so "
+                     "far ({} costly, {} downloaded)",
+                     memory_critical ? "critical" : "short", ticks_to_destroy, costly_age,
+                     slot_images.size(), gc_deletes + gc_costly_deletes, gc_costly_deletes,
+                     gc_download_deletes);
+        }
     }
     if (!overlap_downloads.empty() && async_downloads) {
         std::stable_sort(overlap_downloads.begin(), overlap_downloads.end(),
@@ -1683,6 +1731,13 @@ void TextureCache<P>::TickFrame() {
 
     runtime.TickFrame();
     ++frame_tick;
+    {
+        const auto now = std::chrono::steady_clock::now();
+        frame_times.emplace_back(now, frame_tick);
+        while (!frame_times.empty() && now - frame_times.front().first > std::chrono::seconds{12}) {
+            frame_times.pop_front();
+        }
+    }
 
     if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
         for (auto& buffer : async_buffers_death_ring) {

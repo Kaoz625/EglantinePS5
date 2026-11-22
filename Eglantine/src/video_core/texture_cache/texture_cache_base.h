@@ -962,6 +962,20 @@ private:
 
     u64 modification_tick = 0;
     u64 frame_tick = 0;
+    /// (time, frame_tick) of the last ~12 s of frames: the collector's ages in frames capped by
+    /// wall time while the PS5 pool is short (RunGarbageCollector, FramesWithin).
+    std::deque<std::pair<std::chrono::steady_clock::time_point, u64>> frame_times;
+    /// Frames drawn within the last `window` (at least 2, so the frame in flight and the one
+    /// before it are never taken).
+    [[nodiscard]] u64 FramesWithin(std::chrono::steady_clock::duration window) const {
+        const auto since = std::chrono::steady_clock::now() - window;
+        for (const auto& [time, tick] : frame_times) {
+            if (time >= since) {
+                return (std::max)(frame_tick - (std::min)(frame_tick, tick), u64{2});
+            }
+        }
+        return 2;
+    }
 
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};
