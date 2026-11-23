@@ -637,15 +637,26 @@ Id EmitRenderArea(EmitContext& ctx) {
     }
 }
 
+namespace {
+// The guest's local memory word, or for an index outside it the spare word past its end. A
+// translated STL with a computed offset is not bounds-checked (the guest's hardware ignores such a
+// store), and scratch memory has no bounds on any of our drivers.
+Id LocalMemoryIndex(EmitContext& ctx, Id word_offset) {
+    const Id words{ctx.Const(ctx.local_memory_words)};
+    const Id inside{ctx.OpULessThan(ctx.U1, word_offset, words)};
+    return ctx.OpSelect(ctx.U32[1], inside, word_offset, words);
+}
+} // Anonymous namespace
+
 Id EmitLoadLocal(EmitContext& ctx, Id word_offset) {
-    const Id pointer{
-        ctx.OpAccessChain(ctx.private_u32, ctx.local_memory, word_offset, ctx.Const(0U))};
+    const Id pointer{ctx.OpAccessChain(ctx.private_u32, ctx.local_memory,
+                                       LocalMemoryIndex(ctx, word_offset), ctx.Const(0U))};
     return ctx.OpLoad(ctx.U32[1], pointer);
 }
 
 void EmitWriteLocal(EmitContext& ctx, Id word_offset, Id value) {
-    const Id pointer{
-        ctx.OpAccessChain(ctx.private_u32, ctx.local_memory, word_offset, ctx.Const(0U))};
+    const Id pointer{ctx.OpAccessChain(ctx.private_u32, ctx.local_memory,
+                                       LocalMemoryIndex(ctx, word_offset), ctx.Const(0U))};
     ctx.OpStore(pointer, value);
 }
 
