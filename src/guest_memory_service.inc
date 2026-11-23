@@ -899,11 +899,25 @@ std::atomic<std::uint64_t> memory_waits_won{0}, memory_waits_lost{0};
 // after 23 minutes of play, faster than the caches free at the end of each frame, and the write
 // that found no block ended the session. So the writer waits here, in its fault handler, and tries
 // again every 20 ms for up to 2 s while the caches give memory back. Only then is it refused.
+std::size_t RecoverForWriter(std::size_t bytes) noexcept;
 template <typename Promote>
 bool WaitForBlock(Promote&& promote) noexcept {
     memory_waiters.fetch_add(1, std::memory_order_acq_rel);
     bool ok = false;
-    for (unsigned tries = 0; tries < 100 && !ok; ++tries) {
+    // H36: every 100 ms the writer also packs other guest slots for itself (their blocks go to the
+    // unpack keep, which unpacking takes from). At MKW's second race load a frame took 10-34 s, the
+    // caches free at the end of a frame, and a write that waited 2 s ended the app (SIGSEGV in a
+    // CPU core, H35 J1). Up to 5 s now. EDEN_CRAM_WRITER_RECOVER=0 = H35 (2 s, no packing).
+    static const bool writer_recover = [] {
+        const char* value = std::getenv("EDEN_CRAM_WRITER_RECOVER");
+        return value == nullptr || value[0] != '0';
+    }();
+    const unsigned limit = writer_recover ? 250 : 100;
+    for (unsigned tries = 0; tries < limit && !ok; ++tries) {
+        if (writer_recover && tries % 5 == 4 && RecoverForWriter(SparseSlot * 2) != 0) {
+            ok = promote();
+            if (ok) break;
+        }
         const timespec pause{0, 20'000'000};
         nanosleep(&pause, nullptr);
         ok = promote();
@@ -2073,26 +2087,27 @@ std::size_t GiveBackIdleBlocks(std::size_t bytes) noexcept {
     return freed;
 }
 #endif
-std::size_t RecoverMemory(std::size_t bytes, bool wait) noexcept {
+std::size_t RecoverMemory(std::size_t bytes, bool wait, bool for_writer = false) noexcept {
 #ifdef PS5_NATIVE
     SparseRange* const range = service_range.load(std::memory_order_acquire);
     // Device memory no resource uses goes back first: it costs nothing later (packing makes the
     // guest fault its data back).
     std::size_t trimmed = 0;
-    if (&eden_radv_private_radv_ps5_eden_trim != nullptr)
+    // Not for a writer: it may be a GPU-side thread inside the driver (its locks held).
+    if (&eden_radv_private_radv_ps5_eden_trim != nullptr && !for_writer)
         trimmed = static_cast<std::size_t>(eden_radv_private_radv_ps5_eden_trim(bytes));
     if (trimmed >= bytes) return trimmed;
     bytes -= trimmed;
     if (range == nullptr || !PackEnabled() || pack_refused.load(std::memory_order_relaxed) || holding_pack)
-        return trimmed + GiveBackIdleBlocks(bytes);
+        return trimmed + (for_writer ? 0 : GiveBackIdleBlocks(bytes));
     std::unique_lock pack_lock{pack_mutex, std::defer_lock};
     if (wait) pack_lock.lock();
-    else if (!pack_lock.try_lock()) return trimmed + GiveBackIdleBlocks(bytes);
+    else if (!pack_lock.try_lock()) return trimmed + (for_writer ? 0 : GiveBackIdleBlocks(bytes));
     holding_pack = true;
     struct Held { ~Held() { holding_pack = false; } } held;
     if (packed_slots.load(std::memory_order_acquire) == nullptr || cold_since.empty() ||
         recover_order.capacity() < cold_since.size())
-        return trimmed + GiveBackIdleBlocks(bytes);
+        return trimmed + (for_writer ? 0 : GiveBackIdleBlocks(bytes));
     // Store blocks emptied by compaction go back first: nothing faults back for them later.
     {
         const std::size_t before = store_held.load(std::memory_order_relaxed);
@@ -2108,7 +2123,8 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait) noexcept {
     }
     const std::uint32_t now = ColdNow();
     std::size_t freed = 0;
-    recovering_for_pool = true;
+    // A writer's packed blocks go to the unpack keep (it unpacks or promotes from there).
+    recovering_for_pool = !for_writer;
     struct Recovering { ~Recovering() { recovering_for_pool = false; } } recovering;
     // H35: slots unwritten for 10 s first; then the idle blocks (unpack keep, reserve); then, for
     // a caller that waits (the driver, the JIT), slots unwritten for 3 s and at last any slot, the
@@ -2122,9 +2138,9 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait) noexcept {
     }();
     std::size_t idle = 0, deep_freed = 0;
     const std::uint32_t ages[3] = {10, 3, 0};
-    const int passes = deep && wait ? 3 : 1;
+    const int passes = deep && (wait || for_writer) ? 3 : 1;
     for (int pass = 0; pass < passes && freed < bytes; ++pass) {
-        if (pass == 1) {
+        if (pass == 1 && !for_writer) {
             idle = GiveBackIdleBlocks(bytes - freed);
             freed += idle;
             if (freed >= bytes) break;
@@ -2152,19 +2168,23 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait) noexcept {
     if (calls < 24 || calls % 64 == 0) {
         char line[192];
         const int length = std::snprintf(line, sizeof(line),
-                                         "EDEN_CRAM_PACK recover%s #%llu asked=%zuMiB packed=%zuMiB idle=%zuMiB deep=%zuMiB\n",
-                                         wait ? "" : "_try", (unsigned long long)calls, bytes >> 20,
+                                         "EDEN_CRAM_PACK recover%s%s #%llu asked=%zuMiB packed=%zuMiB idle=%zuMiB deep=%zuMiB\n",
+                                         wait ? "" : "_try", for_writer ? "_writer" : "", (unsigned long long)calls, bytes >> 20,
                                          (freed - idle) >> 20, idle >> 20, deep_freed >> 20);
         if (length > 0) Report(line);
     }
-    if (freed < bytes && passes == 1) freed += GiveBackIdleBlocks(bytes - freed);
+    if (freed < bytes && passes == 1 && !for_writer) freed += GiveBackIdleBlocks(bytes - freed);
     return trimmed + freed;
 #else
     (void)bytes;
     (void)wait;
+    (void)for_writer;
     return 0;
 #endif
 }
+// H36: a guest write that found no block (WaitForBlock); never waits for the scanner (the writer
+// holds its slot's lock, which the scanner may be spinning on).
+std::size_t RecoverForWriter(std::size_t bytes) noexcept { return RecoverMemory(bytes, false, true); }
 } // namespace
 
 // Waits for the scanner if it is packing (the driver's allocations).
