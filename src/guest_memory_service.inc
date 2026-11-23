@@ -561,13 +561,13 @@ bool PromoteShared(SparseRange& range, std::size_t slot) noexcept {
     if (last) return mprotect(reinterpret_cast<void*>(at), SparseSlot, PROT_READ | PROT_WRITE) == 0;
     std::int64_t physical = -1;
     if (eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 && !ReserveBlock(&physical)) return false;
-    void* view = reinterpret_cast<void*>(cpu_mapping_hint);
-    if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ | PROT_WRITE, 0, physical, SparseSlot) != 0) {
+    void* view = MapScratch(SparseSlot, physical, SparseSlot);
+    if (view == nullptr) {
         (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
         return false;
     }
     std::memcpy(view, reinterpret_cast<const void*>(at), SparseSlot);
-    if (munmap(view, SparseSlot) != 0) std::abort();
+    if (!UnmapScratch(view, SparseSlot)) std::abort();
     if (!MapSlot(at, PROT_READ | PROT_WRITE, physical)) {
         (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
         return false;
@@ -645,8 +645,8 @@ bool UnpackSlot(SparseRange& range, std::size_t slot) noexcept {
         return false;
     // Unpacked in a view of its own and only then mapped at the slot: mapped first, a reader that
     // had not faulted yet would see the block half unpacked.
-    void* view = reinterpret_cast<void*>(cpu_mapping_hint);
-    if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ | PROT_WRITE, 0, physical, SparseSlot) != 0) {
+    void* view = MapScratch(SparseSlot, physical, SparseSlot); // H43: a place of its own
+    if (view == nullptr) {
         (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
         return false;
     }
@@ -654,8 +654,7 @@ bool UnpackSlot(SparseRange& range, std::size_t slot) noexcept {
                                         static_cast<int>(table[slot].size), static_cast<int>(SparseSlot));
     if (out != static_cast<int>(SparseSlot)) std::abort(); // the guest's data is gone: never carry on
     if (pack_kept != nullptr && pack_kept[slot] >= 0) {
-        void* kept_view = reinterpret_cast<void*>(cpu_mapping_hint);
-        if (sceKernelMapDirectMemory(&kept_view, SparseSlot, PROT_READ, 0, pack_kept[slot], SparseSlot) == 0) {
+        if (void* kept_view = MapScratch(SparseSlot, pack_kept[slot], SparseSlot); kept_view != nullptr) {
             pack_keep_compared.fetch_add(1, std::memory_order_relaxed);
             const auto* a = static_cast<const std::uint64_t*>(view);
             const auto* b = static_cast<const std::uint64_t*>(kept_view);
@@ -670,12 +669,12 @@ bool UnpackSlot(SparseRange& range, std::size_t slot) noexcept {
                     }
                     break;
                 }
-            (void)munmap(kept_view, SparseSlot);
+            if (!UnmapScratch(kept_view, SparseSlot)) std::abort();
         }
         (void)sceKernelReleaseDirectMemory(pack_kept[slot], SparseSlot);
         pack_kept[slot] = -1;
     }
-    if (munmap(view, SparseSlot) != 0) std::abort();
+    if (!UnmapScratch(view, SparseSlot)) std::abort();
     if (!MapSlot(at, PROT_READ | PROT_WRITE, physical)) {
         (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
         return false;
@@ -718,13 +717,13 @@ bool PromoteFine(SparseRange& range, std::size_t slot) noexcept {
 #ifdef PS5_NATIVE
     std::int64_t physical = -1;
     if (eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 && !ReserveBlock(&physical)) return false;
-    void* view = reinterpret_cast<void*>(cpu_mapping_hint);
-    if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ | PROT_WRITE, 0, physical, SparseSlot) != 0) {
+    void* view = MapScratch(SparseSlot, physical, SparseSlot);
+    if (view == nullptr) {
         (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
         return false;
     }
     std::memcpy(view, reinterpret_cast<const void*>(at), SparseSlot);
-    if (munmap(view, SparseSlot) != 0) std::abort();
+    if (!UnmapScratch(view, SparseSlot)) std::abort();
     if (!MapSlot(at, PROT_READ | PROT_WRITE, physical)) {
         (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
         return false;
@@ -759,8 +758,8 @@ bool MakeFine(SparseRange& range, std::size_t slot, const bool (&zero)[FinePages
 #ifdef PS5_NATIVE
     std::int64_t compact = -1;
     if (eden_direct_low(kept * FinePage, FinePage, 12, &compact) != 0) return false;
-    void* view = reinterpret_cast<void*>(cpu_mapping_hint);
-    if (sceKernelMapDirectMemory(&view, kept * FinePage, PROT_READ | PROT_WRITE, 0, compact, FinePage) != 0) {
+    void* view = MapScratch(kept * FinePage, compact, FinePage);
+    if (view == nullptr) {
         (void)sceKernelReleaseDirectMemory(compact, kept * FinePage);
         return false;
     }
@@ -771,9 +770,10 @@ bool MakeFine(SparseRange& range, std::size_t slot, const bool (&zero)[FinePages
                         reinterpret_cast<const void*>(at + page * FinePage), FinePage);
             ++next;
         }
-    if (munmap(view, kept * FinePage) != 0) std::abort();
+    if (!UnmapScratch(view, kept * FinePage)) std::abort();
     const std::int64_t whole = range.physical[slot];
-    if (munmap(reinterpret_cast<void*>(at), SparseSlot) != 0) std::abort();
+    // H43: taken away whole by a reservation laid over it (no moment with the slot's address free).
+    if (!ReserveOver(reinterpret_cast<void*>(at), SparseSlot, SparseSlot)) std::abort();
     bool ok = true;
     next = 0;
     for (std::size_t page = 0; page < FinePages && ok;) {

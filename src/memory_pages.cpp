@@ -318,19 +318,104 @@ extern "C" int eden_direct_low(std::size_t size, std::size_t alignment, int type
 #endif
 
 #ifdef PS5_NATIVE
+// H43: no mapping of this file leaves a hole in an address range it owns, and its scratch views
+// never land in one. Mario Kart World on H41 (PHAT5) died twice (P2, Q1) with UnpackSlot's freshly
+// mapped 2 MiB view losing its pages in the middle of the unpack, both times inside a heap piece
+// given back and taken again that second (view 0x1074e00000 in piece 0x1074000000, view
+// 0x106b800000 in piece 0x106a000000): a view is mapped where the system finds room above
+// cpu_mapping_hint, and the heap gave a block back by unmapping it and only then reserving its
+// address again, so for that moment the heap's address was the first room there. The view went
+// in, and the reservation then laid over the heap's address took the view away.
+// (1) A range's own mapping goes back by a reservation laid straight over it (it replaces the
+// mapping in one step, as RADV's radv_ps5_memory_unmap_at does); only if the system refuses that,
+// unmap + reserve as before (counted: EDEN_VA_GAP lines).
+// (2) The scratch views (zeroing, unpacking, copying a slot) are mapped at fixed addresses in a
+// range of their own, reserved once (64 x 2 MiB of address space, no memory); a view that finds
+// no free place there is mapped as before (EDEN_SCRATCH_VIEW lines). EDEN_SCRATCH_VIEWS=0 = H41.
+std::atomic<std::uint32_t> va_gap_lines{0}, scratch_view_lines{0};
+bool ReserveOver(void* at, std::size_t bytes, std::size_t alignment) noexcept {
+    void* again = at;
+    if (sceKernelReserveVirtualRange(&again, bytes, MAP_FIXED, alignment) == 0 && again == at) return true;
+    if (va_gap_lines.fetch_add(1, std::memory_order_relaxed) < 16) {
+        char line[128];
+        const int n = std::snprintf(line, sizeof(line), "EDEN_VA_GAP reservation over %p (%zu B) refused: unmapped first\n", at, bytes);
+        if (n > 0) Note(line);
+    }
+    if (munmap(at, bytes) != 0) return false;
+    again = at;
+    return sceKernelReserveVirtualRange(&again, bytes, MAP_FIXED, alignment) == 0 && again == at;
+}
+constexpr std::size_t ViewSlots = 64;
+std::atomic<std::uintptr_t> view_base{0};
+std::atomic<std::uint64_t> view_used{0};
+bool ScratchViewsOn() noexcept {
+    static const bool on = [] {
+        const char* value = std::getenv("EDEN_SCRATCH_VIEWS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on;
+}
+std::uintptr_t ScratchBase() noexcept {
+    if (const std::uintptr_t base = view_base.load(std::memory_order_acquire)) return base;
+    void* address = reinterpret_cast<void*>(cpu_mapping_hint);
+    if (sceKernelReserveVirtualRange(&address, ViewSlots * SparseSlot, 0, SparseSlot) != 0) return 0;
+    std::uintptr_t expected = 0;
+    if (!view_base.compare_exchange_strong(expected, reinterpret_cast<std::uintptr_t>(address), std::memory_order_acq_rel)) {
+        (void)munmap(address, ViewSlots * SparseSlot);
+        return expected;
+    }
+    return reinterpret_cast<std::uintptr_t>(address);
+}
+// `bytes` (at most 2 MiB) of `physical`, read-write, for a moment; null when the system refuses.
+void* MapScratch(std::size_t bytes, std::int64_t physical, std::size_t alignment) noexcept {
+    if (ScratchViewsOn() && bytes <= SparseSlot) {
+        if (const std::uintptr_t base = ScratchBase()) {
+            std::uint64_t used = view_used.load(std::memory_order_relaxed);
+            while (used != ~std::uint64_t{0}) {
+                const unsigned index = static_cast<unsigned>(__builtin_ctzll(~used));
+                if (!view_used.compare_exchange_weak(used, used | (std::uint64_t{1} << index), std::memory_order_acq_rel))
+                    continue;
+                void* at = reinterpret_cast<void*>(base + index * SparseSlot);
+                if (sceKernelMapDirectMemory(&at, bytes, PROT_READ | PROT_WRITE, MAP_FIXED, physical, alignment) == 0 &&
+                    at == reinterpret_cast<void*>(base + index * SparseSlot))
+                    return at;
+                view_used.fetch_and(~(std::uint64_t{1} << index), std::memory_order_acq_rel);
+                break;
+            }
+        }
+        if (scratch_view_lines.fetch_add(1, std::memory_order_relaxed) < 16)
+            Note("EDEN_SCRATCH_VIEW no fixed place: mapped where the system finds room\n");
+    }
+    void* view = reinterpret_cast<void*>(cpu_mapping_hint);
+    if (sceKernelMapDirectMemory(&view, bytes, PROT_READ | PROT_WRITE, 0, physical, alignment) != 0) return nullptr;
+    return view;
+}
+// A view from MapScratch goes; its place stays reserved. False when the system refused.
+bool UnmapScratch(void* view, std::size_t bytes) noexcept {
+    const std::uintptr_t base = view_base.load(std::memory_order_acquire), at = reinterpret_cast<std::uintptr_t>(view);
+    if (base != 0 && at >= base && at < base + ViewSlots * SparseSlot) {
+        if (!ReserveOver(view, SparseSlot, SparseSlot)) return false;
+        view_used.fetch_and(~(std::uint64_t{1} << ((at - base) / SparseSlot)), std::memory_order_acq_rel);
+        return true;
+    }
+    return munmap(view, bytes) == 0;
+}
+#endif
+
+#ifdef PS5_NATIVE
 std::int64_t zero_block = -1;
 
 // A 2 MiB block of direct memory, zeroed through a mapping of its own that is gone again.
 bool ZeroedBlock(std::int64_t* physical) {
     if (eden_direct_low(SparseSlot, SparseSlot, 12, physical) != 0)
         return false;
-    void* view = reinterpret_cast<void*>(cpu_mapping_hint);
-    if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ | PROT_WRITE, 0, *physical, SparseSlot) != 0) {
+    void* view = MapScratch(SparseSlot, *physical, SparseSlot);
+    if (view == nullptr) {
         (void)sceKernelReleaseDirectMemory(*physical, SparseSlot);
         return false;
     }
     std::memset(view, 0, SparseSlot);
-    if (munmap(view, SparseSlot) != 0) std::abort();
+    if (!UnmapScratch(view, SparseSlot)) std::abort();
     return true;
 }
 bool MapSlot(std::uintptr_t at, int protection, std::int64_t physical) {
@@ -852,11 +937,7 @@ bool CommitMemoryRangeFrom(void* address, std::size_t size, bool high) noexcept 
         }
         if (!RecordCommitted(begin + done, block, physical)) {
             // No entry left to give it back with: unmap it now, keeping the address space.
-            if (munmap(at, block) == 0) {
-                void* again = at;
-                (void)sceKernelReserveVirtualRange(&again, block, MAP_FIXED, LargePage);
-                (void)sceKernelReleaseDirectMemory(physical, block);
-            }
+            if (ReserveOver(at, block, LargePage)) (void)sceKernelReleaseDirectMemory(physical, block);
             break;
         }
         done += block;
@@ -900,12 +981,11 @@ int DecommitMemoryRange(void* address, std::size_t size) noexcept {
         void* at = reinterpret_cast<void*>(block.address);
         // As the guest's memory gives a block back (src/host_memory.cpp): unmapped, the address
         // space reserved again at once, then the memory released.
-        if (munmap(at, block.size) != 0) {
+        // H43: the reservation replaces the mapping in one step (no moment with the address free).
+        if (!ReserveOver(at, block.size, LargePage)) {
             result = -1;
             continue;
         }
-        void* again = at;
-        if (sceKernelReserveVirtualRange(&again, block.size, MAP_FIXED, LargePage) != 0 || again != at) result = -1;
         if (sceKernelReleaseDirectMemory(block.physical, block.size) != 0) result = -1;
         covered += block.size;
         block = CommittedBlock{};
@@ -957,12 +1037,7 @@ int PageOutRange(void* address, std::size_t size) noexcept {
     }
     const std::int64_t physical = owner->physical + static_cast<std::int64_t>(left);
     void* at = address;
-    if (munmap(at, size) != 0) {
-        UnlockCommitted();
-        return 0;
-    }
-    void* again = at;
-    const bool reserved = sceKernelReserveVirtualRange(&again, size, MAP_FIXED, SmallPage) == 0 && again == at;
+    const bool reserved = ReserveOver(at, size, SmallPage); // H43: in one step
     if (!reserved || sceKernelReleaseDirectMemory(physical, size) != 0) {
         // The system kept the memory: map it back where it was, as it was.
         void* back = at;
@@ -998,11 +1073,7 @@ int PageInRange(void* address, std::size_t size) noexcept {
         return 0;
     }
     if (!RecordCommitted(begin, size, physical)) {
-        if (munmap(at, size) == 0) {
-            void* again = at;
-            (void)sceKernelReserveVirtualRange(&again, size, MAP_FIXED, SmallPage);
-            (void)sceKernelReleaseDirectMemory(physical, size);
-        }
+        if (ReserveOver(at, size, SmallPage)) (void)sceKernelReleaseDirectMemory(physical, size);
         return 0;
     }
     return 1;
