@@ -229,6 +229,15 @@ bool StoreStart() noexcept {
     for (std::size_t i = 0; i < StoreBlocks; ++i) store_physical[i] = -1;
     return true;
 }
+// A block the store holds with no data left in it, other than the current one and `except`
+// (pack_mutex held). A block's data is only released after its reader is done with it.
+std::size_t StoreEmptyHeld(std::size_t except) noexcept {
+    for (std::size_t i = 0; i < StoreBlocks; ++i)
+        if (store_physical[i] >= 0 && i != store_current && i != except &&
+            store_live[i].load(std::memory_order_acquire) == 0)
+            return i;
+    return StoreBlocks;
+}
 // Room for `size` bytes (pack_mutex held). *donate: a block the caller gives up if the pool has
 // none (-1 afterwards when it was taken).
 void* StoreAlloc(std::size_t size, std::int64_t* donate) noexcept {
@@ -237,6 +246,13 @@ void* StoreAlloc(std::size_t size, std::int64_t* donate) noexcept {
         store_used[store_current] += static_cast<std::uint32_t>(size);
         store_live[store_current].fetch_add(static_cast<std::uint32_t>(size), std::memory_order_relaxed);
         return at;
+    }
+    // An empty block the store still holds is filled again before the pool is asked for one.
+    if (const std::size_t empty = StoreEmptyHeld(StoreBlocks); empty < StoreBlocks) {
+        store_used[empty] = static_cast<std::uint32_t>(size);
+        store_live[empty].fetch_add(static_cast<std::uint32_t>(size), std::memory_order_relaxed);
+        store_current = empty;
+        return reinterpret_cast<void*>(store_base + empty * StoreBlock);
     }
     std::size_t index = 0;
     while (index < StoreBlocks && store_physical[index] >= 0) ++index;
@@ -286,6 +302,95 @@ void ForgetPacked(std::size_t slot) noexcept {
     StoreRelease(table[slot].data, table[slot].size);
     table[slot] = {};
 }
+
+// ---- Store compaction (EDEN_CRAM_STORE_COMPACT=0 turns it off) ----
+// An unpacked slot leaves a hole in its store block, and a block went back only once all of its data
+// had. Mario Kart World unpacks most of what it packs (10,902 packs, 9,088 unpacks), so its store held
+// 1,461-1,495 MiB of blocks for 762-769 MiB of packed data while the race load starved (23 Nov, PHAT5).
+// Blocks at most half full are emptied into the current block, or into a block already emptied (never
+// a new block from the pool), and StoreReclaim gives them back. A slot that is locked (being unpacked)
+// stays where it is. pack_mutex held.
+std::atomic<std::uint64_t> compact_passes{0}, compact_moved{0}, compact_moved_bytes{0}, compact_emptied{0}, compact_recovered{0};
+#ifdef PS5_NATIVE
+bool StoreCompactEnabled() noexcept {
+    static const bool on = [] {
+        const char* value = std::getenv("EDEN_CRAM_STORE_COMPACT");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on;
+}
+constexpr std::size_t CompactMinSlack = std::size_t{32} << 20, CompactMaxBytes = std::size_t{256} << 20;
+bool TryLockSlot(SparseRange& range, std::size_t slot) noexcept {
+    std::uint8_t value = range.state[slot].load(std::memory_order_relaxed);
+    return !(value & SlotLock) &&
+           range.state[slot].compare_exchange_strong(value, value | SlotLock, std::memory_order_acquire,
+                                                     std::memory_order_relaxed);
+}
+void* CompactAlloc(std::size_t size, std::size_t victim) noexcept {
+    if (store_current >= StoreBlocks || store_current == victim || store_used[store_current] + size > StoreBlock) {
+        const std::size_t empty = StoreEmptyHeld(victim);
+        if (empty == StoreBlocks) return nullptr;
+        store_used[empty] = 0;
+        store_current = empty;
+    }
+    void* at = reinterpret_cast<void*>(store_base + store_current * StoreBlock + store_used[store_current]);
+    store_used[store_current] += static_cast<std::uint32_t>(size);
+    store_live[store_current].fetch_add(static_cast<std::uint32_t>(size), std::memory_order_relaxed);
+    return at;
+}
+bool compact_tried[StoreBlocks];
+void CompactStore(SparseRange& range, std::size_t slots) noexcept {
+    PackedSlot* const table = packed_slots.load(std::memory_order_acquire);
+    if (store_base == 0 || table == nullptr || !StoreCompactEnabled()) return;
+    std::size_t live = 0;
+    for (std::size_t i = 0; i < StoreBlocks; ++i)
+        if (store_physical[i] >= 0) live += store_live[i].load(std::memory_order_relaxed);
+    if (store_held.load(std::memory_order_relaxed) < live + CompactMinSlack) return;
+    compact_passes.fetch_add(1, std::memory_order_relaxed);
+    for (std::size_t i = 0; i < StoreBlocks; ++i) compact_tried[i] = false;
+    std::size_t moved = 0;
+    while (moved < CompactMaxBytes) {
+        // The emptiest block at most half full not tried yet.
+        std::size_t victim = StoreBlocks;
+        std::uint32_t least = StoreBlock / 2 + 1;
+        for (std::size_t i = 0; i < StoreBlocks; ++i) {
+            if (store_physical[i] < 0 || i == store_current || compact_tried[i]) continue;
+            const std::uint32_t used = store_live[i].load(std::memory_order_acquire);
+            if (used != 0 && used < least) {
+                least = used;
+                victim = i;
+            }
+        }
+        if (victim == StoreBlocks) break;
+        compact_tried[victim] = true;
+        const std::uintptr_t begin = store_base + victim * StoreBlock, end = begin + StoreBlock;
+        bool full = false;
+        for (std::size_t slot = 0; slot < slots && !full; ++slot) {
+            const auto data = reinterpret_cast<std::uintptr_t>(table[slot].data); // a hint, checked locked
+            if (data < begin || data >= end || !TryLockSlot(range, slot)) continue;
+            const std::uint8_t state = SlotState(range, slot);
+            void* const old = table[slot].data;
+            const std::uint32_t size = table[slot].size;
+            if (state == SlotPacked && old == reinterpret_cast<void*>(data)) {
+                void* const to = CompactAlloc(size, victim);
+                if (to == nullptr) {
+                    full = true;
+                } else {
+                    std::memcpy(to, old, size);
+                    table[slot].data = to;
+                    StoreRelease(old, size);
+                    moved += size;
+                    compact_moved.fetch_add(1, std::memory_order_relaxed);
+                    compact_moved_bytes.fetch_add(size, std::memory_order_relaxed);
+                }
+            }
+            UnlockSlot(range, slot, state);
+        }
+        if (store_live[victim].load(std::memory_order_acquire) == 0) compact_emptied.fetch_add(1, std::memory_order_relaxed);
+        if (full) break;
+    }
+}
+#endif
 
 // Blocks packing freed, kept for unpacking (KeepForUnpack below).
 constexpr std::size_t UnpackKeepBlocks = 256;
@@ -1483,6 +1588,7 @@ void ColdPass(SparseRange& range, std::size_t slots) noexcept {
 
 void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& candidates) noexcept {
 #ifdef PS5_NATIVE
+    CompactStore(range, slots);
     StoreReclaim();
 #endif
     if (packed_slots.load(std::memory_order_acquire) == nullptr) {
@@ -1627,10 +1733,11 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         }
     }
     if (PackEnabled()) {
-        char pack_line[400];
+        char pack_line[512];
         const int pack_length = std::snprintf(pack_line, sizeof(pack_line),
             "EDEN_CRAM_PACK %s packed=%lluMiB stored=%lluMiB packs=%llu unpacks=%llu skips=%llu unpack_keep=%lluMiB"
-            " kept_compared=%llu kept_differed=%llu zero_block_dirty=%llu gpu_skips=%llu gpu_marked=%llu\n", when,
+            " kept_compared=%llu kept_differed=%llu zero_block_dirty=%llu gpu_skips=%llu gpu_marked=%llu"
+            " store_held=%lluMiB compactions=%llu moved=%llu moved_mib=%llu emptied=%llu recovered_mib=%llu\n", when,
             (unsigned long long)(packed_count.load(std::memory_order_relaxed) * (SparseSlot >> 20)),
             (unsigned long long)(packed_bytes.load(std::memory_order_relaxed) >> 20),
             (unsigned long long)packs.load(std::memory_order_relaxed), (unsigned long long)unpacks.load(std::memory_order_relaxed),
@@ -1639,7 +1746,13 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
             (unsigned long long)pack_keep_differed.load(std::memory_order_relaxed),
             (unsigned long long)zero_block_dirty.load(std::memory_order_relaxed),
             (unsigned long long)pack_gpu_skips.load(std::memory_order_relaxed),
-            (unsigned long long)pack_gpu_marked.load(std::memory_order_relaxed));
+            (unsigned long long)pack_gpu_marked.load(std::memory_order_relaxed),
+            (unsigned long long)(store_held.load(std::memory_order_relaxed) >> 20),
+            (unsigned long long)compact_passes.load(std::memory_order_relaxed),
+            (unsigned long long)compact_moved.load(std::memory_order_relaxed),
+            (unsigned long long)(compact_moved_bytes.load(std::memory_order_relaxed) >> 20),
+            (unsigned long long)compact_emptied.load(std::memory_order_relaxed),
+            (unsigned long long)(compact_recovered.load(std::memory_order_relaxed) >> 20));
         if (pack_length > 0) Report(pack_line);
         ReportUnpackers();
     }
@@ -1962,6 +2075,19 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait) noexcept {
     if (packed_slots.load(std::memory_order_acquire) == nullptr || cold_since.empty() ||
         recover_order.capacity() < cold_since.size())
         return trimmed + GiveBackIdleBlocks(bytes);
+    // Store blocks emptied by compaction go back first: nothing faults back for them later.
+    {
+        const std::size_t before = store_held.load(std::memory_order_relaxed);
+        CompactStore(*range, cold_since.size());
+        StoreReclaim();
+        const std::size_t after = store_held.load(std::memory_order_relaxed);
+        if (after < before) {
+            trimmed += before - after;
+            compact_recovered.fetch_add(before - after, std::memory_order_relaxed);
+            if (before - after >= bytes) return trimmed;
+            bytes -= before - after;
+        }
+    }
     const std::uint32_t now = ColdNow();
     recover_order.clear();
     for (std::size_t slot = 0; slot < cold_since.size(); ++slot)
