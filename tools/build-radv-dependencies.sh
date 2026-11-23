@@ -49,6 +49,7 @@ python3 "$root/tools/patch-radv-trim.py"
 python3 "$root/tools/patch-radv-gs-compute.py"
 python3 "$root/tools/patch-radv-shader-code.py"
 python3 "$root/tools/patch-radv-bo-log.py"
+python3 "$root/tools/patch-radv-preamble-wait.py"
 # ProsperoEden's patch-radv-transfer-split.py (splitting before transfers and barriers) is not
 # taken: with it, Mario Kart World hung the GPU under memory pressure (PR #77).
 bash "$vulkan/tools/build-radv.sh" release
@@ -69,3 +70,5 @@ python3 "$root/tools/patch-radv-shader-code.py" --digest \
     > "$vulkan/.deps/native/radv-release/EDEN_SHADER_CODE_SHA256"
 python3 "$root/tools/patch-radv-bo-log.py" --digest \
     > "$vulkan/.deps/native/radv-release/EDEN_BO_LOG_SHA256"
+python3 "$root/tools/patch-radv-preamble-wait.py" --digest \
+    > "$vulkan/.deps/native/radv-release/EDEN_PREAMBLE_WAIT_SHA256"

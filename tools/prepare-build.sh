@@ -99,6 +99,10 @@ if [[ -f $radv_release/lib/libvulkan_radeon.ps5.a ]]; then
         step "RADV: the buffer object address log changed"
         bash tools/build-radv-dependencies.sh
         rm -f build/radv-isolated/libvulkan_radeon.ps5.a
+    elif ! python3 -B tools/patch-radv-preamble-wait.py --check "$radv_release/EDEN_PREAMBLE_WAIT_SHA256"; then
+        step "RADV: freeing old scratch and rings after the GPU is idle changed"
+        bash tools/build-radv-dependencies.sh
+        rm -f build/radv-isolated/libvulkan_radeon.ps5.a
     elif ! python3 -B tools/patch-radv-wsi.py --check "$radv_release/EDEN_WSI_SHA256"; then
         step "RADV: the display code's adaptation changed"
         bash tools/build-radv-dependencies.sh
