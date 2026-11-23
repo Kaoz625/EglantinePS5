@@ -2719,7 +2719,26 @@ void RasterizerVulkan::DispatchCompute() {
     u32 hang_resource_count = 0;
     if (scheduler.HangResourcesOn()) {
         buffer_cache.ForEachComputeStorageForTrace(
-            [&](u64 host, u64 size, u64 guest, bool written, bool multi_range) {
+            [&](const Buffer* buffer, u64 offset, u64 size, u64 guest, bool written,
+                bool multi_range) {
+                u64 host = 0;
+                if (buffer != nullptr) {
+                    if (buffer->DeviceAddress() != 0) {
+                        host = buffer->DeviceAddress() + offset;
+                    } else if (const vk::MemoryLocation where = buffer->Location();
+                               where.memory != VK_NULL_HANDLE &&
+                               device.GetDispatchLoader().vkGetDeviceMemoryOpaqueCaptureAddress) {
+                        const VkDeviceMemoryOpaqueCaptureAddressInfo capture{
+                            .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_OPAQUE_CAPTURE_ADDRESS_INFO,
+                            .pNext = nullptr,
+                            .memory = where.memory,
+                        };
+                        const u64 base =
+                            device.GetDispatchLoader().vkGetDeviceMemoryOpaqueCaptureAddress(
+                                *device.GetLogical(), &capture);
+                        host = base != 0 ? base + where.offset + offset : 0;
+                    }
+                }
                 if (hang_resource_count < hang_resources.size()) {
                     hang_resources[hang_resource_count++] = HangResource{
                         .host = host,
