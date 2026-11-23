@@ -3960,6 +3960,12 @@ void TextureCache<P>::RefreshSparseLayers(Image& image) {
             }
         }
         image.dirty_layers.clear();
+        if constexpr (requires { &Image::BindLayerTiles; }) {
+            if (image.SparseLayersByTile()) {
+                RefreshSparseLayerTiles(image, layers);
+                return;
+            }
+        }
         const std::vector<u32> bound =
             layers.empty() ? std::vector<u32>{} : BindSparseLayers(image, layers);
         if (bound.empty()) {
@@ -3968,6 +3974,74 @@ void TextureCache<P>::RefreshSparseLayers(Image& image) {
         }
         UploadLayers(image, bound);
         runtime.InsertUploadMemoryBarrier();
+    }
+}
+
+template <class P>
+void TextureCache<P>::RefreshSparseLayerTiles(Image& image, std::span<const u32> layers) {
+    if constexpr (requires { &Image::BindLayerTiles; }) {
+        // H31: in each layer only the host sparse blocks under the guest tiles the game maps there
+        // (or the blocks written) get memory and data; the rest read as zero, like unmapped tiles.
+        ImageInfo one_layer = image.info;
+        one_layer.resources.layers = 1;
+        const u64 stride = image.info.layer_stride;
+        const s32 skip = static_cast<s32>(image.host_level_offset);
+        const s32 guest_tail = image.SparseTailLevel() + skip;
+        const u64 bound_before = ImageMemoryBytes(image);
+        size_t uploaded_layers = 0;
+        size_t uploaded_rects = 0;
+        for (const u32 layer : layers) {
+            const GPUVAddr layer_addr = image.gpu_addr + layer * stride;
+            const std::vector<std::pair<u64, u64>> ranges =
+                Tegra::Nx2SparseDataRanges(layer_addr, stride);
+            if (ranges.empty()) {
+                continue;
+            }
+            std::vector<LevelRect> guest_rects =
+                SparseTileRects(one_layer, ranges, image.SparseTileWidth(),
+                                image.SparseTileHeight(), guest_tail);
+            std::erase_if(guest_rects, [skip](const LevelRect& rect) { return rect.level < skip; });
+            if (guest_rects.empty()) {
+                continue;
+            }
+            std::vector<LevelRect> host_rects = guest_rects;
+            for (LevelRect& rect : host_rects) {
+                rect.level -= skip;
+            }
+            if (!image.BindLayerTiles(layer, host_rects)) {
+                continue;
+            }
+            const size_t bytes = UnswizzledRectsBytes(one_layer, guest_rects);
+            auto staging = runtime.UploadStagingBuffer(bytes);
+            std::vector<BufferImageCopy> copies =
+                UnswizzleImageRects(*gpu_memory, layer_addr, one_layer, guest_rects,
+                                    staging.mapped_span);
+            for (BufferImageCopy& copy : copies) {
+                copy.image_subresource.base_level -= skip;
+                copy.image_subresource.base_layer = static_cast<s32>(layer);
+            }
+            image.UploadMemory(staging, copies);
+            ++uploaded_layers;
+            uploaded_rects += guest_rects.size();
+            uploaded_bytes += bytes;
+        }
+        if (True(image.flags & ImageFlagBits::Registered)) {
+            total_used_memory += ImageMemoryBytes(image) - bound_before;
+        }
+        if (uploaded_layers == 0) {
+            runtime.TransitionImageLayout(image);
+            return;
+        }
+        ++images_uploaded;
+        runtime.InsertUploadMemoryBarrier();
+        static std::atomic<u32> logged{0};
+        if (logged++ < 64) {
+            LOG_INFO(HW_GPU,
+                     "Sparse layered image {:#x}: {} of {} asked layers loaded by block ({} rects), "
+                     "{} MiB bound now (whole layers {} KiB each)",
+                     image.gpu_addr, uploaded_layers, layers.size(), uploaded_rects,
+                     image.SparseBoundBytes() >> 20, image.SparseLayerBytes() >> 10);
+        }
     }
 }
 

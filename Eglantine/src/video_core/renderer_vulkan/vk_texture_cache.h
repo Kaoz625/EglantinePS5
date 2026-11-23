@@ -595,6 +595,16 @@ public:
     /// layers that have memory afterwards (a cap per image can leave some out).
     std::vector<u32> BindLayers(std::span<const u32> layers);
 
+    /// H31: SparseLayers arrays of plain 1x1-texel formats get memory by sparse block inside each
+    /// layer (only the blocks the game maps or writes), not whole layers.
+    bool SparseLayersByTile() const noexcept {
+        return sparse_layers.by_tile;
+    }
+
+    /// H31: gives the host sparse blocks of `layer` under `rects` (host levels; a level in the mip
+    /// tail binds the layer's tail) memory where they have none yet. False if none could be bound.
+    bool BindLayerTiles(u32 layer, std::span<const VideoCommon::LevelRect> rects);
+
     /// SparseTiles images: gives the host sparse blocks under `rects` (and the mip tail, for
     /// levels in it) device memory where they have none yet. False if that failed.
     bool BindTiles(std::span<const VideoCommon::LevelRect> rects);
@@ -622,6 +632,11 @@ public:
     /// Device memory BindLayers has bound to the image's layers (an unbacked image has no other).
     u64 SparseBoundBytes() const noexcept {
         return sparse_layers.bound_bytes;
+    }
+
+    /// SparseLayers images: device memory one whole layer takes.
+    u64 SparseLayerBytes() const noexcept {
+        return sparse_layers.layer_bytes;
     }
 
     bool IsRescaled() const noexcept;
@@ -667,6 +682,11 @@ private:
             level_tiles = std::move(other.level_tiles);
             other.level_tiles.clear();
             tail_level = other.tail_level;
+            layer_tiles = std::move(other.layer_tiles);
+            other.layer_tiles.clear();
+            layer_tails = std::move(other.layer_tails);
+            other.layer_tails.clear();
+            by_tile = other.by_tile;
             zero_block = std::exchange(other.zero_block, VK_NULL_HANDLE);
             tail_memory = std::exchange(other.tail_memory, VK_NULL_HANDLE);
             bound_bytes = other.bound_bytes;
@@ -688,6 +708,18 @@ private:
                     allocator->FreeSparseMemory(allocation);
                 }
             }
+            for (const auto& levels_of_layer : layer_tiles) {
+                for (const auto& tiles : levels_of_layer) {
+                    for (const VmaAllocation allocation : tiles) {
+                        allocator->FreeSparseMemory(allocation);
+                    }
+                }
+            }
+            for (const VmaAllocation allocation : layer_tails) {
+                allocator->FreeSparseMemory(allocation);
+            }
+            layer_tiles.clear();
+            layer_tails.clear();
             allocator->FreeSparseMemory(tail_memory);
             allocator->FreeSparseMemory(zero_block);
             zero_block = VK_NULL_HANDLE;
@@ -713,6 +745,11 @@ private:
         /// the driver can't sample unbound memory
         VmaAllocation zero_block{};
         VmaAllocation tail_memory{};             ///< The mip tail all layers share, if one
+        /// H31 (by_tile SparseLayers): per layer, per level before the mip tail, per sparse block
+        /// (rows), null until bound; empty for a layer nothing was bound to by block
+        std::vector<std::vector<std::vector<VmaAllocation>>> layer_tiles;
+        std::vector<VmaAllocation> layer_tails; ///< H31 (by_tile): per layer, its own mip tail
+        bool by_tile{};
         VkDeviceSize bound_bytes{};
         bool warned{};
     };

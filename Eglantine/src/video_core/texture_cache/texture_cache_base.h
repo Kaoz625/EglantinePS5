@@ -267,6 +267,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// Gives the written layers of a SparseLayers image memory and uploads them.
     void RefreshSparseLayers(Image& image);
 
+    /// H31: RefreshSparseLayers for arrays bound by sparse block inside each layer.
+    void RefreshSparseLayerTiles(Image& image, std::span<const u32> layers);
+
     /// Image::BindLayers, with the memory it binds counted in total_used_memory.
     std::vector<u32> BindSparseLayers(Image& image, std::span<const u32> layers);
 
