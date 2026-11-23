@@ -850,6 +850,45 @@ std::optional<u64> BufferCache<P>::FinishReadDownloads(DAddr device_addr, u64 si
         if (!tick) {
             return std::nullopt;
         }
+        // H35: the fencing thread holds a cache lock the split's back may wait for, so it waits
+        // only for submitted downloads. Unsubmitted ones are newer GPU work than what it writes;
+        // they used to land first and be overwritten: they now leave this range out.
+        if (VideoCore::AsyncReadback::t_no_submit_wait && !runtime.IsFree(*tick) &&
+            !runtime.IsSubmitted(*tick) && VideoCommon::GpuSplit::Get().Active() &&
+            !VideoCommon::GpuSplit::OnBackThread()) {
+            std::optional<u64> submitted;
+            bool past_submitted = false;
+            for (ReadDownload& download : read_downloads) {
+                const bool covers =
+                    download.write_ranges.Intersects(device_addr, size) ||
+                    (download.check && download.check->own.Intersects(device_addr, size));
+                if (!covers) {
+                    continue;
+                }
+                if (!past_submitted && runtime.IsSubmitted(download.tick)) {
+                    submitted = download.tick;
+                    continue;
+                }
+                past_submitted = true;
+                download.write_ranges.Subtract(device_addr, size);
+                if (download.check) {
+                    download.check->changed.Add(device_addr, size);
+                }
+            }
+            const u64 skips = VideoCore::AsyncReadback::g_unsubmitted_skips.fetch_add(
+                                  1, std::memory_order_relaxed) +
+                              1;
+            if ((skips & (skips - 1)) == 0) {
+                LOG_INFO(HW_GPU,
+                         "H35: popped flush over {:#x}+{:#x} left an unsubmitted read download "
+                         "out (tick {}, {} times)",
+                         device_addr, size, *tick, skips);
+            }
+            if (!submitted) {
+                return u64{0};
+            }
+            tick = submitted;
+        }
         u64 waited = 0;
         if (!runtime.IsFree(*tick)) {
             lock.unlock();

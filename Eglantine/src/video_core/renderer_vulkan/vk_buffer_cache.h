@@ -139,6 +139,11 @@ public:
 
     bool IsFree(u64 tick);
 
+    /// Whether tick has been handed to the worker for submission (Scheduler::IsSubmitted).
+    [[nodiscard]] bool IsSubmitted(u64 tick) const noexcept {
+        return tick < master_semaphore.CurrentTick();
+    }
+
     void Wait(u64 tick);
 
     /// Waits for a submitted tick without flushing: safe on threads other than the GPU thread.

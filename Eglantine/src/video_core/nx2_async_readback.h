@@ -73,6 +73,29 @@ inline thread_local bool t_reading{};
 /// The reads this thread waited for (EDEN_NX2_GUEST_THREAD_STATS tells read-backs apart by it).
 inline thread_local u64 t_reads{};
 
+/// H35: set on the fencing thread while it holds a cache lock to write popped downloads to guest
+/// memory. The split's back may be waiting for that lock (FenceManager::SignalFence ->
+/// CommitCacheFlushes), so a read download whose tick the back has not submitted yet must not be
+/// waited for there (Scheduler::WaitSubmitted has no time limit: Sonic Frontiers deadlocked
+/// ~2 min into Cyber Space 1-1). Such a download is newer GPU work than the popped flush, and
+/// before H35 it landed first and the flush overwrote it: it now leaves those bytes out instead
+/// (same guest memory afterwards), and FinishReadDownloads waits only for submitted ones.
+inline thread_local bool t_no_submit_wait{};
+/// How often that happened (logged by FinishReadDownloads, rate-limited).
+inline std::atomic<u64> g_unsubmitted_skips{};
+
+struct NoSubmitWaitScope {
+    bool previous;
+    NoSubmitWaitScope() : previous{t_no_submit_wait} {
+        t_no_submit_wait = true;
+    }
+    ~NoSubmitWaitScope() {
+        t_no_submit_wait = previous;
+    }
+    NoSubmitWaitScope(const NoSubmitWaitScope&) = delete;
+    NoSubmitWaitScope& operator=(const NoSubmitWaitScope&) = delete;
+};
+
 [[nodiscard]] inline u64 Now() {
     return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now().time_since_epoch())
