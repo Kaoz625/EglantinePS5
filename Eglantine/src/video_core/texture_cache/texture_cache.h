@@ -4041,7 +4041,14 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
                 auto layer_copies =
                     UnswizzleImage(*gpu_memory, layer_addr, layer_info, swizzle_data,
                                    staging.mapped_span.subspan(i * layer_size, layer_size));
+                const s32 skip = static_cast<s32>(image.host_level_offset);
                 for (BufferImageCopy copy : layer_copies) {
+                    // H30: a trimmed sparse layered array (see SparseLayerTrimLevels) has no host
+                    // levels below host_level_offset.
+                    if (copy.image_subresource.base_level < skip) {
+                        continue;
+                    }
+                    copy.image_subresource.base_level -= skip;
                     copy.buffer_offset += i * layer_size;
                     copy.image_subresource.base_layer = static_cast<s32>(layers[i]);
                     copies.push_back(copy);

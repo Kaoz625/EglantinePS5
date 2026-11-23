@@ -450,8 +450,46 @@ constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
 // over 1 GiB as RGBA8 (title 1's 8192x8192x68 ASTC 8x8 virtual textures are 24 GB each) keeps only
 // its mip levels from `level_offset` on, so host mip 0 is guest mip `level_offset`. Normalized
 // coordinates and derivative LOD still address it correctly; explicit LODs sample one level lower.
-[[nodiscard]] ImageInfo TrimmedHostInfo(const Device& device, const ImageInfo& info, u32& level_offset) {
+// H30: the mip levels a huge plain (not ASTC) SparseLayers array drops on the host. Mario Kart
+// World's 8192x8192x68 1-byte array is 85 MiB a layer: 4 layers filled the 341 MiB the cap allowed
+// (more layers stayed without memory) and the race load starved the pool. Without its top level a
+// layer is 21 MiB. EDEN_NX2_SPARSE_LAYER_TRIM=<levels> (0 = H29b), for layers of 64 MiB or more.
+[[nodiscard]] u32 SparseLayerTrimLevels(const Device& device, const ImageInfo& info,
+                                        GPUVAddr gpu_addr) {
+    static const u32 trim = [] {
+        const char* value = std::getenv("EDEN_NX2_SPARSE_LAYER_TRIM");
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 1U;
+    }();
+    if (trim == 0 || gpu_addr == 0 || IsPixelFormatASTC(info.format) ||
+        info.resources.levels <= 1 || !UsesSparseLayers(device, info, gpu_addr)) {
+        return 0;
+    }
+    ImageInfo one_layer = info;
+    one_layer.resources.layers = 1;
+    if (VideoCommon::CalculateGuestSizeInBytes(one_layer) < (64U << 20)) {
+        return 0;
+    }
+    return (std::min)(trim, static_cast<u32>(info.resources.levels) - 1);
+}
+
+[[nodiscard]] ImageInfo TrimmedHostInfo(const Device& device, const ImageInfo& info, u32& level_offset,
+                                        GPUVAddr gpu_addr = 0) {
     level_offset = 0;
+    if (const u32 trim = SparseLayerTrimLevels(device, info, gpu_addr); trim != 0) {
+        level_offset = trim;
+        ImageInfo host = info;
+        host.size.width = (std::max)(info.size.width >> level_offset, 1U);
+        host.size.height = (std::max)(info.size.height >> level_offset, 1U);
+        host.resources.levels -= static_cast<s32>(level_offset);
+        static std::atomic<u32> logged{0};
+        if (logged++ < 8) {
+            LOG_WARNING(Render_Vulkan,
+                        "Sparse layered {}x{}x{} image {:#x}: keeping mip levels {}+ ({}x{}) on the host",
+                        info.size.width, info.size.height, info.resources.layers, gpu_addr,
+                        level_offset, host.size.width, host.size.height);
+        }
+        return host;
+    }
     if (!WillUseAcceleratedAstcDecode(device, info) || info.type != ImageType::e2D) {
         return info;
     }
@@ -3231,7 +3269,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     : VideoCommon::ImageBase(info_, gpu_addr_, cpu_addr_), scheduler{&runtime_.scheduler},
       runtime{&runtime_},
       original_image(MakeImage(runtime_.device, runtime_.memory_allocator,
-                               TrimmedHostInfo(runtime_.device, info, host_level_offset),
+                               TrimmedHostInfo(runtime_.device, info, host_level_offset, gpu_addr_),
                                IsHugeAstcArray(runtime_.device, info) ||
                                        IsUnevenMipRgba8Astc(runtime_.device, info)
                                    ? std::span<const VkFormat>{HugeAstcViewFormats}
@@ -3251,7 +3289,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     }
     if (original_image.IsUnbacked()) {
         flags |= VideoCommon::ImageFlagBits::Unbacked;
-        const ImageInfo host_info = TrimmedHostInfo(runtime_.device, info, host_level_offset);
+        const ImageInfo host_info = TrimmedHostInfo(runtime_.device, info, host_level_offset, gpu_addr_);
         const u64 texels = u64{host_info.size.width} * host_info.size.height *
                            host_info.size.depth * static_cast<u64>(host_info.resources.layers);
         const u64 bytes =
@@ -3820,7 +3858,7 @@ bool Image::InitSparseLayers() {
     s.requirements = device.GetLogical().GetImageMemoryRequirements(handle);
     s.sparse = *it;
     u32 offset = host_level_offset;
-    const ImageInfo host = TrimmedHostInfo(device, info, offset);
+    const ImageInfo host = TrimmedHostInfo(device, info, offset, gpu_addr);
     s.width = host.size.width;
     s.height = host.size.height;
     s.levels = HostMipCount(host);

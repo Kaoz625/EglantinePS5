@@ -1126,7 +1126,13 @@ int main(int argc, char** argv) {
 #else
         Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Handheld);
 #if defined(PS5_NATIVE) && defined(EDEN_PS5_OPENGL)
-        const bool docked = Eden::LoadGameDocked(eden_game_title_id(guest));
+        bool docked = Eden::LoadGameDocked(eden_game_title_id(guest));
+        // H30: env.txt EDEN_CONSOLE_MODE=handheld|docked decides for games whose title ID the
+        // launcher can't read (packed .nup: "Console mode: Unavailable", always docked).
+        if (const char* mode = std::getenv("EDEN_CONSOLE_MODE"); mode != nullptr) {
+            if (std::strcmp(mode, "handheld") == 0) docked = false;
+            else if (std::strcmp(mode, "docked") == 0) docked = true;
+        }
         Settings::values.use_docked_mode.SetValue(docked ? Settings::ConsoleMode::Docked
                                                        : Settings::ConsoleMode::Handheld);
         Eden::Report("launch", docked ? "Console mode: Docked" : "Console mode: Handheld");
