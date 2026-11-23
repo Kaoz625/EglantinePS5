@@ -1753,10 +1753,11 @@ void TextureCache<P>::TickFrame() {
         if constexpr (requires { runtime.LogMemoryStatistics(); }) {
             runtime.LogMemoryStatistics();
         }
-        LOG_INFO(HW_GPU, "Texture cache last 600 frames: created {} images, deleted {} (collector {}, {} costly, {} downloaded), {} async decodes, ASTC {} opaque / {} alpha",
+        LOG_INFO(HW_GPU, "Texture cache last 600 frames: created {} images, deleted {} (collector {}, {} costly, {} downloaded), {} async decodes, ASTC {} opaque / {} alpha / {} unknown, {} BC1 uploads with alpha",
                  images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
                  gc_download_deletes,
-                 async_decodes_queued, astc_opaque_images, astc_alpha_images);
+                 async_decodes_queued, astc_opaque_images, astc_alpha_images, astc_unknown_images,
+                 astc_opaque_mismatches);
         LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
         LOG_INFO(HW_GPU,
@@ -1766,7 +1767,7 @@ void TextureCache<P>::TickFrame() {
                  (stale_pages.Count() << StalePages::PAGE_BITS) >> 20);
         tc_stale_skips = tc_stale_skip_bytes = tc_stale_gpu_written = 0;
         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
-        astc_opaque_images = astc_alpha_images = 0;
+        astc_opaque_images = astc_alpha_images = astc_unknown_images = astc_opaque_mismatches = 0;
         std::vector<std::pair<u32, u64>> shapes;
         for (const auto& [key, value] : created_shapes) shapes.emplace_back(value.first, key);
         std::sort(shapes.rbegin(), shapes.rend());
@@ -4109,9 +4110,38 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         upload_trace.prefault_ms =
             std::chrono::duration<double, std::milli>(read_begin - prefault_begin).count();
     }
+    // H35k: a BC1 (scanned opaque) ASTC image whose uploaded data has alpha was scanned before
+    // its data was there; BC1 drops that alpha and blackens texels under 0.5. Counted and logged.
+    // Off by default (a second scan per upload); EDEN_NX2_ASTC_UPLOAD_CHECK=1 turns it on.
+    static const bool check_uploads = [] {
+        const char* value = std::getenv("EDEN_NX2_ASTC_UPLOAD_CHECK");
+        return value != nullptr && value[0] == '1';
+    }();
+    const auto check_opaque_upload = [&](std::span<const u8> data) {
+        if (!check_uploads || !image.info.astc_opaque || !IsPixelFormatASTC(image.info.format) ||
+            data.size() > 64_MiB) {
+            return;
+        }
+        if (AstcDataOpacity(data) != 1) {
+            return;
+        }
+        ++astc_opaque_mismatches;
+        static u32 logged{};
+        if (logged < 32) {
+            ++logged;
+            LOG_WARNING(HW_GPU,
+                        "H35k: BC1 ASTC image {:#x} {}x{} levels {} format {} uploads data with "
+                        "alpha (scanned opaque at creation)",
+                        gpu_addr, image.info.size.width, image.info.size.height,
+                        image.info.resources.levels, static_cast<u32>(image.info.format));
+        }
+    };
     if (True(image.flags & ImageFlagBits::AcceleratedUpload)) {
         gpu_memory->ReadBlock(gpu_addr, mapped_span.data(), mapped_span.size_bytes(),
                               VideoCommon::CacheType::NoTextureCache);
+        check_opaque_upload(std::span<const u8>{mapped_span.data(),
+                                                (std::min)(mapped_span.size_bytes(),
+                                                           static_cast<size_t>(image.guest_size_bytes))});
         const auto uploads = FullUploadSwizzles(image.info);
         runtime.AccelerateImageUpload(image, staging, uploads, 0, 0);
         return;
@@ -4125,6 +4155,7 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         gpu_memory->ReadBlockUnsafe(gpu_addr, swizzle_data_buffer.data(), image.guest_size_bytes);
         swizzle_data = {swizzle_data_buffer.data(), swizzle_data_buffer.size()};
     }
+    check_opaque_upload(swizzle_data);
     const auto untile_begin = tc_trace ? TraceClock::now() : TraceClock::time_point{};
     const auto trace_untile = [&] {
         if (tc_trace) {
@@ -4822,9 +4853,18 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                 // buffer) when the range is split.
                 Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead>
                     scan_data(*gpu_memory, gpu_addr, scan_bytes, &astc_scan_buffer);
-                new_info.astc_opaque =
-                    AstcDataLooksOpaque(std::span<const u8>{scan_data.data(), scan_data.size()});
-                ++(new_info.astc_opaque ? astc_opaque_images : astc_alpha_images);
+                // H35k: an error block means the data is not there yet (zeros or stale bytes),
+                // so the image stays BC3; it used to count as opaque (EDEN_NX2_ASTC_UNKNOWN_BC1=1
+                // restores that).
+                static const bool unknown_bc1 = [] {
+                    const char* value = std::getenv("EDEN_NX2_ASTC_UNKNOWN_BC1");
+                    return value != nullptr && value[0] == '1';
+                }();
+                const int opacity =
+                    AstcDataOpacity(std::span<const u8>{scan_data.data(), scan_data.size()});
+                new_info.astc_opaque = opacity == 0 || (opacity == 2 && unknown_bc1);
+                ++(opacity == 0 ? astc_opaque_images
+                                : (opacity == 1 ? astc_alpha_images : astc_unknown_images));
             }
         }
     }

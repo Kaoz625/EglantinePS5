@@ -615,6 +615,18 @@ bool AstcDataLooksOpaque(std::span<const u8> data) noexcept {
     return Tegra::Texture::ASTC::IsOpaque(data);
 }
 
+int AstcDataOpacity(std::span<const u8> data) noexcept {
+    using Tegra::Texture::ASTC::Opacity;
+    switch (Tegra::Texture::ASTC::ScanOpacity(data)) {
+    case Opacity::Opaque:
+        return 0;
+    case Opacity::Alpha:
+        return 1;
+    default:
+        return 2;
+    }
+}
+
 u32 CalculateConvertedSizeBytes(const ImageInfo& info) noexcept {
     if (info.type == ImageType::Buffer) {
         return info.size.width * BytesPerBlock(info.format);
