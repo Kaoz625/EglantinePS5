@@ -203,6 +203,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     std::chrono::steady_clock::time_point spill_log_time{};
     u64 astc_opaque_images{};
     u64 astc_alpha_images{};
+    u64 astc_unknown_images{};     // H35k: scan met an error block (data not there yet) -> BC3
+    u64 astc_opaque_mismatches{};  // H35k: a BC1 (opaque) image whose uploaded data has alpha
     Common::ScratchBuffer<u8> astc_scan_buffer;
     u64 images_deleted{};
     /// Why the next DeleteImage happens, for EDEN_NX2_TC_TRACE: the collector (and its mode),

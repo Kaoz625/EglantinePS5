@@ -2068,6 +2068,10 @@ static std::array<BlockModeInfo, 2048> MakeBlockModeInfos() {
 }
 
 bool IsOpaque(std::span<const uint8_t> data) {
+    return ScanOpacity(data) == Opacity::Opaque;
+}
+
+Opacity ScanOpacity(std::span<const uint8_t> data) {
     // Endpoint modes with an alpha channel: LDR luminance+alpha (4, 5), RGB scale + two alpha
     // (10), LDR RGBA (12, 13) and HDR RGBA (14, 15).
     constexpr u32 AlphaModes = (1U << 4) | (1U << 5) | (1U << 10) | (1U << 12) | (1U << 13) |
@@ -2075,32 +2079,40 @@ bool IsOpaque(std::span<const uint8_t> data) {
     // Decoding each block's mode bit by bit took ~12% of title 1's long frames, where every
     // new ASTC texture is scanned (its title screen streams them in by the thousand).
     static const std::array<BlockModeInfo, 2048> mode_infos = MakeBlockModeInfos();
+    bool unknown = false;
     for (size_t offset = 0; offset + 16 <= data.size(); offset += 16) {
         const std::span<const u8> block = data.subspan(offset, 16);
         u32 low;
         std::memcpy(&low, block.data(), sizeof(low));
         const BlockModeInfo& info = mode_infos[low & 0x7FF];
         if (info.error) {
-            continue; // decodes to the opaque error colour
+            // Decodes to the opaque error colour, but no encoder writes one: the guest data is not
+            // there yet (zeros) or is stale. H35k: such an image used to be called opaque and went
+            // to BC1, and its real data (with alpha) lost alpha and every texel under 0.5 turned
+            // black (punch-through), e.g. Kirby Air Riders' Kirby drawn dark maroon.
+            unknown = true;
+            continue;
         }
         if (info.void_extent) {
             if ((low & 0xC00) != 0xC00) {
-                continue; // reserved bits clear: the error colour too
+                unknown = true; // reserved bits clear: the error colour too
+                continue;
             }
             // One RGBA16 colour in bits 64-127: UNORM16, or FP16 for HDR.
             const u32 alpha = block[14] | (u32{block[15]} << 8);
             if (alpha != (info.void_extent_hdr ? 0x3C00U : 0xFFFFU)) {
-                return false;
+                return Opacity::Alpha;
             }
             continue;
         }
         const u32 partitions = ((low >> 11) & 3) + 1;
         if (partitions == 4 && info.dual_plane) {
+            unknown = true; // an error encoding
             continue;
         }
         if (partitions == 1) {
             if ((AlphaModes >> ((low >> 13) & 0xF)) & 1) {
-                return false;
+                return Opacity::Alpha;
             }
             continue;
         }
@@ -2109,13 +2121,14 @@ bool IsOpaque(std::span<const uint8_t> data) {
         const u32 base_mode = base_cem & 3;
         if (base_mode == 0) {
             if ((AlphaModes >> (base_cem >> 2)) & 1) {
-                return false;
+                return Opacity::Alpha;
             }
             continue;
         }
         // The rest of the per-partition modes sit just below the weights (DecompressBlock).
         const u32 weight_bits = info.weight_bits;
         if (weight_bits < 24 || weight_bits > 96) {
+            unknown = true; // an error encoding
             continue;
         }
         const u32 extra_bits = partitions == 2 ? 2 : partitions == 3 ? 5 : 8;
@@ -2132,11 +2145,11 @@ bool IsOpaque(std::span<const uint8_t> data) {
             const u32 mode = ((base_mode - (((classes >> i) & 1) != 0 ? 0 : 1)) << 2) |
                              ((cem >> (2 * i)) & 3);
             if ((AlphaModes >> mode) & 1) {
-                return false;
+                return Opacity::Alpha;
             }
         }
     }
-    return true;
+    return unknown ? Opacity::Unknown : Opacity::Opaque;
 }
 
 } // namespace Tegra::Texture::ASTC
