@@ -1332,6 +1332,12 @@ bool YieldToRecover() noexcept { // EDEN_CRAM_SCAN_YIELD=0 = H36
     }();
     return on;
 }
+// H38 diag: phase times of slow recoveries and long pack_mutex holds (first 400 lines).
+std::atomic<unsigned> slow_lines{0};
+inline std::uint64_t DiagNs() noexcept {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 thread_local bool holding_pack = false; // this thread holds pack_mutex (a heap growth inside must not wait for it)
 // RecoverMemory is packing for a caller that waits for the pool (the driver, the heap, the JIT): the
 // slots' blocks go to the pool, not to the unpack keep. Kept, eden_memory_recover reported them freed
@@ -1555,9 +1561,26 @@ void ReportUnpackers() noexcept {
 
 void ColdPass(SparseRange& range, std::size_t slots) noexcept {
     CheckZeroBlock();
+    const std::uint64_t diag_wait0 = DiagNs();
     const std::lock_guard pack_lock{pack_mutex};
+    const std::uint64_t diag_t0 = DiagNs();
     holding_pack = true;
-    struct Held { ~Held() { holding_pack = false; } } held;
+    struct Held {
+        std::uint64_t t0, wait;
+        ~Held() {
+            holding_pack = false;
+            const std::uint64_t held_ns = DiagNs() - t0;
+            if (held_ns >= 200'000'000ull && slow_lines.fetch_add(1, std::memory_order_relaxed) < 400) {
+                char line[192];
+                const int n = std::snprintf(line, sizeof(line),
+                    "EDEN_CRAM_SLOW scanner_hold_ms=%llu lock_wait_ms=%llu waiting=%u yields=%llu\n",
+                    (unsigned long long)(held_ns / 1000000), (unsigned long long)(wait / 1000000),
+                    recover_waiting.load(std::memory_order_relaxed),
+                    (unsigned long long)cold_yields.load(std::memory_order_relaxed));
+                if (n > 0) Report(line);
+            }
+        }
+    } held{diag_t0, diag_t0 - diag_wait0};
     // Room made once: a pass allocates nothing (the heap may be out of memory when it runs).
     static std::vector<std::size_t> candidates;
     if (cold_hash.size() != slots) {
@@ -1634,8 +1657,18 @@ void ColdPass(SparseRange& range, std::size_t slots) noexcept {
 
 void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& candidates) noexcept {
 #ifdef PS5_NATIVE
-    CompactStore(range, slots);
-    StoreReclaim();
+    {
+        const std::uint64_t c0 = DiagNs();
+        CompactStore(range, slots);
+        StoreReclaim();
+        const std::uint64_t c_ns = DiagNs() - c0;
+        if (c_ns >= 100'000'000ull && slow_lines.fetch_add(1, std::memory_order_relaxed) < 400) {
+            char line[160];
+            const int n = std::snprintf(line, sizeof(line), "EDEN_CRAM_SLOW scanner_compact_ms=%llu waiting=%u\n",
+                                        (unsigned long long)(c_ns / 1000000), recover_waiting.load(std::memory_order_relaxed));
+            if (n > 0) Report(line);
+        }
+    }
 #endif
     if (packed_slots.load(std::memory_order_acquire) == nullptr) {
         auto* table = new (std::nothrow) PackedSlot[slots]();
@@ -1656,7 +1689,17 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
     }
     if (pack_refused.load(std::memory_order_relaxed) || !PoolShortForPacking()) return;
     // Device memory nothing is bound to goes back before any guest memory is packed.
-    if (&eden_radv_private_radv_ps5_eden_trim != nullptr) (void)eden_radv_private_radv_ps5_eden_trim(std::uint64_t{512} << 20);
+    if (&eden_radv_private_radv_ps5_eden_trim != nullptr) {
+        const std::uint64_t t0 = DiagNs();
+        (void)eden_radv_private_radv_ps5_eden_trim(std::uint64_t{512} << 20);
+        const std::uint64_t t_ns = DiagNs() - t0;
+        if (t_ns >= 100'000'000ull && slow_lines.fetch_add(1, std::memory_order_relaxed) < 400) {
+            char line[128];
+            const int n = std::snprintf(line, sizeof(line), "EDEN_CRAM_SLOW scanner_trim_ms=%llu\n",
+                                        (unsigned long long)(t_ns / 1000000));
+            if (n > 0) Report(line);
+        }
+    }
     // Coldest first, each needing ColdSeconds << (times packed) unwritten.
     const std::uint32_t now = ColdNow();
     std::vector<std::size_t>& ready = pack_ready;
@@ -2112,35 +2155,60 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait, bool for_writer = false)
     SparseRange* const range = service_range.load(std::memory_order_acquire);
     // Device memory no resource uses goes back first: it costs nothing later (packing makes the
     // guest fault its data back).
+    const std::uint64_t d_start = DiagNs();
+    std::uint64_t d_trim = 0, d_lock = 0, d_compact = 0, d_idle = 0, d_pass[3] = {0, 0, 0};
+    unsigned d_packs[3] = {0, 0, 0}, d_fails[3] = {0, 0, 0};
+    std::size_t d_asked = bytes;
     std::size_t trimmed = 0;
     // Not for a writer: it may be a GPU-side thread inside the driver (its locks held).
     if (&eden_radv_private_radv_ps5_eden_trim != nullptr && !for_writer)
         trimmed = static_cast<std::size_t>(eden_radv_private_radv_ps5_eden_trim(bytes));
+    d_trim = DiagNs() - d_start;
     if (trimmed >= bytes) return trimmed;
     bytes -= trimmed;
     if (range == nullptr || !PackEnabled() || pack_refused.load(std::memory_order_relaxed) || holding_pack)
         return trimmed + (for_writer ? 0 : GiveBackIdleBlocks(bytes));
     std::unique_lock pack_lock{pack_mutex, std::defer_lock};
     if (wait) {
+        const std::uint64_t l0 = DiagNs();
         recover_waiting.fetch_add(1, std::memory_order_acq_rel);
         pack_lock.lock();
         recover_waiting.fetch_sub(1, std::memory_order_acq_rel);
+        d_lock = DiagNs() - l0;
     } else if (!pack_lock.try_lock()) return trimmed + (for_writer ? 0 : GiveBackIdleBlocks(bytes));
     holding_pack = true;
     struct Held { ~Held() { holding_pack = false; } } held;
     if (packed_slots.load(std::memory_order_acquire) == nullptr || cold_since.empty() ||
         recover_order.capacity() < cold_since.size())
         return trimmed + (for_writer ? 0 : GiveBackIdleBlocks(bytes));
+    auto diag_log = [&](std::size_t freed) {
+        const std::uint64_t d_total = DiagNs() - d_start;
+        if (d_total >= 50'000'000ull && slow_lines.fetch_add(1, std::memory_order_relaxed) < 400) {
+            char line[320];
+            const int n = std::snprintf(line, sizeof(line),
+                "EDEN_CRAM_SLOW recover%s%s asked=%zuMiB total_ms=%llu trim_ms=%llu lock_ms=%llu compact_ms=%llu"
+                " p0_ms=%llu/%u/%u idle_ms=%llu p1_ms=%llu/%u/%u p2_ms=%llu/%u/%u freed=%zuMiB trimmed=%zuMiB\n",
+                wait ? "" : "_try", for_writer ? "_writer" : "", d_asked >> 20,
+                (unsigned long long)(d_total / 1000000), (unsigned long long)(d_trim / 1000000),
+                (unsigned long long)(d_lock / 1000000), (unsigned long long)(d_compact / 1000000),
+                (unsigned long long)(d_pass[0] / 1000000), d_packs[0], d_fails[0], (unsigned long long)(d_idle / 1000000),
+                (unsigned long long)(d_pass[1] / 1000000), d_packs[1], d_fails[1],
+                (unsigned long long)(d_pass[2] / 1000000), d_packs[2], d_fails[2], freed >> 20, trimmed >> 20);
+            if (n > 0) Report(line);
+        }
+    };
     // Store blocks emptied by compaction go back first: nothing faults back for them later.
     {
+        const std::uint64_t c0 = DiagNs();
         const std::size_t before = store_held.load(std::memory_order_relaxed);
         CompactStore(*range, cold_since.size());
         StoreReclaim();
         const std::size_t after = store_held.load(std::memory_order_relaxed);
+        d_compact = DiagNs() - c0;
         if (after < before) {
             trimmed += before - after;
             compact_recovered.fetch_add(before - after, std::memory_order_relaxed);
-            if (before - after >= bytes) return trimmed;
+            if (before - after >= bytes) { diag_log(0); return trimmed; }
             bytes -= before - after;
         }
     }
@@ -2163,8 +2231,12 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait, bool for_writer = false)
     const std::uint32_t ages[3] = {10, 3, 0};
     const int passes = deep && (wait || for_writer) ? 3 : 1;
     for (int pass = 0; pass < passes && freed < bytes; ++pass) {
+        const std::uint64_t p0 = DiagNs();
+        struct PassTime { std::uint64_t t0; std::uint64_t& out; ~PassTime() { out = DiagNs() - t0; } } pass_time{p0, d_pass[pass]};
         if (pass == 1 && !for_writer) {
+            const std::uint64_t i0 = DiagNs();
             idle = GiveBackIdleBlocks(bytes - freed);
+            d_idle = DiagNs() - i0;
             freed += idle;
             if (freed >= bytes) break;
         }
@@ -2178,13 +2250,17 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait, bool for_writer = false)
         for (const std::size_t slot : recover_order) {
             if (freed >= bytes) break;
             if (PackSlot(*range, slot)) {
+                ++d_packs[pass];
                 freed += SparseSlot;
                 if (pass > 0) deep_freed += SparseSlot;
                 cold_since[slot] = now;
                 if (pack_times[slot] < 255) ++pack_times[slot];
+            } else {
+                ++d_fails[pass];
             }
         }
     }
+    diag_log(freed);
     const auto calls = recover_calls.fetch_add(1, std::memory_order_relaxed);
     recovered_bytes.fetch_add(freed, std::memory_order_relaxed);
     if (deep_freed != 0) recover_deep_bytes.fetch_add(deep_freed, std::memory_order_relaxed);
