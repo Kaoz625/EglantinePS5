@@ -1609,6 +1609,38 @@ void eden_heap_sites_report(void) {
   eden_heap_research_report();
 }
 
+/* H41: a request of 1 MiB or more whose space could not grow gets a block of its own, sized to
+ * it, in pieces of whatever size the pool has (eden_heap_large_allocate: one free block of that
+ * size, else 2 MiB pieces behind one address range; zeroed). The heap grows by 32 MiB pieces: late
+ * in a Mario Kart World session (PHAT5 H39 L2, race 3) a 15.6 MiB request needed a 32 MiB growth,
+ * the pool had no 32 MiB left after a recovery and the app ended with std::bad_alloc.
+ * EDEN_HEAP_FALLBACK=0 = H40 (no fallback). */
+static atomic_uint eden_heap_fallbacks, eden_heap_fallbacks_ok;
+void eden_heap_fallback_stats(unsigned *tries, unsigned *ok) {
+  *tries = atomic_load_explicit(&eden_heap_fallbacks, memory_order_relaxed);
+  *ok = atomic_load_explicit(&eden_heap_fallbacks_ok, memory_order_relaxed);
+}
+static void *eden_heap_fallback_large(size_t bytes) {
+  static int enabled = -1;
+  if (enabled < 0) {
+    const char *value = getenv("EDEN_HEAP_FALLBACK");
+    enabled = value == NULL || value[0] != '0';
+  }
+  if (!enabled || !eden_heap_grows || bytes < ((size_t)1 << 20) || bytes >= EDEN_HEAP_LARGE_REQUEST)
+    return NULL;
+  void *block = eden_heap_large_allocate(bytes);
+  const unsigned calls = atomic_fetch_add_explicit(&eden_heap_fallbacks, 1, memory_order_relaxed);
+  if (block != NULL)
+    atomic_fetch_add_explicit(&eden_heap_fallbacks_ok, 1, memory_order_relaxed);
+  if (calls < 32) {
+    char line[112];
+    const int length = snprintf(line, sizeof(line), "EDEN_HEAP_FALLBACK bytes=%zu ok=%d\n", bytes, block != NULL);
+    if (length > 0)
+      sceKernelDebugOutText(0, line);
+  }
+  return block;
+}
+
 static void *eden_heap_allocate(size_t count, size_t size, int zero, int scratch) {
   const size_t bytes = count * size;
   if (bytes >= EDEN_HEAP_LARGE_REQUEST && eden_heap_grows) {
@@ -1622,7 +1654,10 @@ static void *eden_heap_allocate(size_t count, size_t size, int zero, int scratch
     void *address = eden_heap_arena_allocate(count, size, zero, scratch);
     return address != NULL ? address : eden_heap_spill(count, size, zero);
   }
-  return zero ? eden_heap_main(EDEN_HEAP_CALLOC, count, size) : eden_heap_main(EDEN_HEAP_MALLOC, bytes, 0);
+  void *address = zero ? eden_heap_main(EDEN_HEAP_CALLOC, count, size) : eden_heap_main(EDEN_HEAP_MALLOC, bytes, 0);
+  if (address == NULL)
+    address = eden_heap_fallback_large(bytes);
+  return address;
 }
 
 void *__wrap_malloc(size_t size) {
@@ -1774,6 +1809,9 @@ int __wrap_posix_memalign(void **address, size_t alignment, size_t size) {
       block = eden_heap_large_allocate(size);
     if (block == NULL)
       block = eden_heap_main(EDEN_HEAP_ALIGNED, alignment, size);
+    /* A large block's own memory starts on a page, as above. */
+    if (block == NULL && alignment <= 4096)
+      block = eden_heap_fallback_large(size);
     if (block != NULL) {
       *address = block;
       result = 0;

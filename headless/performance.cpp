@@ -518,6 +518,8 @@ extern "C" std::size_t eden_heap_trim(void) __attribute__((weak));
 extern "C" void eden_heap_sites_report(void) __attribute__((weak));
 extern "C" void eden_heap_usage(std::size_t* held, std::size_t* in_use, std::size_t* returned) __attribute__((weak));
 extern "C" void eden_heap_slack(std::size_t*, std::size_t*, unsigned*, unsigned*) __attribute__((weak));
+extern "C" void eden_heap_wait_stats(unsigned*, unsigned*) __attribute__((weak));
+extern "C" void eden_heap_fallback_stats(unsigned*, unsigned*) __attribute__((weak));
 extern "C" std::size_t eden_heap_arena_live __attribute__((weak));
 extern "C" unsigned eden_heap_arena_empty __attribute__((weak)), eden_heap_arena_quarter __attribute__((weak));
 extern "C" unsigned eden_guest_memory_wanted(void) __attribute__((weak));
@@ -662,6 +664,14 @@ void ReportHeap(const char* why) {
     std::fprintf(stderr, "[EglantinePS5] heap: holds %zu MiB (%zu MiB of pieces, %zu MiB in %u large blocks), "
                          "%zu MiB of it in use; %zu MiB given back so far (%s)\n",
                  held >> 20, (held - large) >> 20, large >> 20, large_blocks, in_use >> 20, returned >> 20, why);
+    if (eden_heap_wait_stats && eden_heap_fallback_stats) {
+        unsigned waits = 0, waits_ok = 0, fallbacks = 0, fallbacks_ok = 0;
+        eden_heap_wait_stats(&waits, &waits_ok);
+        eden_heap_fallback_stats(&fallbacks, &fallbacks_ok);
+        if (waits != 0 || fallbacks != 0)
+            std::fprintf(stderr, "EDEN_HEAP_H41 waits=%u ok=%u fallbacks=%u ok=%u\n", waits, waits_ok, fallbacks,
+                         fallbacks_ok);
+    }
     if (eden_heap_slack) {
         std::size_t tcache = 0, arenas = 0;
         unsigned holders = 0, arena_count = 0;
