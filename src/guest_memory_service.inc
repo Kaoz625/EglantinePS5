@@ -311,6 +311,8 @@ void ForgetPacked(std::size_t slot) noexcept {
 // a new block from the pool), and StoreReclaim gives them back. A slot that is locked (being unpacked)
 // stays where it is. pack_mutex held.
 std::atomic<std::uint64_t> compact_passes{0}, compact_moved{0}, compact_moved_bytes{0}, compact_emptied{0}, compact_recovered{0};
+// H35: what RecoverMemory's 3 s and any-age passes packed (recover_deep_mib on the EDEN_CRAM_PACK line).
+std::atomic<std::uint64_t> recover_deep_bytes{0};
 #ifdef PS5_NATIVE
 bool StoreCompactEnabled() noexcept {
     static const bool on = [] {
@@ -1752,7 +1754,7 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         const int pack_length = std::snprintf(pack_line, sizeof(pack_line),
             "EDEN_CRAM_PACK %s packed=%lluMiB stored=%lluMiB packs=%llu unpacks=%llu skips=%llu unpack_keep=%lluMiB"
             " kept_compared=%llu kept_differed=%llu zero_block_dirty=%llu gpu_skips=%llu gpu_marked=%llu"
-            " store_held=%lluMiB compactions=%llu moved=%llu moved_mib=%llu emptied=%llu recovered_mib=%llu\n", when,
+            " store_held=%lluMiB compactions=%llu moved=%llu moved_mib=%llu emptied=%llu recovered_mib=%llu recover_deep_mib=%llu\n", when,
             (unsigned long long)(packed_count.load(std::memory_order_relaxed) * (SparseSlot >> 20)),
             (unsigned long long)(packed_bytes.load(std::memory_order_relaxed) >> 20),
             (unsigned long long)packs.load(std::memory_order_relaxed), (unsigned long long)unpacks.load(std::memory_order_relaxed),
@@ -1767,7 +1769,8 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
             (unsigned long long)compact_moved.load(std::memory_order_relaxed),
             (unsigned long long)(compact_moved_bytes.load(std::memory_order_relaxed) >> 20),
             (unsigned long long)compact_emptied.load(std::memory_order_relaxed),
-            (unsigned long long)(compact_recovered.load(std::memory_order_relaxed) >> 20));
+            (unsigned long long)(compact_recovered.load(std::memory_order_relaxed) >> 20),
+            (unsigned long long)(recover_deep_bytes.load(std::memory_order_relaxed) >> 20));
         if (pack_length > 0) Report(pack_line);
         ReportUnpackers();
     }
@@ -2104,31 +2107,57 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait) noexcept {
         }
     }
     const std::uint32_t now = ColdNow();
-    recover_order.clear();
-    for (std::size_t slot = 0; slot < cold_since.size(); ++slot)
-        if (SlotState(*range, slot) == SlotOwn && now - cold_since[slot] >= 10) recover_order.push_back(slot);
-    std::sort(recover_order.begin(), recover_order.end(),
-              [](std::size_t a, std::size_t b) { return cold_since[a] < cold_since[b]; });
     std::size_t freed = 0;
     recovering_for_pool = true;
     struct Recovering { ~Recovering() { recovering_for_pool = false; } } recovering;
-    for (const std::size_t slot : recover_order) {
-        if (freed >= bytes) break;
-        if (PackSlot(*range, slot)) {
-            freed += SparseSlot;
-            cold_since[slot] = now;
-            if (pack_times[slot] < 255) ++pack_times[slot];
+    // H35: slots unwritten for 10 s first; then the idle blocks (unpack keep, reserve); then, for
+    // a caller that waits (the driver, the JIT), slots unwritten for 3 s and at last any slot, the
+    // longest unwritten first. At MKW's race load nearly every slot was unpacked or written within
+    // 10 s, the 10 s pass found 10-42 MiB, the driver's retry was refused and the app ended (VK OOM
+    // H33 G1, H34 H1 with 256 MiB idle in the unpack keep). A slot packed too early only faults
+    // back. EDEN_CRAM_RECOVER_DEEP=0 = the 10 s pass only (H34).
+    static const bool deep = [] {
+        const char* value = std::getenv("EDEN_CRAM_RECOVER_DEEP");
+        return value == nullptr || value[0] != '0';
+    }();
+    std::size_t idle = 0, deep_freed = 0;
+    const std::uint32_t ages[3] = {10, 3, 0};
+    const int passes = deep && wait ? 3 : 1;
+    for (int pass = 0; pass < passes && freed < bytes; ++pass) {
+        if (pass == 1) {
+            idle = GiveBackIdleBlocks(bytes - freed);
+            freed += idle;
+            if (freed >= bytes) break;
+        }
+        recover_order.clear();
+        for (std::size_t slot = 0; slot < cold_since.size(); ++slot)
+            if (SlotState(*range, slot) == SlotOwn && now - cold_since[slot] >= ages[pass] &&
+                (pass == 0 || now - cold_since[slot] < ages[pass - 1]))
+                recover_order.push_back(slot);
+        std::sort(recover_order.begin(), recover_order.end(),
+                  [](std::size_t a, std::size_t b) { return cold_since[a] < cold_since[b]; });
+        for (const std::size_t slot : recover_order) {
+            if (freed >= bytes) break;
+            if (PackSlot(*range, slot)) {
+                freed += SparseSlot;
+                if (pass > 0) deep_freed += SparseSlot;
+                cold_since[slot] = now;
+                if (pack_times[slot] < 255) ++pack_times[slot];
+            }
         }
     }
     const auto calls = recover_calls.fetch_add(1, std::memory_order_relaxed);
     recovered_bytes.fetch_add(freed, std::memory_order_relaxed);
-    if (calls < 24) {
-        char line[160];
-        const int length = std::snprintf(line, sizeof(line), "EDEN_CRAM_PACK recover%s asked=%zuMiB packed=%zuMiB\n",
-                                          wait ? "" : "_try", bytes >> 20, freed >> 20);
+    if (deep_freed != 0) recover_deep_bytes.fetch_add(deep_freed, std::memory_order_relaxed);
+    if (calls < 24 || calls % 64 == 0) {
+        char line[192];
+        const int length = std::snprintf(line, sizeof(line),
+                                         "EDEN_CRAM_PACK recover%s #%llu asked=%zuMiB packed=%zuMiB idle=%zuMiB deep=%zuMiB\n",
+                                         wait ? "" : "_try", (unsigned long long)calls, bytes >> 20,
+                                         (freed - idle) >> 20, idle >> 20, deep_freed >> 20);
         if (length > 0) Report(line);
     }
-    if (freed < bytes) freed += GiveBackIdleBlocks(bytes - freed);
+    if (freed < bytes && passes == 1) freed += GiveBackIdleBlocks(bytes - freed);
     return trimmed + freed;
 #else
     (void)bytes;
