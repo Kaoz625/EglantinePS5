@@ -309,6 +309,11 @@ public:
     /// Get the imageview from the graphics descriptor table in the specified index
     [[nodiscard]] ImageView& GetImageView(u32 index) noexcept;
 
+    /// The image with the given id, for the GPU hang report (EDEN_GPU_HANG_RES).
+    [[nodiscard]] Image& GetImageForTrace(ImageId id) noexcept {
+        return slot_images[id];
+    }
+
     // Publish the CPU-readable collision image. Caller holds the cache mutex.
     bool PublishComputeCollisionImage(u32 index);
 

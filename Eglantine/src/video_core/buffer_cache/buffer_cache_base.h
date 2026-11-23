@@ -576,6 +576,29 @@ public:
     /// Indirectly read banks of native programs already uploaded this frame.
     std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
 
+    /// GPU hang report (EDEN_GPU_HANG_RES): each enabled compute storage buffer of the last
+    /// configured dispatch as func(host GPU address or 0, size, guest GPU address, written,
+    /// multi-range).
+    template <typename Func>
+    void ForEachComputeStorageForTrace(Func&& func) {
+        ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
+            const Binding& binding = channel_state->compute_storage_buffers[index];
+            const bool written =
+                ((channel_state->written_compute_storage_buffers >> index) & 1) != 0;
+            u64 host = 0;
+            if (binding.segment_count == 0 && binding.buffer_id != NULL_BUFFER_ID) {
+                const Buffer& buffer = slot_buffers[binding.buffer_id];
+                if constexpr (requires { buffer.DeviceAddress(); }) {
+                    if (buffer.DeviceAddress() != 0) {
+                        host = buffer.DeviceAddress() + buffer.Offset(binding.device_addr);
+                    }
+                }
+            }
+            func(host, u64{binding.size}, u64{binding.gpu_addr}, written,
+                 binding.segment_count != 0);
+        });
+    }
+
 private:
     template <typename Mask, typename Func>
     static void ForEachEnabledBit(Mask enabled_mask, Func&& func) {
