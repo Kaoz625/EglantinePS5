@@ -486,6 +486,42 @@ constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
     return (std::min)(trim, static_cast<u32>(info.resources.levels) - 1);
 }
 
+// H32: Switch 2 ASTC that the GPU re-compresses to BC1/BC3 (WillUseGpuBcnTranscode) keeps only its
+// mip levels 1+ on the host - a quarter of the memory - when it is made while the shared pool is
+// short. Mario Kart World's race load starved the pool with ~870 MiB of such textures, all used
+// within 2 frames (nothing idle for the collector). Images made with free memory stay whole, so
+// games that fit lose nothing. EDEN_NX2_ASTC_TRIM=0 off (= H31b), 1 always, 2 only while the pool
+// is short (default); EDEN_NX2_ASTC_TRIM_MIN_PX=<px> the smallest level-0 side trimmed (512).
+[[nodiscard]] u32 AstcTrimLevels(const Device& device, const ImageInfo& info, GPUVAddr gpu_addr) {
+    static const u32 mode = [] {
+        const char* value = std::getenv("EDEN_NX2_ASTC_TRIM");
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 2U;
+    }();
+    static const u32 min_px = [] {
+        const char* value = std::getenv("EDEN_NX2_ASTC_TRIM_MIN_PX");
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 512U;
+    }();
+    if (mode == 0 || gpu_addr == 0 || !Settings::CurrentProgramIsSwitch2() ||
+        !WillUseGpuBcnTranscode(device, info) || HostMipCount(info) < 2 ||
+        (std::max)(info.size.width, info.size.height) < min_px ||
+        UsesSparseLayers(device, info, gpu_addr) || UsesSparseTiles(device, info, gpu_addr) ||
+        IsUnwrittenSparse(device, info, gpu_addr)) {
+        return 0;
+    }
+    if (mode == 2 && !::Eden::Performance::GraphicsMemoryIsShort()) {
+        return 0;
+    }
+    return 1;
+}
+
+[[nodiscard]] ImageInfo LevelsFrom(const ImageInfo& info, u32 level_offset) {
+    ImageInfo host = info;
+    host.size.width = (std::max)(info.size.width >> level_offset, 1U);
+    host.size.height = (std::max)(info.size.height >> level_offset, 1U);
+    host.resources.levels -= static_cast<s32>(level_offset);
+    return host;
+}
+
 [[nodiscard]] ImageInfo TrimmedHostInfo(const Device& device, const ImageInfo& info, u32& level_offset,
                                         GPUVAddr gpu_addr = 0) {
     level_offset = 0;
@@ -503,6 +539,18 @@ constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
                         level_offset, host.size.width, host.size.height);
         }
         return host;
+    }
+    if (const u32 trim = AstcTrimLevels(device, info, gpu_addr); trim != 0) {
+        level_offset = trim;
+        static std::atomic<u32> astc_logged{0};
+        const u32 count = ++astc_logged;
+        if (count <= 4 || (count & (count - 1)) == 0) {
+            LOG_INFO(Render_Vulkan, "ASTC {}x{}x{} ({} levels) {:#x}: pool short, keeping mip levels "
+                     "{}+ on the host (H32), {} images so far",
+                     info.size.width, info.size.height, info.resources.layers,
+                     info.resources.levels, gpu_addr, trim, count);
+        }
+        return LevelsFrom(info, trim);
     }
     if (!WillUseAcceleratedAstcDecode(device, info) || info.type != ImageType::e2D) {
         return info;
@@ -3303,7 +3351,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     }
     if (original_image.IsUnbacked()) {
         flags |= VideoCommon::ImageFlagBits::Unbacked;
-        const ImageInfo host_info = TrimmedHostInfo(runtime_.device, info, host_level_offset, gpu_addr_);
+        const ImageInfo host_info = LevelsFrom(info, host_level_offset);
         const u64 texels = u64{host_info.size.width} * host_info.size.height *
                            host_info.size.depth * static_cast<u64>(host_info.resources.layers);
         const u64 bytes =
@@ -3321,6 +3369,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     if (host_level_offset != 0) {
         flags |= VideoCommon::ImageFlagBits::TrimmedLevels;
     }
+    astc_trimmed = host_level_offset != 0 && WillUseGpuBcnTranscode(runtime->device, info);
     if (IsHugeAstcArray(runtime->device, info)) {
         flags |= VideoCommon::ImageFlagBits::AcceleratedUpload;
         flags |= VideoCommon::ImageFlagBits::Converted;
@@ -3871,8 +3920,7 @@ bool Image::InitSparseLayers() {
     s.allocator = &runtime->memory_allocator;
     s.requirements = device.GetLogical().GetImageMemoryRequirements(handle);
     s.sparse = *it;
-    u32 offset = host_level_offset;
-    const ImageInfo host = TrimmedHostInfo(device, info, offset, gpu_addr);
+    const ImageInfo host = LevelsFrom(info, host_level_offset);
     s.width = host.size.width;
     s.height = host.size.height;
     s.levels = HostMipCount(host);
@@ -5745,9 +5793,12 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     Image& image, const StagingBufferRef& map,
     std::span<const VideoCommon::SwizzleParameters> swizzles) {
     const ImageInfo& info = image.info;
-    const u32 width = info.size.width;
-    const u32 height = info.size.height;
-    const u32 levels = static_cast<u32>(HostMipCount(info));
+    // H32: a trimmed image (AstcTrimLevels) decodes and encodes only its host levels; the input
+    // then holds each layer's mip chain from that level on (UploadImageContents).
+    const u32 skip = image.host_level_offset;
+    const u32 width = (std::max)(info.size.width >> skip, 1U);
+    const u32 height = (std::max)(info.size.height >> skip, 1U);
+    const u32 levels = static_cast<u32>(HostMipCount(info)) - skip;
     const u32 layers = static_cast<u32>(info.resources.layers);
     // The BC encoder declares layout(rgba8). Identical byte layout is not enough:
     // its storage image view must have the matching R8G8B8A8_UNORM format.
@@ -5954,8 +6005,11 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     // was past the decode, and two textures' blocks met in one buffer.
     auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal, true);
 
-    const u64 layer_stride = info.layer_stride;
-    const size_t guest_size = image.guest_size_bytes;
+    const u64 layer_stride =
+        skip != 0 ? info.layer_stride - VideoCommon::FullUploadSwizzles(info)[skip].buffer_offset
+                  : info.layer_stride;
+    const size_t guest_size =
+        skip != 0 ? static_cast<size_t>(layer_stride * layers) : image.guest_size_bytes;
     for (u32 base = 0; base < layers; base += batch) {
         const u32 count = (std::min)(batch, layers - base);
         // The swizzles describe one layer's levels and the decoder steps layer_stride per layer
@@ -5972,7 +6026,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                 : (std::min)(static_cast<size_t>(u64{count} * layer_stride),
                              guest_size - (std::min)(guest_size, guest_offset));
         astc_decoder_pass->AssembleInto(
-            batch_info, 0, batch_size,
+            batch_info, skip, batch_size,
             ASTCDecoderPass::Target{
                 .image = *pending.image,
                 .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,

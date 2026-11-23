@@ -1639,6 +1639,10 @@ void TextureCache<P>::TickFrame() {
         {
             u64 astc_bc{}, astc_rgba{}, gpu_rt{}, bcn{}, other{}, costly{}, decoding{};
             size_t n_astc_bc{}, n_astc_rgba{}, n_rt{};
+            // H32: ASTC kept as BC by host size (<256 KiB, <1, <4, <16, >=16 MiB), single-level
+            // ones (nothing to trim) and the trimmed ones (AstcTrimLevels).
+            u64 astc_size_bytes[5]{}, astc_one_level{}, astc_trimmed_bytes{};
+            size_t astc_size_count[5]{}, n_astc_trimmed{};
             // H29: memory bound to the layers of sparse layered images (an Unbacked image has no
             // other; MKW's ~1.75 GB of driver memory at its race load was not in this census).
             u64 sparse_bound{}, sparse_bound_unbacked{};
@@ -1664,7 +1668,7 @@ void TextureCache<P>::TickFrame() {
                     decoding += bytes;
                 }
                 if (IsPixelFormatASTC(image->info.format)) {
-                    if (True(image->flags & ImageFlagBits::TrimmedLevels) ||
+                    if ((True(image->flags & ImageFlagBits::TrimmedLevels) && !image->astc_trimmed) ||
                         Settings::GetAstcRecompression() == Settings::AstcRecompression::Uncompressed ||
                         bytes > ImageMemoryBytes(*image) + (ImageMemoryBytes(*image) >> 1)) {
                         astc_rgba += bytes;
@@ -1672,6 +1676,20 @@ void TextureCache<P>::TickFrame() {
                     } else {
                         astc_bc += bytes;
                         ++n_astc_bc;
+                        const size_t bucket = bytes < (256ULL << 10) ? 0
+                                              : bytes < (1ULL << 20)  ? 1
+                                              : bytes < (4ULL << 20)  ? 2
+                                              : bytes < (16ULL << 20) ? 3
+                                                                      : 4;
+                        astc_size_bytes[bucket] += bytes;
+                        ++astc_size_count[bucket];
+                        if (image->info.resources.levels <= 1) {
+                            astc_one_level += bytes;
+                        }
+                        if (image->astc_trimmed) {
+                            astc_trimmed_bytes += bytes;
+                            ++n_astc_trimmed;
+                        }
                     }
                 } else if (True(image->flags & ImageFlagBits::GpuModified)) {
                     gpu_rt += bytes;
@@ -1705,6 +1723,15 @@ void TextureCache<P>::TickFrame() {
                      costly >> 20, decoding >> 20, older[0] >> 20, older[1] >> 20, older[2] >> 20,
                      FramesWithin(std::chrono::seconds{1}), sparse_bound >> 20, n_sparse,
                      sparse_bound_unbacked >> 20);
+            LOG_INFO(HW_GPU,
+                     "Memory census ASTC as BC by size: <256K {} MiB ({}), <1M {} MiB ({}), <4M {} "
+                     "MiB ({}), <16M {} MiB ({}), >=16M {} MiB ({}); one level {} MiB; trimmed {} "
+                     "MiB ({})",
+                     astc_size_bytes[0] >> 20, astc_size_count[0], astc_size_bytes[1] >> 20,
+                     astc_size_count[1], astc_size_bytes[2] >> 20, astc_size_count[2],
+                     astc_size_bytes[3] >> 20, astc_size_count[3], astc_size_bytes[4] >> 20,
+                     astc_size_count[4], astc_one_level >> 20, astc_trimmed_bytes >> 20,
+                     n_astc_trimmed);
         }
         if constexpr (requires { runtime.LogMemoryTrace(); }) {
             runtime.LogMemoryTrace();
