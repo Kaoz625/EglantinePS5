@@ -1320,6 +1320,9 @@ std::size_t PackBelowLargest() noexcept {
 constexpr double PackMaxRatio = 0.6;
 std::vector<std::uint8_t> pack_times; // per slot, the scanner's: how often it was packed
 std::atomic<bool> pack_refused{false};
+// H39: PackSlot's last failure was a compression that did not pay (ratio over PackMaxRatio): the
+// 2 MiB were compressed for nothing (~2 ms). pack_mutex held.
+bool pack_last_rejected = false;
 std::mutex pack_mutex; // the scanner's cold pass and packing, and eden_memory_recover
 // H37: driver/JIT recoveries waiting for pack_mutex; the scanner's cold pass stops early for them
 // (MKW race load H35 J2: memory_allocate took ~2 s per call, 5-11 calls a frame).
@@ -1377,6 +1380,7 @@ bool PoolShortForPacking() noexcept {
 bool PackSlot(SparseRange& range, std::size_t slot) noexcept {
 #ifdef PS5_NATIVE
     PackedSlot* const table = packed_slots.load(std::memory_order_acquire);
+    pack_last_rejected = false;
     if (table == nullptr) return false;
     static const bool pack_gpu = [] {
         const char* value = std::getenv("EDEN_CRAM_PACK_GPU");
@@ -1403,6 +1407,7 @@ bool PackSlot(SparseRange& range, std::size_t slot) noexcept {
     const int size = LZ4_compress_default(reinterpret_cast<const char*>(at), pack_scratch.data(),
                                           static_cast<int>(SparseSlot), static_cast<int>(pack_scratch.size()));
     if (size <= 0 || size > static_cast<int>(SparseSlot * PackMaxRatio) || !StoreStart()) {
+        pack_last_rejected = size <= 0 || size > static_cast<int>(SparseSlot * PackMaxRatio);
         Unfence(at);
         UnlockSlot(range, slot, SlotOwn);
         pack_skips.fetch_add(1, std::memory_order_relaxed);
@@ -1472,6 +1477,45 @@ std::size_t ColdSecondsNow() noexcept {
 #define ColdSeconds ColdSecondsNow()
 std::vector<std::uint64_t> cold_hash;
 std::vector<std::uint32_t> cold_since; // per Own slot: when its hash last changed (s, steady clock)
+// H39: slots whose data did not compress, with the scanner's hash and the time then. Packing
+// (eden_memory_recover and the scanner's pack pass) skips them while that hash is unchanged, for
+// up to 120 s. MKW race load (H38 K2): every driver recovery compressed the same ~700 oldest
+// unwritten slots for nothing first (1.0-1.6 s a call, 5-11 calls a frame). EDEN_CRAM_SKIP_REJECTED=0 = H38.
+std::vector<std::uint64_t> reject_hash;
+std::vector<std::uint32_t> reject_time;
+std::atomic<std::uint64_t> reject_skips{0}, rejects_noted{0};
+bool SkipRejectedOn() noexcept {
+    static const bool on = [] {
+        const char* value = std::getenv("EDEN_CRAM_SKIP_REJECTED");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on;
+}
+bool KnownIncompressible(std::size_t slot, std::uint32_t now) noexcept {
+    if (!SkipRejectedOn() || slot >= reject_hash.size() || reject_hash[slot] == 0) return false;
+    if (reject_hash[slot] != (cold_hash[slot] | 1) || now - reject_time[slot] >= 120) {
+        reject_hash[slot] = 0;
+        return false;
+    }
+    reject_skips.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+std::atomic<std::uint64_t> net_shortfall{0};
+bool RecoverNet() noexcept {
+    static const bool on = [] {
+        const char* value = std::getenv("EDEN_CRAM_RECOVER_NET");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on;
+}
+// After a PackSlot that failed (pack_mutex held).
+void NoteRejected(std::size_t slot, std::uint32_t now) noexcept {
+    if (!pack_last_rejected || slot >= reject_hash.size()) return;
+    pack_last_rejected = false;
+    reject_hash[slot] = cold_hash[slot] | 1;
+    reject_time[slot] = now;
+    rejects_noted.fetch_add(1, std::memory_order_relaxed);
+}
 std::uint32_t ColdNow() noexcept {
     return static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -1585,6 +1629,8 @@ void ColdPass(SparseRange& range, std::size_t slots) noexcept {
     static std::vector<std::size_t> candidates;
     if (cold_hash.size() != slots) {
         cold_hash.assign(slots, 0);
+        reject_hash.assign(slots, 0);
+        reject_time.assign(slots, 0);
         cold_since.assign(slots, ColdNow());
         candidates.clear();
         candidates.reserve(slots);
@@ -1705,7 +1751,9 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
     std::vector<std::size_t>& ready = pack_ready;
     ready.clear();
     for (const std::size_t slot : candidates)
-        if (now - cold_since[slot] >= (ColdSeconds << std::min<unsigned>(pack_times[slot], 4))) ready.push_back(slot);
+        if (now - cold_since[slot] >= (ColdSeconds << std::min<unsigned>(pack_times[slot], 4)) &&
+            !KnownIncompressible(slot, now))
+            ready.push_back(slot);
     std::sort(ready.begin(), ready.end(), [](std::size_t a, std::size_t b) { return cold_since[a] < cold_since[b]; });
     std::size_t done = 0;
     for (const std::size_t slot : ready) {
@@ -1718,6 +1766,8 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
         if (PackSlot(range, slot)) {
             ++done;
             cold_since[slot] = now;
+        } else {
+            NoteRejected(slot, now);
         }
     }
 }
@@ -1830,7 +1880,8 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         const int pack_length = std::snprintf(pack_line, sizeof(pack_line),
             "EDEN_CRAM_PACK %s packed=%lluMiB stored=%lluMiB packs=%llu unpacks=%llu skips=%llu unpack_keep=%lluMiB"
             " kept_compared=%llu kept_differed=%llu zero_block_dirty=%llu gpu_skips=%llu gpu_marked=%llu"
-            " store_held=%lluMiB compactions=%llu moved=%llu moved_mib=%llu emptied=%llu recovered_mib=%llu recover_deep_mib=%llu scan_yields=%llu\n", when,
+            " store_held=%lluMiB compactions=%llu moved=%llu moved_mib=%llu emptied=%llu recovered_mib=%llu recover_deep_mib=%llu scan_yields=%llu"
+            " reject_skips=%llu rejects=%llu net_short_mib=%llu\n", when,
             (unsigned long long)(packed_count.load(std::memory_order_relaxed) * (SparseSlot >> 20)),
             (unsigned long long)(packed_bytes.load(std::memory_order_relaxed) >> 20),
             (unsigned long long)packs.load(std::memory_order_relaxed), (unsigned long long)unpacks.load(std::memory_order_relaxed),
@@ -1847,7 +1898,10 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
             (unsigned long long)compact_emptied.load(std::memory_order_relaxed),
             (unsigned long long)(compact_recovered.load(std::memory_order_relaxed) >> 20),
             (unsigned long long)(recover_deep_bytes.load(std::memory_order_relaxed) >> 20),
-            (unsigned long long)cold_yields.load(std::memory_order_relaxed));
+            (unsigned long long)cold_yields.load(std::memory_order_relaxed),
+            (unsigned long long)reject_skips.load(std::memory_order_relaxed),
+            (unsigned long long)rejects_noted.load(std::memory_order_relaxed),
+            (unsigned long long)(net_shortfall.load(std::memory_order_relaxed) >> 20));
         if (pack_length > 0) Report(pack_line);
         ReportUnpackers();
     }
@@ -2243,20 +2297,30 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait, bool for_writer = false)
         recover_order.clear();
         for (std::size_t slot = 0; slot < cold_since.size(); ++slot)
             if (SlotState(*range, slot) == SlotOwn && now - cold_since[slot] >= ages[pass] &&
-                (pass == 0 || now - cold_since[slot] < ages[pass - 1]))
+                (pass == 0 || now - cold_since[slot] < ages[pass - 1]) && !KnownIncompressible(slot, now))
                 recover_order.push_back(slot);
         std::sort(recover_order.begin(), recover_order.end(),
                   [](std::size_t a, std::size_t b) { return cold_since[a] < cold_since[b]; });
         for (const std::size_t slot : recover_order) {
             if (freed >= bytes) break;
+            const std::size_t store_before = store_held.load(std::memory_order_relaxed);
             if (PackSlot(*range, slot)) {
                 ++d_packs[pass];
-                freed += SparseSlot;
-                if (pass > 0) deep_freed += SparseSlot;
+                // H39: what the pool really got: the slot's block less any store block taken for
+                // its packed data (the store takes a pool block first, or the slot's own when the
+                // pool has none). Counted as a whole 2 MiB, a recovery that "packed what was
+                // asked" left the driver's retry refused (H37 K1/K2). EDEN_CRAM_RECOVER_NET=0 = H38.
+                const std::size_t store_after = store_held.load(std::memory_order_relaxed);
+                const std::size_t taken = RecoverNet() && store_after > store_before ? store_after - store_before : 0;
+                const std::size_t net = taken < SparseSlot ? SparseSlot - taken : 0;
+                freed += net;
+                net_shortfall.fetch_add(SparseSlot - net, std::memory_order_relaxed);
+                if (pass > 0) deep_freed += net;
                 cold_since[slot] = now;
                 if (pack_times[slot] < 255) ++pack_times[slot];
             } else {
                 ++d_fails[pass];
+                NoteRejected(slot, now);
             }
         }
     }

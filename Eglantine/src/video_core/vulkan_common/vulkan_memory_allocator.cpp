@@ -48,6 +48,9 @@ extern "C" std::size_t eden_heap_committed(void);
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
 
+// The guest's memory gives memory back (EglantinePS5 guest_memory_service.inc; absent elsewhere).
+extern "C" [[gnu::weak]] std::size_t eden_memory_recover(std::size_t bytes) noexcept;
+
 namespace Vulkan {
 namespace {
 
@@ -611,6 +614,28 @@ VkResult MemoryAllocator::AllocateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
             VmaAllocationCreateInfo relaxed = alloc_ci;
             relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
             result = create(relaxed);
+            // EglantinePS5 H39: a refused buffer was fatal (the GPU thread aborts on the
+            // exception): MKW race load, VK OOM 525-587 s (H37 K1/K2) with recoveries that had
+            // just packed what they were asked. Ask the guest's memory for more, growing, and try
+            // again a few times; a stall instead of the end. EDEN_GRAPHICS_RETRY=0 = H38.
+            static const bool retry_on = [] {
+                const char* value = std::getenv("EDEN_GRAPHICS_RETRY");
+                return value == nullptr || value[0] != '0';
+            }();
+            for (unsigned attempt = 0; retry_on && result != VK_SUCCESS && attempt < 6 &&
+                                       &eden_memory_recover != nullptr;
+                 ++attempt) {
+                const std::size_t want = (static_cast<std::size_t>(ci.size) + (std::size_t{64} << 20))
+                                         << (attempt < 3 ? attempt : 3);
+                const std::size_t got = eden_memory_recover(want);
+                result = create(relaxed);
+                static std::atomic<u32> retry_lines{};
+                if (retry_lines.fetch_add(1, std::memory_order_relaxed) < 64) {
+                    std::fprintf(stderr, "EDEN_GRAPHICS_RETRY buffer=%lluKiB attempt=%u asked=%zuMiB got=%zuMiB result=%d\n",
+                                 static_cast<unsigned long long>(ci.size >> 10), attempt, want >> 20, got >> 20,
+                                 int(result));
+                }
+            }
             if (result != VK_SUCCESS) {
                 // EglantinePS5: what the pool and the guest held when even the allocation
                 // outside the budget was refused.
