@@ -1321,6 +1321,17 @@ constexpr double PackMaxRatio = 0.6;
 std::vector<std::uint8_t> pack_times; // per slot, the scanner's: how often it was packed
 std::atomic<bool> pack_refused{false};
 std::mutex pack_mutex; // the scanner's cold pass and packing, and eden_memory_recover
+// H37: driver/JIT recoveries waiting for pack_mutex; the scanner's cold pass stops early for them
+// (MKW race load H35 J2: memory_allocate took ~2 s per call, 5-11 calls a frame).
+std::atomic<unsigned> recover_waiting{0};
+std::atomic<std::uint64_t> cold_yields{0};
+bool YieldToRecover() noexcept { // EDEN_CRAM_SCAN_YIELD=0 = H36
+    static const bool on = [] {
+        const char* value = std::getenv("EDEN_CRAM_SCAN_YIELD");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on;
+}
 thread_local bool holding_pack = false; // this thread holds pack_mutex (a heap growth inside must not wait for it)
 // RecoverMemory is packing for a caller that waits for the pool (the driver, the heap, the JIT): the
 // slots' blocks go to the pool, not to the unpack keep. Kept, eden_memory_recover reported them freed
@@ -1560,6 +1571,10 @@ void ColdPass(SparseRange& range, std::size_t slots) noexcept {
     std::uint64_t own = 0, c1 = 0, c3 = 0, c6 = 0, zero = 0, zero_old = 0;
     const std::uint32_t now = ColdNow();
     for (std::size_t slot = 0; slot < slots; ++slot) {
+        if (YieldToRecover() && recover_waiting.load(std::memory_order_acquire) != 0) {
+            cold_yields.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
         if (SlotState(range, slot) != SlotOwn) {
             cold_since[slot] = now;
             cold_hash[slot] = 0;
@@ -1652,6 +1667,10 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
     std::size_t done = 0;
     for (const std::size_t slot : ready) {
         if (done >= PackPerPass) break;
+        if (YieldToRecover() && recover_waiting.load(std::memory_order_acquire) != 0) {
+            cold_yields.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
         if (pack_times[slot] < 255) ++pack_times[slot];
         if (PackSlot(range, slot)) {
             ++done;
@@ -1768,7 +1787,7 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         const int pack_length = std::snprintf(pack_line, sizeof(pack_line),
             "EDEN_CRAM_PACK %s packed=%lluMiB stored=%lluMiB packs=%llu unpacks=%llu skips=%llu unpack_keep=%lluMiB"
             " kept_compared=%llu kept_differed=%llu zero_block_dirty=%llu gpu_skips=%llu gpu_marked=%llu"
-            " store_held=%lluMiB compactions=%llu moved=%llu moved_mib=%llu emptied=%llu recovered_mib=%llu recover_deep_mib=%llu\n", when,
+            " store_held=%lluMiB compactions=%llu moved=%llu moved_mib=%llu emptied=%llu recovered_mib=%llu recover_deep_mib=%llu scan_yields=%llu\n", when,
             (unsigned long long)(packed_count.load(std::memory_order_relaxed) * (SparseSlot >> 20)),
             (unsigned long long)(packed_bytes.load(std::memory_order_relaxed) >> 20),
             (unsigned long long)packs.load(std::memory_order_relaxed), (unsigned long long)unpacks.load(std::memory_order_relaxed),
@@ -1784,7 +1803,8 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
             (unsigned long long)(compact_moved_bytes.load(std::memory_order_relaxed) >> 20),
             (unsigned long long)compact_emptied.load(std::memory_order_relaxed),
             (unsigned long long)(compact_recovered.load(std::memory_order_relaxed) >> 20),
-            (unsigned long long)(recover_deep_bytes.load(std::memory_order_relaxed) >> 20));
+            (unsigned long long)(recover_deep_bytes.load(std::memory_order_relaxed) >> 20),
+            (unsigned long long)cold_yields.load(std::memory_order_relaxed));
         if (pack_length > 0) Report(pack_line);
         ReportUnpackers();
     }
@@ -2101,8 +2121,11 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait, bool for_writer = false)
     if (range == nullptr || !PackEnabled() || pack_refused.load(std::memory_order_relaxed) || holding_pack)
         return trimmed + (for_writer ? 0 : GiveBackIdleBlocks(bytes));
     std::unique_lock pack_lock{pack_mutex, std::defer_lock};
-    if (wait) pack_lock.lock();
-    else if (!pack_lock.try_lock()) return trimmed + (for_writer ? 0 : GiveBackIdleBlocks(bytes));
+    if (wait) {
+        recover_waiting.fetch_add(1, std::memory_order_acq_rel);
+        pack_lock.lock();
+        recover_waiting.fetch_sub(1, std::memory_order_acq_rel);
+    } else if (!pack_lock.try_lock()) return trimmed + (for_writer ? 0 : GiveBackIdleBlocks(bytes));
     holding_pack = true;
     struct Held { ~Held() { holding_pack = false; } } held;
     if (packed_slots.load(std::memory_order_acquire) == nullptr || cold_since.empty() ||
