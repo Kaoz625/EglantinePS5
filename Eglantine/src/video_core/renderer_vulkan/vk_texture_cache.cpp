@@ -3935,9 +3935,12 @@ bool Image::InitSparseLayers() {
     s.tail_level = tail_lod;
     // H31: by block inside each layer, for the layouts SparseTileRects/UnswizzleImageRects read
     // (1x1-texel blocks, block-linear one GOB wide, blocks on whole GOB columns).
-    s.by_tile = SparseLayerTilesEnabled() && !huge_astc && block_width == 1 && block_height == 1 &&
-                info.block.width == 0 && info.size.depth == 1 &&
-                (u64{s.tile_width} * block_bytes) % 64 == 0;
+    // Compressed formats (BCn, 4x4 texels a block) are read as images of their blocks.
+    s.by_tile = SparseLayerTilesEnabled() && !huge_astc && info.block.width == 0 &&
+                info.size.depth == 1 && s.tile_width % block_width == 0 &&
+                s.tile_height % block_height == 0 &&
+                (u64{s.tile_width / block_width} * block_bytes) % 64 == 0 &&
+                (block_width == 1 || (block_bytes == 8 || block_bytes == 16));
     if (s.by_tile) {
         s.layer_tiles.resize(static_cast<size_t>(info.resources.layers));
         s.layer_tails.assign(static_cast<size_t>(info.resources.layers), VK_NULL_HANDLE);
@@ -3946,7 +3949,11 @@ bool Image::InitSparseLayers() {
              "Sparse layered image {:#x}: {}x{} {} levels {} layers, {} KiB a layer, block {}x{}, "
              "mip tail from {}{}",
              gpu_addr, s.width, s.height, s.levels, info.resources.layers, s.layer_bytes >> 10,
-             s.tile_width, s.tile_height, tail_lod, s.by_tile ? ", bound by block" : "");
+             s.tile_width, s.tile_height, tail_lod,
+             s.by_tile ? ", bound by block"
+                       : fmt::format(" (format {} block {}x{}, gob block w {})",
+                                     static_cast<u32>(info.format), block_width, block_height,
+                                     info.block.width));
     return true;
 }
 

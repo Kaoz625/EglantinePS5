@@ -3987,6 +3987,39 @@ void TextureCache<P>::RefreshSparseLayerTiles(Image& image, std::span<const u32>
         const u64 stride = image.info.layer_stride;
         const s32 skip = static_cast<s32>(image.host_level_offset);
         const s32 guest_tail = image.SparseTailLevel() + skip;
+        // Compressed formats (BCn): the guest layout of an image of their blocks, a 1x1 format of
+        // the same size. Rectangles and copies come back in blocks and are scaled to texels.
+        const u32 bw = VideoCore::Surface::DefaultBlockWidth(image.info.format);
+        const u32 bh = VideoCore::Surface::DefaultBlockHeight(image.info.format);
+        if (bw != 1 || bh != 1) {
+            const u32 bytes = VideoCore::Surface::BytesPerBlock(image.info.format);
+            one_layer.format = bytes == 16 ? PixelFormat::R32G32B32A32_UINT
+                                           : PixelFormat::R16G16B16A16_UINT;
+            one_layer.size.width = Common::DivCeil(image.info.size.width, bw);
+            one_layer.size.height = Common::DivCeil(image.info.size.height, bh);
+            ImageInfo real_layer = image.info;
+            real_layer.resources.layers = 1;
+            const u32 real_size = CalculateGuestSizeInBytes(real_layer);
+            if ((bytes != 8 && bytes != 16) || CalculateGuestSizeInBytes(one_layer) != real_size) {
+                static std::atomic<u32> warned{0};
+                if (warned++ < 4) {
+                    LOG_WARNING(HW_GPU,
+                                "Sparse layered image {:#x}: its blocks don't lay out like the "
+                                "image; binding whole layers",
+                                image.gpu_addr);
+                }
+                const std::vector<u32> bound = BindSparseLayers(image, layers);
+                if (bound.empty()) {
+                    runtime.TransitionImageLayout(image);
+                    return;
+                }
+                UploadLayers(image, bound);
+                runtime.InsertUploadMemoryBarrier();
+                return;
+            }
+        }
+        const u32 tile_w = image.SparseTileWidth() / bw;
+        const u32 tile_h = image.SparseTileHeight() / bh;
         const u64 bound_before = ImageMemoryBytes(image);
         size_t uploaded_layers = 0;
         size_t uploaded_rects = 0;
@@ -3998,8 +4031,7 @@ void TextureCache<P>::RefreshSparseLayerTiles(Image& image, std::span<const u32>
                 continue;
             }
             std::vector<LevelRect> guest_rects =
-                SparseTileRects(one_layer, ranges, image.SparseTileWidth(),
-                                image.SparseTileHeight(), guest_tail);
+                SparseTileRects(one_layer, ranges, tile_w, tile_h, guest_tail);
             std::erase_if(guest_rects, [skip](const LevelRect& rect) { return rect.level < skip; });
             if (guest_rects.empty()) {
                 continue;
@@ -4007,6 +4039,10 @@ void TextureCache<P>::RefreshSparseLayerTiles(Image& image, std::span<const u32>
             std::vector<LevelRect> host_rects = guest_rects;
             for (LevelRect& rect : host_rects) {
                 rect.level -= skip;
+                rect.x *= bw;
+                rect.y *= bh;
+                rect.width *= bw;
+                rect.height *= bh;
             }
             if (!image.BindLayerTiles(layer, host_rects)) {
                 continue;
@@ -4017,6 +4053,21 @@ void TextureCache<P>::RefreshSparseLayerTiles(Image& image, std::span<const u32>
                 UnswizzleImageRects(*gpu_memory, layer_addr, one_layer, guest_rects,
                                     staging.mapped_span);
             for (BufferImageCopy& copy : copies) {
+                if (bw != 1 || bh != 1) {
+                    const s32 level = copy.image_subresource.base_level;
+                    const u32 level_w = (std::max)(image.info.size.width >> level, 1U);
+                    const u32 level_h = (std::max)(image.info.size.height >> level, 1U);
+                    copy.buffer_row_length *= bw;
+                    copy.buffer_image_height *= bh;
+                    copy.image_offset.x *= static_cast<s32>(bw);
+                    copy.image_offset.y *= static_cast<s32>(bh);
+                    copy.image_extent.width =
+                        (std::min)(copy.image_extent.width * bw,
+                                   level_w - static_cast<u32>(copy.image_offset.x));
+                    copy.image_extent.height =
+                        (std::min)(copy.image_extent.height * bh,
+                                   level_h - static_cast<u32>(copy.image_offset.y));
+                }
                 copy.image_subresource.base_level -= skip;
                 copy.image_subresource.base_layer = static_cast<s32>(layer);
             }
