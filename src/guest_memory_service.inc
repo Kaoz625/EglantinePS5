@@ -1306,6 +1306,20 @@ std::vector<std::uint8_t> pack_times; // per slot, the scanner's: how often it w
 std::atomic<bool> pack_refused{false};
 std::mutex pack_mutex; // the scanner's cold pass and packing, and eden_memory_recover
 thread_local bool holding_pack = false; // this thread holds pack_mutex (a heap growth inside must not wait for it)
+// RecoverMemory is packing for a caller that waits for the pool (the driver, the heap, the JIT): the
+// slots' blocks go to the pool, not to the unpack keep. Kept, eden_memory_recover reported them freed
+// while the pool got none, and the driver's retry failed (MKW race load, H33 G1: VK OOM, largest free
+// block 1 MiB right after "recover packed=40MiB"). EDEN_CRAM_RECOVER_KEEP=1 = the old way.
+#ifdef PS5_NATIVE
+thread_local bool recovering_for_pool = false;
+bool RecoverKeeps() noexcept {
+    static const bool on = [] {
+        const char* value = std::getenv("EDEN_CRAM_RECOVER_KEEP");
+        return value != nullptr && value[0] == '1';
+    }();
+    return on;
+}
+#endif
 std::vector<std::size_t> recover_order; // eden_memory_recover's list, room made once (no allocation there)
 std::vector<std::size_t> pack_ready;    // PackPass's, likewise
 std::vector<char> pack_scratch;
@@ -1386,7 +1400,8 @@ bool PackSlot(SparseRange& range, std::size_t slot) noexcept {
     std::memcpy(data, pack_scratch.data(), static_cast<std::size_t>(size));
     if (PackKeep() && pack_kept != nullptr) {
         pack_kept[slot] = range.physical[slot];
-    } else if (donate >= 0 && !KeepForUnpack(donate) && sceKernelReleaseDirectMemory(donate, SparseSlot) != 0) {
+    } else if (donate >= 0 && ((recovering_for_pool && !RecoverKeeps()) || !KeepForUnpack(donate)) &&
+               sceKernelReleaseDirectMemory(donate, SparseSlot) != 0) {
         std::abort();
     }
     range.physical[slot] = -1;
@@ -2095,6 +2110,8 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait) noexcept {
     std::sort(recover_order.begin(), recover_order.end(),
               [](std::size_t a, std::size_t b) { return cold_since[a] < cold_since[b]; });
     std::size_t freed = 0;
+    recovering_for_pool = true;
+    struct Recovering { ~Recovering() { recovering_for_pool = false; } } recovering;
     for (const std::size_t slot : recover_order) {
         if (freed >= bytes) break;
         if (PackSlot(*range, slot)) {
