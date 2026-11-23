@@ -348,6 +348,9 @@ public:
     u32 render_are_member_index{};
 
     Id local_memory{};
+    /// Words of the guest local memory; local_memory holds one more, the slot an access outside
+    /// them goes to (LocalMemoryIndex).
+    u32 local_memory_words{};
 
     bool uses_explicit_workgroup_layout{};
     Id shared_memory_u8{};

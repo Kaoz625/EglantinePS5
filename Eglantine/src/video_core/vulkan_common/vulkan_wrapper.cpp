@@ -252,6 +252,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkUpdateDescriptorSetWithTemplate);
     X(vkUpdateDescriptorSets);
     X(vkGetBufferDeviceAddress);
+    X(vkGetDeviceMemoryOpaqueCaptureAddress);
     X(vkGetDescriptorSetLayoutSizeEXT);
     X(vkGetDescriptorSetLayoutBindingOffsetEXT);
     X(vkGetDescriptorEXT);
@@ -541,6 +542,27 @@ void Image::Release() const noexcept {
     if (handle) {
         vmaDestroyImage(allocator, handle, allocation);
     }
+}
+
+u64 Image::GetGpuAddressForTrace(u64* size) const noexcept {
+    if (allocation == nullptr || dld == nullptr || dld->vkGetDeviceMemoryOpaqueCaptureAddress == nullptr) {
+        return 0;
+    }
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(allocator, allocation, &info);
+    if (info.deviceMemory == VK_NULL_HANDLE) {
+        return 0;
+    }
+    const VkDeviceMemoryOpaqueCaptureAddressInfo capture{
+        .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_OPAQUE_CAPTURE_ADDRESS_INFO,
+        .pNext = nullptr,
+        .memory = info.deviceMemory,
+    };
+    const u64 base = dld->vkGetDeviceMemoryOpaqueCaptureAddress(owner, &capture);
+    if (size != nullptr) {
+        *size = info.size;
+    }
+    return base != 0 ? base + info.offset : 0;
 }
 
 Image::MemoryBlock Image::GetMemoryBlock() const noexcept {

@@ -21,6 +21,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <span>
 #include <vector>
 
 #include "common/common_types.h"
@@ -46,6 +47,15 @@ enum class HangWorkKind : u8 {
     DispatchIndirect,
 };
 
+/// A resource a draw or dispatch writes or reads, kept for the hang report (EDEN_GPU_HANG_RES=1).
+struct HangResource {
+    u64 host;  ///< Host GPU address (0: unknown)
+    u64 size;  ///< Bytes from `host`
+    u64 guest; ///< Guest GPU address
+    u64 info;  ///< Images: width | height << 16 | depth << 32 | levels << 48
+    u8 kind;   ///< 1 storage buffer read, 2 storage buffer written, 3 multi-range storage, 4 written image
+};
+
 class GpuHangWatch {
 public:
     explicit GpuHangWatch(const Device& device, MasterSemaphore& master_semaphore);
@@ -69,6 +79,16 @@ public:
         return markers != nullptr;
     }
 
+    /// True when work resources are kept for the report (EDEN_GPU_HANG_RES=1 and markers on).
+    [[nodiscard]] bool ResourcesOn() const noexcept {
+        return markers != nullptr && !resources.empty();
+    }
+
+    /// Worker thread, right before Begin: the resources of the next draw or dispatch.
+    void NoteResources(std::span<const HangResource> list) noexcept;
+
+    static constexpr u32 MaxResources = 6;
+
 private:
     struct Work {
         u32 number;
@@ -89,6 +109,10 @@ private:
     vk::DeviceMemory marker_memory;
     volatile u32* markers{}; ///< [0] last number the command processor reached, [1] last finished.
     std::vector<Work> ring;
+    std::vector<std::array<HangResource, MaxResources>> resources; ///< Per ring slot (opt-in)
+    std::vector<u8> resource_counts;
+    std::array<HangResource, MaxResources> pending{};
+    u32 pending_count{};
     u32 next_number{1};
     std::atomic<u64> submitted_tick{0};
     u64 limit_ms{1500};

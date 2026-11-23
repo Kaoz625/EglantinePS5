@@ -581,6 +581,11 @@ public:
         return original_image.GetMemoryBlock();
     }
 
+    /// GPU address and size of the image's memory, for the GPU hang report (0: none).
+    [[nodiscard]] u64 GpuAddressForTrace(u64* size) const noexcept {
+        return original_image.GetGpuAddressForTrace(size);
+    }
+
     /// Returns true when the image is already initialized and mark it as initialized
     [[nodiscard]] bool ExchangeInitialization() noexcept {
         return std::exchange(initialized, true);

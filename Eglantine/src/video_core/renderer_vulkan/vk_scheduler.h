@@ -103,6 +103,16 @@ public:
     [[nodiscard]] std::optional<double> GpuBusyMs() const;
     void TraceGraphicsPipeline(const std::array<u64, 6>& hashes);
     void TraceComputePipeline(u64 hash);
+    /// True when the GPU hang watch keeps each work's resources (EDEN_GPU_HANG_RES=1).
+    [[nodiscard]] bool HangResourcesOn() const noexcept {
+        return hang_watch && hang_watch->ResourcesOn();
+    }
+    /// Worker thread, right before TraceGpuWork: the next work's resources for the hang report.
+    void NoteHangResources(std::span<const HangResource> list) noexcept {
+        if (hang_watch) {
+            hang_watch->NoteResources(list);
+        }
+    }
     /// Worker thread, inside a recorded command: timestamps one draw or dispatch of a sampled
     /// submission. A draw passes its vertex and fragment hashes, a dispatch its compute hash.
     /// Also numbers the work for the GPU hang watch (vk_hang_watch.h) when its markers are on.

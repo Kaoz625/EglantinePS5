@@ -373,6 +373,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkUnmapMemory vkUnmapMemory{};
     PFN_vkUpdateDescriptorSetWithTemplate vkUpdateDescriptorSetWithTemplate{};
     PFN_vkGetBufferDeviceAddress vkGetBufferDeviceAddress{};
+    PFN_vkGetDeviceMemoryOpaqueCaptureAddress vkGetDeviceMemoryOpaqueCaptureAddress{};
     PFN_vkGetDescriptorSetLayoutSizeEXT vkGetDescriptorSetLayoutSizeEXT{};
     PFN_vkGetDescriptorSetLayoutBindingOffsetEXT vkGetDescriptorSetLayoutBindingOffsetEXT{};
     PFN_vkGetDescriptorEXT vkGetDescriptorEXT{};
@@ -763,6 +764,10 @@ public:
         u64 size;
     };
     [[nodiscard]] MemoryBlock GetMemoryBlock() const noexcept;
+
+    /// GPU address of the image's memory (the driver's device-memory address plus the image's
+    /// offset; 0 without memory), and its size in `size`. For the GPU hang report.
+    [[nodiscard]] u64 GetGpuAddressForTrace(u64* size) const noexcept;
 
 private:
     void Release() const noexcept;

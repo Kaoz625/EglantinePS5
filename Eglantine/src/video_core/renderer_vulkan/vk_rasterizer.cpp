@@ -2713,8 +2713,68 @@ void RasterizerVulkan::DispatchCompute() {
     if (!replacement) {
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
     }
+    // GPU hang report (EDEN_GPU_HANG_RES=1): where the dispatch's storage buffers and written
+    // images lie, so a GPU page fault address can be matched to one of them.
+    std::array<HangResource, GpuHangWatch::MaxResources> hang_resources{};
+    u32 hang_resource_count = 0;
+    if (scheduler.HangResourcesOn()) {
+        buffer_cache.ForEachComputeStorageForTrace(
+            [&](const Buffer* buffer, u64 offset, u64 size, u64 guest, bool written,
+                bool multi_range) {
+                u64 host = 0;
+                if (buffer != nullptr) {
+                    if (buffer->DeviceAddress() != 0) {
+                        host = buffer->DeviceAddress() + offset;
+                    } else if (const vk::MemoryLocation where = buffer->Location();
+                               where.memory != VK_NULL_HANDLE &&
+                               device.GetDispatchLoader().vkGetDeviceMemoryOpaqueCaptureAddress) {
+                        const VkDeviceMemoryOpaqueCaptureAddressInfo capture{
+                            .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_OPAQUE_CAPTURE_ADDRESS_INFO,
+                            .pNext = nullptr,
+                            .memory = where.memory,
+                        };
+                        const u64 base =
+                            device.GetDispatchLoader().vkGetDeviceMemoryOpaqueCaptureAddress(
+                                *device.GetLogical(), &capture);
+                        host = base != 0 ? base + where.offset + offset : 0;
+                    }
+                }
+                if (hang_resource_count < hang_resources.size()) {
+                    hang_resources[hang_resource_count++] = HangResource{
+                        .host = host,
+                        .size = size,
+                        .guest = guest,
+                        .info = 0,
+                        .kind = static_cast<u8>(multi_range ? 3 : written ? 2 : 1),
+                    };
+                }
+            });
+        for (const VideoCommon::ImageViewId id : pipeline->WrittenImages()) {
+            if (!id || hang_resource_count >= hang_resources.size()) {
+                continue;
+            }
+            const ImageView& view = texture_cache.GetImageView(id);
+            if (!view.image_id) {
+                continue;
+            }
+            const Image& image = texture_cache.GetImageForTrace(view.image_id);
+            u64 bytes = 0;
+            const u64 host = image.GpuAddressForTrace(&bytes);
+            hang_resources[hang_resource_count++] = HangResource{
+                .host = host,
+                .size = bytes,
+                .guest = image.gpu_addr,
+                .info = u64{image.info.size.width & 0xffff} |
+                        (u64{image.info.size.height & 0xffff} << 16) |
+                        (u64{image.info.size.depth & 0xffff} << 32) |
+                        (u64{static_cast<u32>(image.info.resources.levels) & 0xffff} << 48),
+                .kind = 4,
+            };
+        }
+    }
     scheduler.Record([this, pipeline, dim, byte_addressed_shadow, bind = std::move(deferred_bind),
-                      replacement, barrier_recorded](vk::CommandBuffer cmdbuf) {
+                      replacement, barrier_recorded, hang_resources,
+                      hang_resource_count](vk::CommandBuffer cmdbuf) {
         if (!barrier_recorded) {
             RecordDispatchBarrier(cmdbuf);
         }
@@ -2732,6 +2792,10 @@ void RasterizerVulkan::DispatchCompute() {
         }
         if (byte_addressed_shadow) {
             TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, false);
+        }
+        if (hang_resource_count != 0) {
+            scheduler.NoteHangResources(
+                std::span<const HangResource>(hang_resources.data(), hang_resource_count));
         }
         scheduler.TraceGpuWork(cmdbuf, pipeline->ShaderHash(), 0, dim,
                                [&] { cmdbuf.Dispatch(dim[0], dim[1], dim[2]); },

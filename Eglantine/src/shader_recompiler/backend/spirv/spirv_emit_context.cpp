@@ -645,8 +645,14 @@ void EmitContext::DefineLocalMemory(const IR::Program& program) {
         return;
     }
     const u32 num_elements{Common::DivCeil(program.local_memory_size, 4U)};
+    // One word more: a store outside the guest's local memory goes there (LocalMemoryIndex). The
+    // GPU drivers put a large private array in scratch memory without bounds, so an index past it
+    // writes wherever it lands. Suspected cause of Fast Fusion's GPU page fault on the PS5 (RADV):
+    // compute shader 145f88354862b8ab, first run as the compute scratch grew 10 -> 24 MiB, wrote to
+    // an unmapped address in the device-memory region and hung the GPU.
+    local_memory_words = num_elements;
     const Id element_type{TypeStruct(U32[1])};
-    const Id type{TypeArray(element_type, Const(num_elements))};
+    const Id type{TypeArray(element_type, Const(num_elements + 1U))};
     const Id pointer{TypePointer(spv::StorageClass::Private, type)};
     local_memory = AddGlobalVariable(pointer, spv::StorageClass::Private);
     if (profile.supported_spirv >= 0x00010400) {

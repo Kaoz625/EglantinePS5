@@ -120,6 +120,10 @@ GpuHangWatch::GpuHangWatch(const Device& device_, MasterSemaphore& master_semaph
                 markers[0] = 0;
                 markers[1] = 0;
                 ring.resize(RingSize);
+                if (EnvNumber("EDEN_GPU_HANG_RES", 0) != 0) {
+                    resources.resize(RingSize);
+                    resource_counts.assign(RingSize, 0);
+                }
             }
         }
     }
@@ -152,6 +156,12 @@ u32 GpuHangWatch::Begin(vk::CommandBuffer cmdbuf, u64 hash, u64 fragment_hash,
     if (next_number == 0) {
         next_number = 1;
     }
+    if (!resources.empty()) {
+        const u32 slot = number % RingSize;
+        resource_counts[slot] = static_cast<u8>(pending_count);
+        std::copy_n(pending.begin(), pending_count, resources[slot].begin());
+        pending_count = 0;
+    }
     ring[number % RingSize] = Work{
         .number = number,
         .kind = kind,
@@ -163,6 +173,14 @@ u32 GpuHangWatch::Begin(vk::CommandBuffer cmdbuf, u64 hash, u64 fragment_hash,
     device.GetDispatchLoader().vkCmdWriteBufferMarkerAMD(
         *cmdbuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, marker_buffer, 0, number);
     return number;
+}
+
+void GpuHangWatch::NoteResources(std::span<const HangResource> list) noexcept {
+    if (resources.empty()) {
+        return;
+    }
+    pending_count = static_cast<u32>(std::min<size_t>(list.size(), MaxResources));
+    std::copy_n(list.begin(), pending_count, pending.begin());
 }
 
 void GpuHangWatch::End(vk::CommandBuffer cmdbuf, u32 number) noexcept {
@@ -273,6 +291,18 @@ void GpuHangWatch::Report(u64 gpu_tick, u64 submitted, u64 stalled_ms) {
                       number, state, KindName(work.kind), work.tick, work.hash,
                       work.fragment_hash, work.size[0], work.size[1], work.size[2]);
         Say(line);
+        if (!resources.empty()) {
+            const u32 slot = number % RingSize;
+            for (u32 i = 0; i < resource_counts[slot]; ++i) {
+                const HangResource& res = resources[slot][i];
+                std::snprintf(line, sizeof(line),
+                              "EDEN_GPU_HANG_RES #%u kind=%u host=0x%" PRIx64 " size=0x%" PRIx64
+                              " end=0x%" PRIx64 " guest=0x%" PRIx64 " info=0x%" PRIx64 "\n",
+                              number, unsigned(res.kind), res.host, res.size,
+                              res.host != 0 ? res.host + res.size : 0, res.guest, res.info);
+                Say(line);
+            }
+        }
     }
 }
 

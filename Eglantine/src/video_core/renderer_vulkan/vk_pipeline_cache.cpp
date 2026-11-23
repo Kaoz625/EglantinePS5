@@ -3785,6 +3785,16 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
 
     const auto translate_start = std::chrono::steady_clock::now();
     auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+    if (program.local_memory_size != 0) {
+        // Which compute programs keep guest local memory (a private array, in scratch memory on
+        // RADV): a GPU fault in one of them is first checked against this (LocalMemoryIndex).
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 256) {
+            std::fprintf(stderr, "EDEN_LOCAL_MEMORY compute shader=%016llx bytes=%u\n",
+                         static_cast<unsigned long long>(key.unique_hash),
+                         program.local_memory_size);
+        }
+    }
     const auto translate_end = std::chrono::steady_clock::now();
     // Compute has eight constant buffers. The Ampere lowering reads NVN2's root tables (banks
     // 24-31) from bank 17, which only the 3D engine provides.
