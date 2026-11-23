@@ -641,6 +641,10 @@ void GuestMemoryUsage(std::size_t* span, std::size_t* held) noexcept {
     *held = guest_committed.load(std::memory_order_relaxed);
 }
 
+// The guest's memory packs cold slots for a caller that must not wait for the scanner
+// (guest_memory_service.inc, included below).
+extern "C" std::size_t eden_memory_recover_try(std::size_t bytes) noexcept;
+
 // Failure-only accounting uses stack storage; it must also work when allocation fails.
 static void ReportSparseCommitFailure(const SparseRange& range, std::size_t slot) noexcept {
     const auto begin = range.begin.load(std::memory_order_relaxed);
@@ -674,7 +678,34 @@ void CommitSparsePage(std::uintptr_t page) noexcept {
     }
     const std::lock_guard lock{sparse_mutex};
     if (range->owned[slot].load(std::memory_order_relaxed)) return;
-    if (!OwnSlot(begin + slot * SparseSlot, &range->physical[slot])) {
+    bool owned_now = OwnSlot(begin + slot * SparseSlot, &range->physical[slot]);
+    // H40: a table page the pool has no block for waits, as a guest write does (WaitForBlock):
+    // the guest's memory packs cold slots for it (never waiting for the scanner) every 20 ms, for
+    // up to 5 s. MKW second race (H39 L1): a table commit found no block and the app ended
+    // (SIGABRT 1283 s, largest free block 1 MiB) while recoveries were giving memory back.
+    // EDEN_TABLES_WAIT=0 = H39.
+    static const bool tables_wait = [] {
+        const char* value = std::getenv("EDEN_TABLES_WAIT");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!owned_now && tables_wait && &eden_memory_recover_try != nullptr) {
+        static std::atomic<unsigned> waits_logged{0};
+        unsigned tries = 0;
+        for (; tries < 250 && !owned_now; ++tries) {
+            (void)eden_memory_recover_try(SparseSlot * 4);
+            owned_now = OwnSlot(begin + slot * SparseSlot, &range->physical[slot]);
+            if (owned_now) break;
+            const timespec pause{0, 20'000'000};
+            nanosleep(&pause, nullptr);
+        }
+        if (waits_logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+            char line[128];
+            const int length = std::snprintf(line, sizeof(line), "EDEN_SPARSE_TABLES waited tries=%u ok=%d\n",
+                                             tries, owned_now ? 1 : 0);
+            if (length > 0) Report(line);
+        }
+    }
+    if (!owned_now) {
         // Out of memory in the middle of a guest mapping: there is no table to continue with.
         ReportSparseCommitFailure(*range, slot);
         Report("EDEN_SPARSE_TABLES commit failed: out of memory\n");
