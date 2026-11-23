@@ -54,6 +54,8 @@ fi
     --wrap=flockfile --wrap=funlockfile --wrap=open --wrap=close --wrap=read --wrap=pread --wrap=lseek \
     --wrap=fstat --wrap=stat --wrap=lstat \
     --wrap=sceKernelAllocateDirectMemory --wrap=sceKernelReleaseDirectMemory \
+    --wrap=sceKernelMapDirectMemory --wrap=sceKernelMunmap --wrap=munmap --wrap=mmap \
+    --wrap=sceKernelReserveVirtualRange \
     -o "$output" --start-group "${libraries[@]}" "${radv_link_inputs[@]}" \
     "$sdk/target/lib/libc++.a" "$sdk/target/lib/libc++abi.a" "$sdk/target/lib/libunwind.a" \
     --end-group --as-needed "$sdk/target/lib/libSceLibcInternal.so" "$sdk/target/lib/libkernel.so" \

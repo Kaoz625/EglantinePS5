@@ -259,9 +259,16 @@ int __wrap_sceKernelAllocateDirectMemory(int64_t from, int64_t to, size_t size, 
   return result;
 }
 
+static int eden_mc_release_check(int64_t start, size_t size, uintptr_t caller);
+static void eden_mc_release_failed(int64_t start, size_t size, int result, uintptr_t caller);
 int __wrap_sceKernelReleaseDirectMemory(int64_t start, size_t size) {
+  const uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+  if (eden_mc_release_check(start, size, caller)) return 0; /* H42 mode 2: kept (leaked), not unmapped */
   const int result = __real_sceKernelReleaseDirectMemory(start, size);
-  if (result != 0) return result;
+  if (result != 0) {
+    eden_mc_release_failed(start, size, result, caller);
+    return result;
+  }
   eden_census_give(start, size);
   eden_direct_acquire();
   if (size == EDEN_DIRECT_SMALL && eden_direct_floor != 0 && start >= eden_direct_floor &&
@@ -269,4 +276,201 @@ int __wrap_sceKernelReleaseDirectMemory(int64_t start, size_t size) {
     eden_direct_holes[eden_direct_hole_count++] = start;
   eden_direct_release();
   return result;
+}
+
+/* H42 diagnostic (EDEN_RELEASE_MAPPED_CHECK): direct memory given back while a mapping still shows it.
+ *
+ * Mario Kart World on H41 (PHAT5, 23 Nov 2026) died twice in a way that reads as "memory that was in
+ * use lost its pages": P1 a GPU colour/depth write to an unmapped device address on a 2 MiB boundary
+ * (0x40a8a00000), P2 a 'page not present' read inside UnpackSlot's freshly mapped 2 MiB view. Giving
+ * back direct memory takes away every mapping of it, so one stale or doubled release of a 2 MiB block
+ * that has since gone to someone else would explain both. This counts, per 16 KiB page of the pool,
+ * the mappings made through this link (sceKernelMapDirectMemory; munmap, sceKernelMunmap and fixed
+ * mmap/sceKernelReserveVirtualRange take them away again, read back from the system with
+ * sceKernelVirtualQuery), and a release of a page still counted is printed to the kernel log with the
+ * caller and a backtrace. 1 = report; 2 = report and keep the block (it is not given back: a leak
+ * instead of a lost mapping, the A/B for the cause). Off (unset or 0): every wrapper is a plain call. */
+#include <unwind.h>
+#include <stdlib.h>
+#include <string.h>
+int __real_sceKernelMapDirectMemory(void **, size_t, int, int, int64_t, size_t);
+int __real_sceKernelMunmap(void *, size_t);
+int __real_munmap(void *, size_t);
+void *__real_mmap(void *, size_t, int, int, int, long);
+int __real_sceKernelReserveVirtualRange(void **, size_t, int, size_t);
+int sceKernelDebugOutText(int, const char *);
+struct EdenVq {
+  uintptr_t start, end;
+  int64_t offset;
+  int32_t protection, memory_type;
+  uint32_t flags; /* bit 0 flexible, bit 1 direct, bit 2 stack, bit 3 pooled, bit 4 committed */
+  char name[32];
+};
+int sceKernelVirtualQuery(const void *, int, struct EdenVq *, size_t);
+#define EDEN_MC_PAGE_SHIFT 14
+#define EDEN_MC_FIXED 0x10
+#define EDEN_MC_STUCK 0xffffu
+static atomic_int eden_mc_state; /* 0 not read yet, 1 off, 2 report, 3 report + keep, 4 being set up */
+static uint16_t *eden_mc_count;
+static uint64_t eden_mc_pages;
+static atomic_flag eden_mc_lock = ATOMIC_FLAG_INIT;
+static atomic_uint eden_mc_lines, eden_mc_hits, eden_mc_failed_lines;
+static atomic_int eden_mc_verified; /* 0 not yet, 1 sceKernelVirtualQuery reads back what was mapped */
+
+static void eden_mc_say(const char *line) { sceKernelDebugOutText(0, line); }
+
+static int eden_mc_mode(void) {
+  const int state = atomic_load_explicit(&eden_mc_state, memory_order_acquire);
+  return state == 0 || state == 4 ? 1 : state; /* not started yet: off (missed reports, never false ones) */
+}
+/* Called once by main after env.txt is applied (the switch is read there, not at the first mapping). */
+void eden_release_mapped_check_start(void) {
+  int expected = 0;
+  if (!atomic_compare_exchange_strong(&eden_mc_state, &expected, 4)) return;
+  const char *text = getenv("EDEN_RELEASE_MAPPED_CHECK");
+  int mode = text && (text[0] == '1' || text[0] == '2') ? (text[0] == '2' ? 3 : 2) : 1;
+  if (mode != 1) {
+    eden_mc_pages = (uint64_t)sceKernelGetDirectMemorySize() >> EDEN_MC_PAGE_SHIFT;
+    void *table = __real_mmap(0, (size_t)eden_mc_pages * sizeof(uint16_t), 3 /* read|write */, 0x1000 | 0x2 /* anon|private */, -1, 0);
+    if (table == (void *)-1 || !table) mode = 1;
+    else eden_mc_count = (uint16_t *)table;
+    char line[160];
+    snprintf(line, sizeof(line), "EDEN_RELEASE_MAPPED_CHECK mode=%d pages=%llu table=%p base=%p\n", mode,
+             (unsigned long long)eden_mc_pages, table, (void *)&__wrap_sceKernelReleaseDirectMemory);
+    eden_mc_say(line);
+  }
+  atomic_store_explicit(&eden_mc_state, mode, memory_order_release);
+}
+
+/* Adds `delta` to the pages of [physical, physical + bytes) (a count that reached the top stays there). */
+static void eden_mc_add(int64_t physical, uint64_t bytes, int delta) {
+  if (physical < 0 || !bytes) return;
+  uint64_t first = (uint64_t)physical >> EDEN_MC_PAGE_SHIFT;
+  uint64_t last = ((uint64_t)physical + bytes - 1) >> EDEN_MC_PAGE_SHIFT;
+  if (last >= eden_mc_pages) last = eden_mc_pages - 1;
+  while (atomic_flag_test_and_set_explicit(&eden_mc_lock, memory_order_acquire)) {}
+  for (uint64_t page = first; page <= last && first < eden_mc_pages; ++page) {
+    uint16_t value = eden_mc_count[page];
+    if (value == EDEN_MC_STUCK) continue;
+    if (delta > 0) eden_mc_count[page] = (uint16_t)(value + 1);
+    else if (value) eden_mc_count[page] = (uint16_t)(value - 1);
+  }
+  atomic_flag_clear_explicit(&eden_mc_lock, memory_order_release);
+}
+
+/* The direct mappings in [at, at + bytes) leave the count (before an unmap or a fixed mapping over them). */
+static void eden_mc_forget(uintptr_t at, uint64_t bytes) {
+  uintptr_t cursor = at;
+  const uintptr_t end = at + bytes;
+  for (int guard = 0; cursor < end && guard < 4096; ++guard) {
+    struct EdenVq info;
+    memset(&info, 0, sizeof(info));
+    if (sceKernelVirtualQuery((const void *)cursor, 1 /* find next */, &info, sizeof(info)) != 0) return;
+    if (info.start >= end || info.end <= cursor) return;
+    if (info.flags & 2u) {
+      const uintptr_t from = info.start > cursor ? info.start : cursor;
+      const uintptr_t to = info.end < end ? info.end : end;
+      eden_mc_add(info.offset + (int64_t)(from - info.start), to - from, -1);
+    }
+    cursor = info.end;
+  }
+}
+
+struct EdenMcTrace { uintptr_t pc[12]; unsigned count; };
+static _Unwind_Reason_Code eden_mc_frame(struct _Unwind_Context *context, void *argument) {
+  struct EdenMcTrace *trace = (struct EdenMcTrace *)argument;
+  if (trace->count >= 12) return _URC_END_OF_STACK;
+  trace->pc[trace->count++] = (uintptr_t)_Unwind_GetIP(context);
+  return _URC_NO_REASON;
+}
+
+int __wrap_sceKernelMapDirectMemory(void **address, size_t size, int protection, int flags, int64_t physical,
+                                    size_t alignment) {
+  const int mode = eden_mc_mode();
+  if (mode == 1) return __real_sceKernelMapDirectMemory(address, size, protection, flags, physical, alignment);
+  if ((flags & EDEN_MC_FIXED) && address && *address) eden_mc_forget((uintptr_t)*address, size);
+  const int result = __real_sceKernelMapDirectMemory(address, size, protection, flags, physical, alignment);
+  if (result == 0 && address) {
+    eden_mc_add(physical, size, 1);
+    if (!atomic_load_explicit(&eden_mc_verified, memory_order_relaxed)) {
+      struct EdenVq info;
+      memset(&info, 0, sizeof(info));
+      const int query = sceKernelVirtualQuery(*address, 0, &info, sizeof(info));
+      const int ok = query == 0 && (info.flags & 2u) &&
+                     info.offset + (int64_t)((uintptr_t)*address - info.start) == physical;
+      atomic_store_explicit(&eden_mc_verified, 1, memory_order_relaxed);
+      char line[200];
+      snprintf(line, sizeof(line), "EDEN_RELEASE_MAPPED_CHECK query %s: rc=%d at=%p start=%#llx offset=%#llx flags=%#x physical=%#llx\n",
+               ok ? "ok" : "MISMATCH (check off)", query, *address, (unsigned long long)info.start,
+               (unsigned long long)info.offset, info.flags, (unsigned long long)physical);
+      eden_mc_say(line);
+      if (!ok) atomic_store_explicit(&eden_mc_state, 1, memory_order_release);
+    }
+  }
+  return result;
+}
+int __wrap_sceKernelMunmap(void *address, size_t size) {
+  if (eden_mc_mode() != 1) eden_mc_forget((uintptr_t)address, size);
+  return __real_sceKernelMunmap(address, size);
+}
+int __wrap_munmap(void *address, size_t size) {
+  if (eden_mc_mode() != 1) eden_mc_forget((uintptr_t)address, size);
+  return __real_munmap(address, size);
+}
+void *__wrap_mmap(void *address, size_t size, int protection, int flags, int fd, long offset) {
+  if ((flags & EDEN_MC_FIXED) && address && eden_mc_mode() != 1) eden_mc_forget((uintptr_t)address, size);
+  return __real_mmap(address, size, protection, flags, fd, offset);
+}
+int __wrap_sceKernelReserveVirtualRange(void **address, size_t size, int flags, size_t alignment) {
+  if ((flags & EDEN_MC_FIXED) && address && *address && eden_mc_mode() != 1) eden_mc_forget((uintptr_t)*address, size);
+  return __real_sceKernelReserveVirtualRange(address, size, flags, alignment);
+}
+
+/* Before a release: 1 when the block is to be kept (mode 2 found it mapped). */
+static int eden_mc_release_check(int64_t start, size_t size, uintptr_t caller) {
+  const int mode = eden_mc_mode();
+  if (mode == 1 || start < 0 || !size) return 0;
+  uint64_t first = (uint64_t)start >> EDEN_MC_PAGE_SHIFT;
+  uint64_t last = ((uint64_t)start + size - 1) >> EDEN_MC_PAGE_SHIFT;
+  if (last >= eden_mc_pages) last = eden_mc_pages - 1;
+  unsigned mapped = 0, stuck = 0;
+  uint64_t first_mapped = 0;
+  while (atomic_flag_test_and_set_explicit(&eden_mc_lock, memory_order_acquire)) {}
+  for (uint64_t page = first; page <= last && first < eden_mc_pages; ++page) {
+    const uint16_t value = eden_mc_count[page];
+    if (value == EDEN_MC_STUCK) ++stuck;
+    else if (value) {
+      if (!mapped) first_mapped = page;
+      ++mapped;
+      if (mode == 2) eden_mc_count[page] = 0; /* the system takes those mappings away now */
+    }
+  }
+  atomic_flag_clear_explicit(&eden_mc_lock, memory_order_release);
+  if (!mapped) return 0;
+  const unsigned hit = atomic_fetch_add(&eden_mc_hits, 1);
+  if (atomic_fetch_add(&eden_mc_lines, 1) < 48) {
+    struct EdenMcTrace trace = {{0}, 0};
+    _Unwind_Backtrace(eden_mc_frame, &trace);
+    char line[512];
+    int length = snprintf(line, sizeof(line),
+                          "EDEN_RELEASE_MAPPED #%u%s phys=%#llx size=%#zx mapped_pages=%u first=%#llx stuck=%u caller=%p base=%p bt=",
+                          hit, mode == 3 ? " KEPT" : "", (unsigned long long)start, size, mapped,
+                          (unsigned long long)(first_mapped << EDEN_MC_PAGE_SHIFT), stuck, (void *)caller,
+                          (void *)&__wrap_sceKernelReleaseDirectMemory);
+    for (unsigned i = 0; i < trace.count && length > 0 && length < (int)sizeof(line) - 24; ++i)
+      length += snprintf(line + length, sizeof(line) - (size_t)length, "%#llx ", (unsigned long long)trace.pc[i]);
+    if (length > 0 && length < (int)sizeof(line) - 1) {
+      line[length] = '\n';
+      line[length + 1] = 0;
+    }
+    eden_mc_say(line);
+  }
+  return mode == 3;
+}
+static void eden_mc_release_failed(int64_t start, size_t size, int result, uintptr_t caller) {
+  if (eden_mc_mode() == 1 || atomic_fetch_add(&eden_mc_failed_lines, 1) >= 16) return;
+  char line[200];
+  snprintf(line, sizeof(line), "EDEN_RELEASE_FAILED phys=%#llx size=%#zx rc=%#x caller=%p base=%p\n",
+           (unsigned long long)start, size, result, (void *)caller, (void *)&__wrap_sceKernelReleaseDirectMemory);
+  eden_mc_say(line);
 }

@@ -24,6 +24,9 @@
 #include <cerrno>
 #include <cstring>
 #include <sys/stat.h>
+#ifdef PS5_NATIVE
+extern "C" void eden_release_mapped_check_start(void);
+#endif
 extern "C" size_t eden_heap_last_failure(unsigned*, size_t*);
 extern "C" void eden_heap_set_ralloc_scratch(int) __attribute__((weak));
 #endif
@@ -559,6 +562,10 @@ int main(int argc, char** argv) {
                 std::printf("EDEN_ENV %s\n", entry.c_str());
             }
         }
+#ifdef PS5_NATIVE
+        // H42 diagnostic: EDEN_RELEASE_MAPPED_CHECK (src/direct_memory.c), read after env.txt.
+        eden_release_mapped_check_start();
+#endif
         // EDEN_HEAP_RALLOC_SCRATCH=0 turns the compiler scratch arenas off; read here, after env.txt.
         if (const char* scratch = std::getenv("EDEN_HEAP_RALLOC_SCRATCH");
             scratch != nullptr && eden_heap_set_ralloc_scratch != nullptr) {
