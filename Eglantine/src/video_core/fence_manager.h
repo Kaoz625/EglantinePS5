@@ -28,6 +28,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
+#include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
@@ -326,16 +327,21 @@ private:
                 texture_pops += (released.flushes & TextureFlushes) != 0 ? 1 : 0;
                 buffer_pops += (released.flushes & BufferFlushes) != 0 ? 1 : 0;
             }
-            if (texture_pops != 0) {
-                std::scoped_lock lock{texture_cache.mutex};
-                for (size_t i = 0; i < texture_pops; ++i) {
-                    texture_cache.PopAsyncFlushes();
+            // H35: the guest writes under these locks must not wait for the back to submit
+            // (it may be waiting for the same lock in SignalFence).
+            if (texture_pops != 0 || buffer_pops != 0) {
+                VideoCore::AsyncReadback::NoSubmitWaitScope no_submit_wait;
+                if (texture_pops != 0) {
+                    std::scoped_lock lock{texture_cache.mutex};
+                    for (size_t i = 0; i < texture_pops; ++i) {
+                        texture_cache.PopAsyncFlushes();
+                    }
                 }
-            }
-            if (buffer_pops != 0) {
-                std::scoped_lock lock{buffer_cache.mutex};
-                for (size_t i = 0; i < buffer_pops; ++i) {
-                    buffer_cache.PopAsyncFlushes();
+                if (buffer_pops != 0) {
+                    std::scoped_lock lock{buffer_cache.mutex};
+                    for (size_t i = 0; i < buffer_pops; ++i) {
+                        buffer_cache.PopAsyncFlushes();
+                    }
                 }
             }
             // Queries and operations keep their per-fence order.
@@ -389,13 +395,16 @@ private:
 
     /// committed: what CommitAsyncFlushes returned for this fence.
     void PopAsyncFlushes(u8 committed) {
-        if (committed & TextureFlushes) {
-            std::scoped_lock lock{texture_cache.mutex};
-            texture_cache.PopAsyncFlushes();
-        }
-        if (committed & BufferFlushes) {
-            std::scoped_lock lock{buffer_cache.mutex};
-            buffer_cache.PopAsyncFlushes();
+        {
+            VideoCore::AsyncReadback::NoSubmitWaitScope no_submit_wait; // H35
+            if (committed & TextureFlushes) {
+                std::scoped_lock lock{texture_cache.mutex};
+                texture_cache.PopAsyncFlushes();
+            }
+            if (committed & BufferFlushes) {
+                std::scoped_lock lock{buffer_cache.mutex};
+                buffer_cache.PopAsyncFlushes();
+            }
         }
         query_cache.PopAsyncFlushes();
     }
