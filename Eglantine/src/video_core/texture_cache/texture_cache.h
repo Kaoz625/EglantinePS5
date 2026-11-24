@@ -277,6 +277,18 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             (evict_bad_overlaps && False(image.flags & ImageFlagBits::BadOverlap))) {
             return false;
         }
+        // H53k: GPU-written 3D images stay. Kirby Air Riders renders its colour-grading LUTs
+        // (33x33x33 RGBA16F, 280 KiB each) on the GPU; once the collector deleted them (downloaded)
+        // and they were made again from guest memory, the screen stayed black. EDEN_NX2_TC_KEEP_3D=0
+        // lets the collector take them again.
+        static const bool keep_3d = [] {
+            const char* value = std::getenv("EDEN_NX2_TC_KEEP_3D");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (keep_3d && image.info.type == ImageType::e3D &&
+            True(image.flags & ImageFlagBits::GpuModified)) {
+            return false;
+        }
         const bool must_download =
             IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
         if (out_must_download != nullptr) {
