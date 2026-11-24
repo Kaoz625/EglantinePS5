@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <system_error>
 
@@ -65,29 +67,68 @@ u64 UnixNow() {
 
 LogFile ReadLogFile(const std::filesystem::path& file, const ForEach& for_each) {
     LogFile log;
+    std::vector<LogSegment> segments;
     std::ifstream stream(file, std::ios::binary | std::ios::ate);
     if (stream.is_open()) {
         const std::streamoff size = stream.tellg();
-        if (size > 0) {
-            log.bytes.resize(static_cast<size_t>(size));
-            stream.seekg(0);
-            // In chunks: MinGW's libstdc++ hands one read to the CRT's _read, which aborts the
-            // process (invalid parameter) on a count above INT_MAX, a cache past 2 GiB
-            constexpr std::streamoff Chunk = std::streamoff{256} << 20;
-            std::streamoff done = 0;
-            while (done < size) {
-                const std::streamoff want = std::min(Chunk, size - done);
-                stream.read(reinterpret_cast<char*>(log.bytes.data()) + done, want);
-                done += stream.gcount();
-                if (stream.gcount() != want) {
-                    break;
-                }
-            }
+        stream.seekg(0);
+        // H47: in pieces of PieceBytes, each cut after the last record it holds whole; the rest
+        // starts the next piece. (Also keeps every read below INT_MAX: MinGW's libstdc++ hands one
+        // read to the CRT's _read, which aborts on a larger count.)
+        static const u64 PieceBytes = [] {
+            const char* value = std::getenv("EDEN_SC_READ_PIECE_MIB");
+            const long mib = value ? std::strtol(value, nullptr, 10) : 32;
+            return u64(mib >= 1 && mib <= 1024 ? mib : 32) << 20;
+        }();
+        u64 done = 0;
+        std::vector<u8> carry;
+        while (size > 0) {
+            std::vector<u8> piece = std::move(carry);
+            carry = {};
+            const u64 piece_offset = done - piece.size();
+            const u64 left = done < static_cast<u64>(size) ? static_cast<u64>(size) - done : 0;
+            const u64 want = std::min<u64>(PieceBytes, left);
+            const size_t kept = piece.size();
+            piece.resize(kept + static_cast<size_t>(want));
+            stream.read(reinterpret_cast<char*>(piece.data()) + kept,
+                        static_cast<std::streamsize>(want));
+            const u64 got = static_cast<u64>(stream.gcount());
+            piece.resize(kept + static_cast<size_t>(got));
+            done += got;
             // Cut short when the file shrank since (a compaction replaced it)
-            log.bytes.resize(static_cast<size_t>(done));
+            const bool last = got != want || done >= static_cast<u64>(size);
+            if (!last) {
+                const u64 start = piece_offset == 0 ? FileHeaderSize : 0;
+                const u64 cut = piece.size() < start ? start : LogSegmentCut(piece, start);
+                if (cut <= start) {
+                    // Not one whole record yet (a record or a damaged stretch longer than a
+                    // piece): read on into the same piece
+                    carry = std::move(piece);
+                    continue;
+                }
+                carry.assign(piece.begin() + static_cast<std::ptrdiff_t>(cut), piece.end());
+                piece.resize(static_cast<size_t>(cut));
+            }
+            if (!piece.empty()) {
+                log.pieces.push_back(std::move(piece));
+                segments.push_back({.bytes = log.pieces.back(), .offset = piece_offset});
+            }
+            if (last) {
+                break;
+            }
         }
     }
-    log.parsed = ParseLog(log.bytes, for_each);
+    // Spans into the pieces stay valid as log.pieces grows: a moved vector keeps its buffer.
+    log.parsed = ParseLogSegments(segments, for_each);
+    if (!log.pieces.empty()) {
+        size_t largest = 0;
+        for (const auto& piece : log.pieces) {
+            largest = std::max(largest, piece.size());
+        }
+        std::fprintf(stderr, "EDEN_SC_READ pieces=%zu largest_mib=%.1f file_mib=%.1f (H47)\n",
+                     log.pieces.size(), largest / 1048576.0,
+                     log.parsed.stats.file_size / 1048576.0);
+    }
     return log;
 }
 

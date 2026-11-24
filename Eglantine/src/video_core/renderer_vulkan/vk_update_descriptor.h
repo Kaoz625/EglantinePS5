@@ -10,6 +10,7 @@
 #include <span>
 #include <variant>
 #include <vector>
+#include "video_core/renderer_vulkan/descriptor_payload_growth.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
@@ -141,7 +142,17 @@ private:
     size_t peak_frame_entries = 0;
     size_t ticks_since_report = 0;
     DescriptorUpdateEntry* upload_start = nullptr;
-    std::unique_ptr<DescriptorUpdateEntry[]> payload;
+    DescriptorUpdateEntry* chunk_end = nullptr;
+    std::unique_ptr<ChunkedDescriptorPayload<DescriptorUpdateEntry>> payload;
+    // H47: entries this frame in chunks already left, most chunks one frame used (frame + window)
+    size_t frame_entries_before{};
+    size_t frame_chunks{1};
+    size_t window_peak_chunks{1};
+    size_t window_frames{};
+    size_t shrink_to_chunks{}; // > 0 = give back chunks at the next Acquire (after a drain)
+    size_t reported_extra_high{};
+    size_t freed_total{};
+    size_t drains{};
     bool growth_disabled{};
     bool fallback_reported{};
 };

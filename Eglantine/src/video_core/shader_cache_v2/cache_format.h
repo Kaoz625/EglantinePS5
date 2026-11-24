@@ -123,4 +123,20 @@ using ForEach = std::function<void(size_t count, const std::function<void(size_t
 /// are checked on its threads; the result is the same.
 [[nodiscard]] ParsedLog ParseLog(std::span<const u8> bytes, const ForEach& for_each = {});
 
+/// One piece of a log read in pieces (H47): its bytes begin at `offset` in the file.
+struct LogSegment {
+    std::span<const u8> bytes;
+    u64 offset;
+};
+
+/// ParseLog over a log held in pieces, the same result as over the whole file. Piece 0 begins the
+/// file (and holds its header); no record crosses from one piece into the next (LogSegmentCut).
+[[nodiscard]] ParsedLog ParseLogSegments(std::span<const LogSegment> segments,
+                                         const ForEach& for_each = {});
+
+/// Where a piece of a log being read, whose walk begins at `start`, ends: after the last record it
+/// holds whole, or at a scan for a record header that runs off its end. What follows belongs to the
+/// next piece.
+[[nodiscard]] u64 LogSegmentCut(std::span<const u8> bytes, u64 start);
+
 } // namespace VideoCommon::ShaderCacheV2

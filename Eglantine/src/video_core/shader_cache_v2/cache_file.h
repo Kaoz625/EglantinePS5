@@ -20,9 +20,11 @@ class FileLock;
 
 namespace VideoCommon::ShaderCacheV2 {
 
-/// A log read into memory; `parsed` points into `bytes`.
+/// A log read into memory; `parsed` points into `pieces`. H47: the file is held in pieces of about
+/// 32 MiB cut at record boundaries (LogSegmentCut), never in one buffer of the whole file (Kirby Air
+/// Riders: 741 MiB in one block at boot).
 struct LogFile {
-    std::vector<u8> bytes;
+    std::vector<std::vector<u8>> pieces;
     ParsedLog parsed;
 
     LogFile() = default;

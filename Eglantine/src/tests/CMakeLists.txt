@@ -182,6 +182,7 @@ add_executable(tests
     video_core/ampere_stage_buffer_output.cpp
     video_core/pipeline_cache_files.cpp
     video_core/shader_cache_v2.cpp
+    video_core/shader_cache_v2_segments.cpp
     video_core/evicted_pointer_slots.cpp
     video_core/shader_cache_v2_programs.cpp
     video_core/shader_cache_v2_driver.cpp

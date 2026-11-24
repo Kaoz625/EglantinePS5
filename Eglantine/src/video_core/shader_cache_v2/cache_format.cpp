@@ -83,8 +83,8 @@ bool PayloadIntact(std::span<const u8> bytes, u64 offset, u16 kind, u64 key,
 /// for intact to `on_record` with the bytes it takes in the file, and counts what it passes over
 template <typename PayloadIntactFn, typename OnRecord>
 void WalkRecords(std::span<const u8> bytes, LogStats& stats, PayloadIntactFn&& payload_intact,
-                 OnRecord&& on_record) {
-    u64 offset = FileHeaderSize;
+                 OnRecord&& on_record, u64 start = FileHeaderSize) {
+    u64 offset = start;
     while (offset < bytes.size()) {
         const u64 left = bytes.size() - offset;
         if (left < RecordHeaderSize) {
@@ -199,18 +199,53 @@ std::optional<LogRecord> ParseRecord(std::span<const u8> bytes, u64 offset) {
                      .payload = payload};
 }
 
+u64 LogSegmentCut(std::span<const u8> bytes, u64 start) {
+    // Mirrors WalkRecords without the payload hashes: a piece ends after the last record it holds
+    // whole, or where a scan for the next record header runs off its end.
+    u64 offset = start;
+    while (offset < bytes.size()) {
+        const u64 left = bytes.size() - offset;
+        if (left < RecordHeaderSize) {
+            return offset;
+        }
+        const std::optional<RecordHeader> header = ReadRecordHeader(bytes, offset);
+        if (!header) {
+            const u64 next = FindRecord(bytes, offset + RecordAlignment);
+            if (next == bytes.size()) {
+                return offset;
+            }
+            offset = next;
+            continue;
+        }
+        const u64 size = RecordSize(header->payload_size);
+        if (size > left) {
+            return offset;
+        }
+        offset += size;
+    }
+    return offset;
+}
+
 ParsedLog ParseLog(std::span<const u8> bytes, const ForEach& for_each) {
+    const LogSegment whole{.bytes = bytes, .offset = 0};
+    return ParseLogSegments(std::span<const LogSegment>{&whole, 1}, for_each);
+}
+
+ParsedLog ParseLogSegments(std::span<const LogSegment> segments, const ForEach& for_each) {
     ParsedLog log;
     LogStats& stats = log.stats;
-    stats.file_size = bytes.size();
-    if (bytes.empty()) {
+    for (const LogSegment& segment : segments) {
+        stats.file_size += segment.bytes.size();
+    }
+    const std::span<const u8> bytes = segments.empty() ? std::span<const u8>{} : segments[0].bytes;
+    if (stats.file_size == 0) {
         log.header = HeaderStatus::Empty;
         return log;
     }
     if (bytes.size() < FileHeaderSize) {
         log.header = HeaderStatus::Damaged;
-        stats.torn_tail_bytes = bytes.size();
-        stats.dead_bytes = bytes.size();
+        stats.torn_tail_bytes = stats.file_size;
+        stats.dead_bytes = stats.file_size;
         return log;
     }
     if (std::memcmp(bytes.data(), FileMagic.data(), FileMagic.size()) == 0 &&
@@ -251,58 +286,68 @@ ParsedLog ParseLog(std::span<const u8> bytes, const ForEach& for_each) {
         u8 intact; ///< 0 not checked, 1 intact, 2 damaged
     };
     std::vector<Checked> checked;
-    if (for_each) {
-        LogStats ignored;
-        WalkRecords(
-            bytes, ignored, [](u64, const RecordHeader&, std::span<const u8>) { return true; },
-            [&](u64 offset, const RecordHeader& header, std::span<const u8> payload, u64) {
-                checked.push_back({offset, payload, header.kind, header.key, 0});
-            });
-        const size_t chunks = std::min<size_t>(checked.size(), 256);
-        for_each(chunks, [&](size_t chunk) {
-            const size_t end = (chunk + 1) * checked.size() / chunks;
-            for (size_t index = chunk * checked.size() / chunks; index < end; ++index) {
-                Checked& record = checked[index];
-                record.intact = PayloadIntact(bytes, record.offset, record.kind, record.key,
-                                              record.payload)
-                                    ? 1
-                                    : 2;
-            }
-        });
-    }
-    const auto payload_intact = [&](u64 offset, const RecordHeader& header,
-                                    std::span<const u8> payload) {
-        const auto it = std::ranges::lower_bound(checked, offset, {}, &Checked::offset);
-        if (it != checked.end() && it->offset == offset && it->intact != 0) {
-            return it->intact == 1;
-        }
-        return PayloadIntact(bytes, offset, header.kind, header.key, payload);
-    };
-    WalkRecords(bytes, stats, payload_intact,
-                [&](u64 offset, const RecordHeader& header, std::span<const u8> payload,
-                    u64 size) {
-                    ++stats.records;
-                    const KindKey id{header.kind, header.key};
-                    if (static_cast<RecordKind>(header.kind) == RecordKind::Tombstone) {
-                        ++stats.tombstones;
-                        stats.dead_bytes += size;
-                        if (payload.size() == sizeof(u16)) {
-                            remove({Load<u16>(payload, 0), header.key});
-                        }
-                    } else {
-                        remove(id);
-                        latest.emplace(id, entries.size());
-                        entries.push_back({
-                            .record = {.kind = static_cast<RecordKind>(header.kind),
-                                       .flags = header.flags,
-                                       .key = header.key,
-                                       .offset = offset,
-                                       .payload = payload},
-                            .size = size,
-                            .live = true,
-                        });
+    for (size_t index = 0; index < segments.size(); ++index) {
+        const std::span<const u8> piece = segments[index].bytes;
+        const u64 base = segments[index].offset;
+        const u64 start = index == 0 ? FileHeaderSize : 0;
+        checked.clear();
+        if (for_each) {
+            LogStats ignored;
+            WalkRecords(
+                piece, ignored, [](u64, const RecordHeader&, std::span<const u8>) { return true; },
+                [&](u64 offset, const RecordHeader& header, std::span<const u8> payload, u64) {
+                    checked.push_back({offset, payload, header.kind, header.key, 0});
+                },
+                start);
+            const size_t chunks = std::min<size_t>(checked.size(), 256);
+            if (chunks != 0) {
+                for_each(chunks, [&](size_t chunk) {
+                    const size_t end = (chunk + 1) * checked.size() / chunks;
+                    for (size_t at = chunk * checked.size() / chunks; at < end; ++at) {
+                        Checked& record = checked[at];
+                        record.intact = PayloadIntact(piece, record.offset, record.kind,
+                                                      record.key, record.payload)
+                                            ? 1
+                                            : 2;
                     }
                 });
+            }
+        }
+        const auto payload_intact = [&](u64 offset, const RecordHeader& header,
+                                        std::span<const u8> payload) {
+            const auto it = std::ranges::lower_bound(checked, offset, {}, &Checked::offset);
+            if (it != checked.end() && it->offset == offset && it->intact != 0) {
+                return it->intact == 1;
+            }
+            return PayloadIntact(piece, offset, header.kind, header.key, payload);
+        };
+        WalkRecords(
+            piece, stats, payload_intact,
+            [&](u64 offset, const RecordHeader& header, std::span<const u8> payload, u64 size) {
+                ++stats.records;
+                const KindKey id{header.kind, header.key};
+                if (static_cast<RecordKind>(header.kind) == RecordKind::Tombstone) {
+                    ++stats.tombstones;
+                    stats.dead_bytes += size;
+                    if (payload.size() == sizeof(u16)) {
+                        remove({Load<u16>(payload, 0), header.key});
+                    }
+                } else {
+                    remove(id);
+                    latest.emplace(id, entries.size());
+                    entries.push_back({
+                        .record = {.kind = static_cast<RecordKind>(header.kind),
+                                   .flags = header.flags,
+                                   .key = header.key,
+                                   .offset = base + offset,
+                                   .payload = payload},
+                        .size = size,
+                        .live = true,
+                    });
+                }
+            },
+            start);
+    }
 
     for (const Entry& entry : entries) {
         if (entry.live) {
