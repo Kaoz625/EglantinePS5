@@ -1346,6 +1346,16 @@ void TextureCache<P>::TickFrame() {
                runtime.IsFree(gpu_sentenced_images.front().tick)) {
             gpu_sentenced_bytes -= gpu_sentenced_images.front().bytes;
             gpu_sentenced_images.pop_front();
+            ++defer_free_images;
+        }
+        // H45: deleted images are destroyed (and their memory freed) only once the GPU is past
+        // their last submission; this says how many waited and how many still wait.
+        if (frame_tick % 600 == 0) {
+            LOG_INFO(HW_GPU,
+                     "EDEN_DEFER_FREE images freed after their fence: {} (last 600 frames), "
+                     "waiting: {} ({} MiB)",
+                     defer_free_images, gpu_sentenced_images.size(), gpu_sentenced_bytes >> 20);
+            defer_free_images = 0;
         }
     }
     // If we can obtain the memory info, use it instead of the estimate. Read before the budget

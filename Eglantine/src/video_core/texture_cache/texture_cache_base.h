@@ -947,6 +947,7 @@ private:
     };
     std::deque<GpuSentencedImage> gpu_sentenced_images;
     u64 gpu_sentenced_bytes{};
+    u64 defer_free_images{}; ///< H45 EDEN_DEFER_FREE: freed after their fence since the last log
 
     /// Bytes of images per device memory block, for the collector (refreshed every 60 frames).
     std::unordered_map<u64, u64> block_image_bytes;

@@ -141,6 +141,12 @@ The crash moves ~80 s later.
     gives back 130–330 MiB per pass.
   - A bind over a given-back granule takes a new piece first, or fails with
     `VK_ERROR_OUT_OF_DEVICE_MEMORY` so the app recovers memory and binds again.
+- **Sparse backing kept** (`tools/patch-radv-sparse-backing.py`, H45). The trim counted only
+  vkBind*Memory, not sparse binds, so a granule holding only sparse tiles or layers looked unused
+  and was given back while the sparse range still mapped it (reasoned cause of the H44 R1 GPU page
+  fault, TCP read of unmapped 0x41b1aac000; not yet matched in a buffer object log). Memory a
+  sparse range maps is now never trimmed. stderr `EDEN_DEFER_FREE radv...`; eden_log
+  `EDEN_DEFER_FREE images freed after their fence` every 600 frames.
 - **Texture cache ceiling for Switch 2 titles** (core patch `0024`). The thresholds are capped at
   3.5/4 GiB (expected/critical); the environment variables still override them.
 
