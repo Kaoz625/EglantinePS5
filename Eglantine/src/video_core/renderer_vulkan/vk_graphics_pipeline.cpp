@@ -1603,6 +1603,43 @@ void GraphicsPipeline::TraceDrawTextures(std::span<const VideoCommon::ImageViewI
                                   written_frame, memory);
         }
     }
+    // H49g: for full-screen targets, what places the quad and its UVs: viewport 0, vertex
+    // stream 0 and the first constant buffers of the vertex and pixel stages (guest bytes as
+    // floats). A uniform output colour = one texel sampled everywhere (degenerate UVs/scale).
+    if (max_draws > 1) {
+        const auto& vp = regs.viewport_transform[0];
+        std::string extra = fmt::format(" vp={:g},{:g},{:g},{:g}", vp.scale_x, vp.scale_y,
+                                        vp.translate_x, vp.translate_y);
+        const auto floats = [&](GPUVAddr address, u32 size, u32 count) {
+            std::array<float, 16> values{};
+            const u32 bytes = std::min<u32>(std::min<u32>(count, 16) * 4, size);
+            if (address != 0 && bytes != 0) {
+                gpu_memory->ReadBlockUnsafe(address, values.data(), bytes);
+            }
+            std::string text;
+            for (u32 i = 0; i < bytes / 4; ++i) {
+                text += fmt::format("{}{:g}", i ? "," : "", values[i]);
+            }
+            return text;
+        };
+        const auto& stream = regs.vertex_streams[0];
+        if (stream.IsEnabled()) {
+            extra += fmt::format(" vb0={:#x}/{}:[{}]", stream.Address(), static_cast<u32>(stream.stride.Value()),
+                                 floats(stream.Address(), 64, 16));
+        }
+        for (const size_t stage : {size_t{1}, size_t{5}}) {
+            const auto& cbufs = maxwell3d->state.shader_stages[stage == 1 ? 0 : 4].const_buffers;
+            for (size_t i = 0; i < 4; ++i) {
+                if (!cbufs[i].enabled || cbufs[i].address == 0) {
+                    continue;
+                }
+                extra += fmt::format(" {}cb{}={:#x}/{}:[{}]", stage == 1 ? "v" : "p", i,
+                                     cbufs[i].address, cbufs[i].size,
+                                     floats(cbufs[i].address, cbufs[i].size, 12));
+            }
+        }
+        listed += extra;
+    }
     std::fprintf(stderr,
                  "EDEN_DRAW_STATS textures d%u rt0=%#llx %ux%u fmt=%#x vs=%#llx ps=%#llx entries=%u "
                  "null=%u distinct=%u gpu_written=%u%s\n",
