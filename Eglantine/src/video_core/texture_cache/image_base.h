@@ -144,6 +144,12 @@ struct ImageBase {
     u64 load_tick = 0;
     /// frame_tick + 1 of the first frame a render pass other than a clear wrote it, or 0.
     u64 first_written_frame = 0;
+    /// EDEN_DRAW_STATS: hash of the guest bytes at the last RefreshContents that cleared
+    /// CpuModified, what that refresh did (1 uploaded, 2 stale-skip, 3 unbacked skip) and its frame.
+    u64 trace_upload_hash = 0;
+    u64 trace_refresh_frame = 0;
+    u32 trace_refresh = 0;
+    u32 trace_refreshes = 0;
     /// Levels whose every layer a shader last wrote through a storage view. Any other GPU write
     /// (render pass, clear, copy, alias copy) and an upload from guest memory clear them.
     u32 storage_written_levels = 0;

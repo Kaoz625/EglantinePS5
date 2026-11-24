@@ -17,6 +17,7 @@
 #include <optional>
 #include <bit>
 #include <chrono>
+#include <cstring>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -40,6 +41,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/render_trace.h"
+#include "video_core/draw_stats.h"
 #include "video_core/texture_cache/conversion.h"
 #include "video_core/texture_cache/eviction_age.h"
 #include "video_core/texture_cache/host_memory_limit.h"
@@ -3604,6 +3606,33 @@ void TextureCache<P>::NoteHostOutOfMemory(std::string_view operation, const Imag
 }
 
 template <class P>
+typename TextureCache<P>::TraceMemory TextureCache<P>::TraceImageMemory(const ImageBase& image) {
+    TraceMemory out{};
+    const u64 size = image.guest_size_bytes;
+    if (size == 0 || size > 32_MiB || image.cpu_addr == 0) {
+        return out;
+    }
+    thread_local std::vector<u8> bytes;
+    bytes.resize(size);
+    device_memory.ReadBlockUnsafe(image.cpu_addr, bytes.data(), size);
+    u64 hash = 0xcbf29ce484222325ULL;
+    u64 zeros = 0;
+    const size_t words = size / 8;
+    for (size_t i = 0; i < words; ++i) {
+        u64 word;
+        std::memcpy(&word, bytes.data() + i * 8, 8);
+        hash = (hash ^ word) * 0x100000001b3ULL;
+        zeros += word == 0 ? 8 : 0;
+    }
+    out.hash = hash;
+    out.zero_permille = static_cast<u32>(zeros * 1000 / size);
+    std::memcpy(&out.first_word, bytes.data() + (size / 2 & ~u64{15}), 4);
+    out.stale = stale_pages.IsAll(image.cpu_addr, size);
+    out.read = true;
+    return out;
+}
+
+template <class P>
 void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     if (False(image.flags & ImageFlagBits::CpuModified)) {
         // Only upload modified images
@@ -3620,6 +3649,12 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     image.flags &= ~ImageFlagBits::CpuModified;
     image.load_tick = modification_tick;
     image.storage_written_levels = 0;
+    if (VideoCommon::DrawStats::Enabled()) {
+        image.trace_upload_hash = TraceImageMemory(image).hash;
+        image.trace_refresh = 1;
+        image.trace_refresh_frame = frame_tick;
+        ++image.trace_refreshes;
+    }
 
     // Images uploaded by layer stay tracked while some of their layers are dirty.
     if (False(image.flags & ImageFlagBits::Tracked)) {
@@ -3656,6 +3691,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
                 }
                 ++tc_stale_skips;
                 tc_stale_skip_bytes += image.guest_size_bytes;
+                image.trace_refresh = 2;
                 runtime.TransitionImageLayout(image);
                 return;
             }
@@ -3680,6 +3716,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
 
     if (True(image.flags & ImageFlagBits::Unbacked)) {
         // Nothing to upload into (and staging it could take tens of GB).
+        image.trace_refresh = 3;
         runtime.TransitionImageLayout(image);
         return;
     }

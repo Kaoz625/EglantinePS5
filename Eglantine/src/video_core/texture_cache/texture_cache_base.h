@@ -319,6 +319,17 @@ public:
         return slot_images[id];
     }
 
+    /// EDEN_DRAW_STATS: the guest bytes an image is made from now (64-bit hash, zero bytes per
+    /// mille, whether every page is marked stale, whether its pages are CPU-write tracked).
+    struct TraceMemory {
+        u64 hash = 0;
+        u32 zero_permille = 0;
+        u32 first_word = 0;
+        bool stale = false;
+        bool read = false;
+    };
+    [[nodiscard]] TraceMemory TraceImageMemory(const ImageBase& image);
+
     // Publish the CPU-readable collision image. Caller holds the cache mutex.
     bool PublishComputeCollisionImage(u32 index);
 

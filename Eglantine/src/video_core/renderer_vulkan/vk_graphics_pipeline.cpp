@@ -1505,6 +1505,7 @@ void GraphicsPipeline::TraceDrawTextures(std::span<const VideoCommon::ImageViewI
     }
     static u64 window = ~0ULL;
     static std::array<std::pair<u64, u32>, 16> logged{};
+    static std::array<u32, 16> logged_draws{};
     static size_t logged_count = 0;
     const u64 now_window = VideoCommon::DrawStats::Get().window.load(std::memory_order_relaxed);
     if (now_window != window) {
@@ -1513,15 +1514,27 @@ void GraphicsPipeline::TraceDrawTextures(std::span<const VideoCommon::ImageViewI
     }
     const auto& regs{maxwell3d->regs};
     const std::pair<u64, u32> key{regs.rt[0].Address(), regs.rt[0].width};
+    // H49f: full-screen targets (1920 wide and up) log their first 8 draws, others their first.
+    const u32 max_draws = regs.rt[0].width >= 1920 ? 8 : 1;
+    size_t slot = logged_count;
     for (size_t i = 0; i < logged_count; ++i) {
         if (logged[i] == key) {
-            return;
+            slot = i;
+            break;
         }
     }
-    if (logged_count >= logged.size()) {
+    if (slot == logged_count) {
+        if (logged_count >= logged.size()) {
+            return;
+        }
+        logged[logged_count] = key;
+        logged_draws[logged_count] = 0;
+        ++logged_count;
+    }
+    if (logged_draws[slot] >= max_draws) {
         return;
     }
-    logged[logged_count++] = key;
+    const u32 draw_number = logged_draws[slot]++;
     size_t view_index{};
     for (size_t stage = 0; stage < 4; ++stage) {
         if (!stages[stage]) {
@@ -1561,25 +1574,39 @@ void GraphicsPipeline::TraceDrawTextures(std::span<const VideoCommon::ImageViewI
         const bool has_image = view.image_id != VideoCommon::NULL_IMAGE_ID;
         u32 flags = 0;
         u64 written_frame = 0;
+        std::string memory;
         if (has_image) {
             const auto& image = texture_cache.GetImageForTrace(view.image_id);
             flags = static_cast<u32>(image.flags);
             written_frame = image.first_written_frame;
+            // H49f: CPU-side images: the guest bytes now vs the bytes at the last refresh. A hash
+            // that differs while CpuModified is clear = a CPU write the cache never saw.
+            if ((flags & static_cast<u32>(VideoCommon::ImageFlagBits::GpuModified)) == 0) {
+                const auto now = texture_cache.TraceImageMemory(image);
+                const bool cpu_modified =
+                    (flags & static_cast<u32>(VideoCommon::ImageFlagBits::CpuModified)) != 0;
+                memory = fmt::format(
+                    " dev={:#x} sz={:#x} gh={:016x} uh={:016x} same={} rf={}x{} rff={} z={} st={} w={:08x}",
+                    image.cpu_addr, image.guest_size_bytes, now.hash, image.trace_upload_hash,
+                    !now.read ? 2 : (now.hash == image.trace_upload_hash ? 1 : (cpu_modified ? 3 : 0)),
+                    image.trace_refresh, image.trace_refreshes, image.trace_refresh_frame,
+                    now.zero_permille, now.stale ? 1 : 0, now.first_word);
+            }
         }
         const bool gpu = (flags & static_cast<u32>(VideoCommon::ImageFlagBits::GpuModified)) != 0;
         gpu_written += gpu ? 1 : 0;
-        if ((gpu && listed_gpu < 6) || (!gpu && listed_other < 3)) {
+        if ((gpu && listed_gpu < 6) || (!gpu && listed_other < 4)) {
             ++(gpu ? listed_gpu : listed_other);
-            listed += fmt::format(" [{}:{:#x} {}x{} f{} fl={:#x} img={} w1={}]", index - first,
+            listed += fmt::format(" [{}:{:#x} {}x{} f{} fl={:#x} img={} w1={}{}]", index - first,
                                   view.gpu_addr, view.size.width, view.size.height,
                                   static_cast<u32>(view.format), flags, has_image ? 1 : 0,
-                                  written_frame);
+                                  written_frame, memory);
         }
     }
     std::fprintf(stderr,
-                 "EDEN_DRAW_STATS textures rt0=%#llx %ux%u fmt=%#x vs=%#llx ps=%#llx entries=%u "
+                 "EDEN_DRAW_STATS textures d%u rt0=%#llx %ux%u fmt=%#x vs=%#llx ps=%#llx entries=%u "
                  "null=%u distinct=%u gpu_written=%u%s\n",
-                 (unsigned long long)key.first, regs.rt[0].width, regs.rt[0].height,
+                 draw_number, (unsigned long long)key.first, regs.rt[0].width, regs.rt[0].height,
                  static_cast<u32>(regs.rt[0].format),
                  (unsigned long long)((u64{regs.pipelines[1].reserved[0] & 0xff} << 32) |
                                       regs.pipelines[1].reserved[1]),
