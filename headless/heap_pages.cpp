@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <unistd.h>
 
@@ -116,6 +117,28 @@ extern "C" void* eden_heap_split_pages(std::size_t size) {
     if (!WithRecoveryWait(span, [&] { return Common::CommitMemoryRangeFrom(address, span, false); })) {
         Common::ReleaseMemoryRange(address, span);
         return nullptr;
+    }
+    return address;
+}
+// H46: a large block (64 MiB or more) taken in parts of at most 32 MiB from the first: each part
+// is committed as above (it may itself land in smaller blocks), so a free block of the pool larger
+// than 32 MiB is left for the GPU, whose buffers need one, and no part asks for more than the pool
+// is likely to have in one block. Freed as eden_heap_split_pages (every block in the range).
+extern "C" void* eden_heap_split_pages_capped(std::size_t size) {
+    constexpr std::size_t large_page = std::size_t{2} << 20;
+    constexpr std::size_t part = std::size_t{32} << 20;
+    if (size == 0 || size > ~std::size_t{0} - large_page) return nullptr;
+    const std::size_t span = (size + large_page - 1) / large_page * large_page;
+    void* address = Common::ReserveAddressRange(span);
+    if (address == nullptr) return nullptr;
+    auto* begin = static_cast<std::uint8_t*>(address);
+    for (std::size_t done = 0; done < span;) {
+        const std::size_t step = span - done < part ? span - done : part;
+        if (!WithRecoveryWait(step, [&] { return Common::CommitMemoryRangeFrom(begin + done, step, false); })) {
+            Common::ReleaseMemoryRange(address, span);
+            return nullptr;
+        }
+        done += step;
     }
     return address;
 }

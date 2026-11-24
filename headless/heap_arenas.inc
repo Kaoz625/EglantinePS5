@@ -252,10 +252,18 @@ static size_t eden_heap_large_request(void) {
 #define EDEN_HEAP_LARGE_REQUEST (eden_heap_large_request())
 #define EDEN_HEAP_LARGE_BLOCKS 256u
 /* The large blocks alive: address 0 marks a free entry, 1 one being filled in. */
+/* H46: the call chain of each large block (return addresses read off the stack, as the site report
+ * does). The site table fills early in a long session (Kirby Air Riders: `no_group big=4835 MiB`),
+ * so the 384 MiB block made at ~+170 s on H44k/H45 was never named. EDEN_HEAP_LARGE_NEW is printed
+ * when a block of EDEN_HEAP_LARGE_LOG_MIB (64) or more is made; EDEN_HEAP_LARGE_LIVE lists the live
+ * ones in every heap report (eden_heap_large_report). */
+#define EDEN_HEAP_LARGE_PCS 10u
+static __attribute__((noinline)) unsigned eden_site_collect(uintptr_t *pcs);
 static struct {
   _Atomic uintptr_t address;
   size_t size;
   int split; /* its memory in pieces (eden_heap_split_pages) */
+  uintptr_t pcs[EDEN_HEAP_LARGE_PCS];
 } eden_heap_large[EDEN_HEAP_LARGE_BLOCKS];
 static atomic_uint eden_heap_large_count;
 static atomic_size_t eden_heap_large_bytes;
@@ -517,6 +525,77 @@ static int eden_heap_large_find(const void *address) {
   return -1;
 }
 
+void *eden_heap_split_pages_capped(size_t size); /* H46: as eden_heap_split_pages, pieces <= 32 MiB */
+static size_t eden_heap_env_mib(const char *name, long fallback) {
+  const char *value = getenv(name);
+  long mib = value != NULL ? strtol(value, NULL, 10) : fallback;
+  if (mib < 0)
+    mib = fallback;
+  return (size_t)mib << 20;
+}
+static size_t eden_heap_large_split_bytes(void) {
+  static size_t bytes = (size_t)-1;
+  if (bytes == (size_t)-1)
+    bytes = eden_heap_env_mib("EDEN_HEAP_LARGE_SPLIT_MIB", 64);
+  return bytes;
+}
+static size_t eden_heap_large_log_bytes(void) {
+  static size_t bytes = 0;
+  if (bytes == 0) {
+    bytes = eden_heap_env_mib("EDEN_HEAP_LARGE_LOG_MIB", 64);
+    if (bytes == 0)
+      bytes = 1;
+  }
+  return bytes;
+}
+/* One line, written with no stdio (this runs inside malloc): the offsets of the chain from the
+ * image's start, as EDEN_HEAP_SITE (tools/symbolize-sites.py; or llvm-nm of the symbols ELF). */
+int sceKernelDebugOutText(int channel, const char *text);
+/* The lines wait here for the heap report, which prints them to stderr.log (outside malloc). */
+#define EDEN_HEAP_LARGE_RING 64u
+static char eden_heap_large_ring[EDEN_HEAP_LARGE_RING][320];
+static atomic_uint eden_heap_large_ring_ready[EDEN_HEAP_LARGE_RING];
+static unsigned eden_heap_large_ring_printed; /* the report's own (one reporter thread) */
+static atomic_uint eden_heap_large_notes;
+static void eden_heap_large_note(const uintptr_t *pcs, size_t bytes, int split) {
+  const unsigned at = atomic_fetch_add_explicit(&eden_heap_large_notes, 1, memory_order_relaxed);
+  if (at >= 256)
+    return;
+  char line[320];
+  int length = snprintf(line, sizeof(line), "EDEN_HEAP_LARGE_NEW bytes=%zu (%zu MiB) split=%d live_large=%zu MiB:", bytes,
+                        bytes >> 20, split, atomic_load_explicit(&eden_heap_large_bytes, memory_order_relaxed) >> 20);
+  for (unsigned k = 0; k < EDEN_HEAP_LARGE_PCS && length > 0 && length < (int)sizeof(line) - 24; ++k)
+    length += snprintf(line + length, sizeof(line) - (size_t)length, " %lx",
+                       (unsigned long)(pcs[k] ? pcs[k] - 0x400000ul : 0));
+  if (length <= 0)
+    return;
+  if (length > (int)sizeof(line) - 2)
+    length = (int)sizeof(line) - 2;
+  line[length++] = '\n';
+  line[length] = 0;
+  sceKernelDebugOutText(0, line);
+  if (at < EDEN_HEAP_LARGE_RING) {
+    memcpy(eden_heap_large_ring[at], line, (size_t)length + 1);
+    atomic_store_explicit(&eden_heap_large_ring_ready[at], 1, memory_order_release);
+  }
+}
+/* The live large blocks with their chains (the heap report, headless/performance.cpp ReportHeap). */
+void eden_heap_large_report(void) {
+  while (eden_heap_large_ring_printed < EDEN_HEAP_LARGE_RING &&
+         atomic_load_explicit(&eden_heap_large_ring_ready[eden_heap_large_ring_printed], memory_order_acquire))
+    fputs(eden_heap_large_ring[eden_heap_large_ring_printed++], stderr);
+  for (unsigned i = 0; i < EDEN_HEAP_LARGE_BLOCKS; ++i) {
+    if (atomic_load_explicit(&eden_heap_large[i].address, memory_order_acquire) <= 1)
+      continue;
+    fprintf(stderr, "EDEN_HEAP_LARGE_LIVE %zu MiB split=%d:", eden_heap_large[i].size >> 20, eden_heap_large[i].split);
+    for (unsigned k = 0; k < EDEN_HEAP_LARGE_PCS; ++k) {
+      const uintptr_t pc = eden_heap_large[i].pcs[k];
+      fprintf(stderr, " %lx", (unsigned long)(pc ? pc - 0x400000ul : 0));
+    }
+    fputc('\n', stderr);
+  }
+}
+
 /* A large block of its own (zeroed), or NULL: no entry free, or no memory. */
 static void *eden_heap_large_allocate(size_t bytes) {
   for (unsigned i = 0; i < EDEN_HEAP_LARGE_BLOCKS; ++i) {
@@ -524,8 +603,21 @@ static void *eden_heap_large_allocate(size_t bytes) {
     if (!atomic_compare_exchange_strong_explicit(&eden_heap_large[i].address, &expected, 1, memory_order_acquire,
                                                  memory_order_relaxed))
       continue;
-    void *block = eden_heap_pages(bytes);
+    /* H46: a block of EDEN_HEAP_LARGE_SPLIT_MIB (64) or more goes straight to memory in pieces
+     * (eden_heap_split_pages_capped: blocks of at most 32 MiB). Asked for in one piece first, a
+     * 384 MiB block found none in Kirby Air Riders (H44k a2) and the failed try ran the guest
+     * memory recovery for nothing (605 ms, 288 MiB of guest memory packed) before the pieces
+     * served it; and when a piece that large is free, the block takes it from the GPU, whose
+     * buffers need one. 0 = as H45 (one piece first). */
+    const size_t split_from = eden_heap_large_split_bytes();
+    void *block = NULL;
     int split = 0;
+    if (split_from != 0 && bytes >= split_from) {
+      block = eden_heap_split_pages_capped(bytes);
+      split = 1;
+    }
+    if (block == NULL && !split)
+      block = eden_heap_pages(bytes);
     if (block == NULL) {
       /* No free piece of the pool that large: memory in smaller pieces behind one range. */
       block = eden_heap_split_pages(bytes);
@@ -537,6 +629,9 @@ static void *eden_heap_large_allocate(size_t bytes) {
     }
     eden_heap_large[i].size = bytes;
     eden_heap_large[i].split = split;
+    eden_site_collect(eden_heap_large[i].pcs);
+    if (bytes >= eden_heap_large_log_bytes())
+      eden_heap_large_note(&eden_heap_large[i].pcs[0], bytes, split);
     atomic_fetch_add_explicit(&eden_heap_large_bytes, bytes, memory_order_relaxed);
     atomic_fetch_add_explicit(&eden_heap_large_count, 1, memory_order_release);
     atomic_store_explicit(&eden_heap_large[i].address, (uintptr_t)block, memory_order_release);
@@ -1372,7 +1467,7 @@ static unsigned eden_site_slot(const void *address) {
   return (unsigned)(x % EDEN_SITE_BLOCKS);
 }
 
-static __attribute__((noinline)) unsigned eden_site_collect(uintptr_t pcs[EDEN_SITE_PCS]) {
+static __attribute__((noinline)) unsigned eden_site_collect(uintptr_t *pcs) {
   const uintptr_t low = (uintptr_t)__eden_text_start + 8, high = (uintptr_t)__eden_text_end;
   const uintptr_t *stack = (const uintptr_t *)__builtin_frame_address(0);
   /* The result is written after the scan: the array of the caller lies in the stack being read. */

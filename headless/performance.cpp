@@ -516,6 +516,7 @@ extern "C" std::size_t eden_heap_committed(void) __attribute__((weak));
 extern "C" std::size_t eden_heap_large_held(unsigned* blocks) __attribute__((weak));
 extern "C" std::size_t eden_heap_trim(void) __attribute__((weak));
 extern "C" void eden_heap_sites_report(void) __attribute__((weak));
+extern "C" void eden_heap_large_report(void) __attribute__((weak));
 extern "C" void eden_heap_usage(std::size_t* held, std::size_t* in_use, std::size_t* returned) __attribute__((weak));
 extern "C" void eden_heap_slack(std::size_t*, std::size_t*, unsigned*, unsigned*) __attribute__((weak));
 extern "C" void eden_heap_wait_stats(unsigned*, unsigned*) __attribute__((weak));
@@ -681,6 +682,7 @@ void ReportHeap(const char* why) {
                      eden_heap_arena_empty, eden_heap_arena_quarter,
                      ((held - large) > arenas ? (held - large) - arenas : 0) >> 20);
     }
+    if (eden_heap_large_report) eden_heap_large_report();
     if (eden_heap_sites_report) eden_heap_sites_report();
 }
 
