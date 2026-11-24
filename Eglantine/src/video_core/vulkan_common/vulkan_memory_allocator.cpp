@@ -278,8 +278,74 @@ vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedi
     return image;
 }
 
+// H49-H51 diag (EDEN_SPARSE_POOL / EDEN_VMA_POOL lines, every 10 s while memory is being
+// allocated): every separate pool's blocks against what is allocated in them, and per memory
+// type the default blocks (images and dedicated memory) = all minus the separate pools.
+// MKW PHAT5 H50 U1 (24 Nov): with the sparse tiles packed, RADV's device-local BOs stayed at
+// ~3.0 GB as on H49c (16 MiB blocks 96 -> 72, plus 188 x 2 MiB): the memory the sparse pools
+// gave back was taken by the default 16 MiB blocks (+592 MiB). This shows how full those are.
+static void LogVmaPools(const Device& device, VmaAllocator allocator) {
+    static std::atomic<long long> pool_logged{0};
+    const long long now = std::chrono::duration_cast<std::chrono::seconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+    long long last = pool_logged.load(std::memory_order_relaxed);
+    if (now - last < 10 ||
+        !pool_logged.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+        return;
+    }
+    std::array<VmaStatistics, VK_MAX_MEMORY_TYPES> separate{};
+    for (const auto [pool_kind, name] :
+         {std::pair{Device::SeparatePool::SparsePages, "pages"},
+          std::pair{Device::SeparatePool::SparseTiles, "tiles"},
+          std::pair{Device::SeparatePool::DeviceBuffers, "buffers"}}) {
+        for (u32 type = 0; type < VK_MAX_MEMORY_TYPES; ++type) {
+            if (!device.HasSeparatePool(pool_kind, type)) {
+                continue;
+            }
+            VmaStatistics statistics{};
+            vmaGetPoolStatistics(allocator, device.GetSeparatePool(pool_kind, type), &statistics);
+            separate[type].blockCount += statistics.blockCount;
+            separate[type].allocationCount += statistics.allocationCount;
+            separate[type].blockBytes += statistics.blockBytes;
+            separate[type].allocationBytes += statistics.allocationBytes;
+            std::fprintf(stderr,
+                         "%s %s type=%u blocks=%u block_mib=%llu used_mib=%llu allocations=%u\n",
+                         pool_kind == Device::SeparatePool::DeviceBuffers ? "EDEN_VMA_POOL"
+                                                                          : "EDEN_SPARSE_POOL",
+                         name, type, statistics.blockCount,
+                         static_cast<unsigned long long>(statistics.blockBytes >> 20),
+                         static_cast<unsigned long long>(statistics.allocationBytes >> 20),
+                         statistics.allocationCount);
+        }
+    }
+    // Default blocks = the memory type's totals minus its separate pools (a dedicated allocation
+    // counts as a block of its own there). unused_ranges / largest_unused cover the whole type.
+    VmaTotalStatistics total{};
+    vmaCalculateStatistics(allocator, &total);
+    for (u32 type = 0; type < VK_MAX_MEMORY_TYPES; ++type) {
+        const VmaStatistics& all = total.memoryType[type].statistics;
+        if (all.blockCount <= separate[type].blockCount) {
+            continue;
+        }
+        const auto& detail = total.memoryType[type];
+        std::fprintf(stderr,
+                     "EDEN_VMA_POOL default type=%u blocks=%u block_mib=%llu used_mib=%llu "
+                     "allocations=%u unused_ranges=%u largest_unused_kib=%llu\n",
+                     type, all.blockCount - separate[type].blockCount,
+                     static_cast<unsigned long long>(
+                         (all.blockBytes - separate[type].blockBytes) >> 20),
+                     static_cast<unsigned long long>(
+                         (all.allocationBytes - separate[type].allocationBytes) >> 20),
+                     all.allocationCount - separate[type].allocationCount, detail.unusedRangeCount,
+                     static_cast<unsigned long long>(
+                         detail.unusedRangeCount != 0 ? detail.unusedRangeSizeMax >> 10 : 0));
+    }
+}
+
 VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
                                         vk::Image &image) const {
+    LogVmaPools(device, allocator);
     const VmaAllocationCreateInfo alloc_ci = {
             // Best fit: images freed by the thousand leave holes in the blocks, which new ones
             // should fill before VMA takes another block.
@@ -506,35 +572,7 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
                 VK_SUCCESS) {
                 memory = info.deviceMemory;
                 offset = info.offset;
-                // H49/H50 diag: every sparse pool's blocks against what is allocated in them, every
-                // 10 s while sparse memory is being allocated (all pools in one go, by memory type).
-                static std::atomic<long long> pool_logged{0};
-                const long long now = std::chrono::duration_cast<std::chrono::seconds>(
-                                          std::chrono::steady_clock::now().time_since_epoch())
-                                          .count();
-                long long last = pool_logged.load(std::memory_order_relaxed);
-                if (now - last >= 10 &&
-                    pool_logged.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
-                    for (const auto [pool_kind, name] :
-                         {std::pair{Device::SeparatePool::SparsePages, "pages"},
-                          std::pair{Device::SeparatePool::SparseTiles, "tiles"}}) {
-                        for (u32 type = 0; type < VK_MAX_MEMORY_TYPES; ++type) {
-                            if (!device.HasSeparatePool(pool_kind, type)) {
-                                continue;
-                            }
-                            VmaStatistics statistics{};
-                            vmaGetPoolStatistics(allocator, device.GetSeparatePool(pool_kind, type),
-                                                 &statistics);
-                            std::fprintf(stderr,
-                                         "EDEN_SPARSE_POOL %s type=%u blocks=%u block_mib=%llu "
-                                         "used_mib=%llu allocations=%u\n",
-                                         name, type, statistics.blockCount,
-                                         static_cast<unsigned long long>(statistics.blockBytes >> 20),
-                                         static_cast<unsigned long long>(statistics.allocationBytes >> 20),
-                                         statistics.allocationCount);
-                        }
-                    }
-                }
+                LogVmaPools(device, allocator);
                 return allocation;
             }
         }
