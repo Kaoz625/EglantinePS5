@@ -205,6 +205,71 @@ std::atomic_flag unpackers_lock = ATOMIC_FLAG_INIT;
 void CountUnpacker(std::size_t slot) noexcept;
 std::atomic<std::uint64_t> pack_keep_compared{0}, pack_keep_differed{0};
 std::atomic<std::uint64_t> packed_count{0}, packed_bytes{0}, packs{0}, unpacks{0}, pack_skips{0};
+// H53 (MKW race 3 stall): per slot, when it was last packed and by which path, when it came back.
+// The packer only sees writes (cold_since = last hash change), never reads: a slot the game reads every
+// frame looks the coldest and is packed first. EDEN_CRAM_H53 counts how soon packed slots come back, by
+// path. The hot guard (EDEN_CRAM_HOT_GUARD=0 turns it off = H52): a slot that came back within
+// EDEN_CRAM_HOT_BACK_MS (default 10000) of its pack is "hot" for EDEN_CRAM_HOT_S (default 60) seconds;
+// hot slots are packed only by a waiting caller's last pass, after every other slot, and every pass
+// counts a slot's age from its last unpack too (least recently used first, not least recently written).
+std::atomic<std::uint32_t>* slot_packed_ms = nullptr;
+std::atomic<std::uint32_t>* slot_unpacked_ms = nullptr;
+std::atomic<std::uint32_t>* slot_unpacked_s = nullptr;
+std::atomic<std::uint32_t>* slot_hot_until = nullptr;
+std::atomic<std::uint8_t>* slot_pack_path = nullptr;
+std::size_t slot_trace_count = 0;
+thread_local std::uint8_t pack_path_now = 0; // 0 scanner, 1-3 recover pass 0-2, 4-6 for a writer pass 0-2
+constexpr int TraceBuckets = 6;              // <250 ms, <1 s, <3 s, <10 s, <60 s, >=60 s
+std::atomic<std::uint64_t> back_hist[8][TraceBuckets];
+std::atomic<std::uint64_t> repack_hist[TraceBuckets];
+std::atomic<std::uint64_t> packs_by_path[8];
+std::atomic<std::uint64_t> hot_marks{0}, hot_skips{0}, hot_packed{0};
+inline int TraceBucket(std::uint32_t ms) noexcept {
+    return ms < 250 ? 0 : ms < 1000 ? 1 : ms < 3000 ? 2 : ms < 10000 ? 3 : ms < 60000 ? 4 : 5;
+}
+inline std::uint32_t NowMs() noexcept {
+    return static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+inline std::uint32_t NowS() noexcept {
+    return static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+std::size_t H53Env(const char* name, std::size_t fallback) noexcept {
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] >= '0' && value[0] <= '9' ? std::strtoull(value, nullptr, 10) : fallback;
+}
+bool HotGuard() noexcept {
+    static const bool on = H53Env("EDEN_CRAM_HOT_GUARD", 1) != 0;
+    return on;
+}
+inline bool SlotHot(std::size_t slot, std::uint32_t now) noexcept {
+    return HotGuard() && slot < slot_trace_count && slot_hot_until[slot].load(std::memory_order_relaxed) > now;
+}
+void TracePacked(std::size_t slot) noexcept {
+    if (slot >= slot_trace_count) return;
+    const std::uint32_t ms = NowMs();
+    slot_packed_ms[slot].store(ms, std::memory_order_relaxed);
+    slot_pack_path[slot].store(pack_path_now, std::memory_order_relaxed);
+    packs_by_path[pack_path_now & 7].fetch_add(1, std::memory_order_relaxed);
+    if (const std::uint32_t u = slot_unpacked_ms[slot].load(std::memory_order_relaxed); u != 0)
+        repack_hist[TraceBucket(ms - u)].fetch_add(1, std::memory_order_relaxed);
+    if (SlotHot(slot, NowS())) hot_packed.fetch_add(1, std::memory_order_relaxed);
+}
+void TraceUnpacked(std::size_t slot) noexcept {
+    if (slot >= slot_trace_count) return;
+    const std::uint32_t ms = NowMs(), now = NowS();
+    const std::uint32_t back = ms - slot_packed_ms[slot].load(std::memory_order_relaxed);
+    back_hist[slot_pack_path[slot].load(std::memory_order_relaxed) & 7][TraceBucket(back)].fetch_add(1, std::memory_order_relaxed);
+    slot_unpacked_ms[slot].store(ms | 1, std::memory_order_relaxed);
+    slot_unpacked_s[slot].store(now, std::memory_order_relaxed);
+    static const std::uint32_t back_ms = static_cast<std::uint32_t>(H53Env("EDEN_CRAM_HOT_BACK_MS", 10000));
+    static const std::uint32_t hold_s = static_cast<std::uint32_t>(H53Env("EDEN_CRAM_HOT_S", 60));
+    if (HotGuard() && back < back_ms) {
+        slot_hot_until[slot].store(now + hold_s, std::memory_order_relaxed);
+        hot_marks.fetch_add(1, std::memory_order_relaxed);
+    }
+}
 
 // The packed store: packed data lives in 2 MiB blocks of direct memory of its own, filled one after
 // another, outside Eden's heap. Packing then takes no heap memory, so it can run where the heap
@@ -696,6 +761,7 @@ bool UnpackSlot(SparseRange& range, std::size_t slot) noexcept {
     ForgetPacked(slot);
     guest_committed.fetch_add(SparseSlot, std::memory_order_relaxed);
     unpacks.fetch_add(1, std::memory_order_relaxed);
+    TraceUnpacked(slot);
     return true;
 #else
     (void)range;
@@ -1461,6 +1527,7 @@ bool PackSlot(SparseRange& range, std::size_t slot) noexcept {
     packed_count.fetch_add(1, std::memory_order_relaxed);
     packed_bytes.fetch_add(static_cast<std::uint64_t>(size), std::memory_order_relaxed);
     packs.fetch_add(1, std::memory_order_relaxed);
+    TracePacked(slot);
     UnlockSlot(range, slot, SlotPacked);
     return true;
 #else
@@ -1534,6 +1601,12 @@ std::uint32_t ColdNow() noexcept {
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 std::size_t cold_rotor = 0;
+// H53: last write (hash change) or last unpack, whichever is later (guard on); last write only (H52).
+inline std::uint32_t SlotTouch(std::size_t slot) noexcept {
+    const std::uint32_t written = cold_since[slot];
+    if (!HotGuard() || slot >= slot_trace_count) return written;
+    return std::max(written, slot_unpacked_s[slot].load(std::memory_order_relaxed));
+}
 std::atomic<std::uint64_t> cold_1{0}, cold_3{0}, cold_6{0}, cold_own{0}, cold_zero{0}, cold_zero_old{0};
 // Diagnostic (MKW leak): every 64th word of the slot is zero.
 bool ColdLooksZero(std::uintptr_t at) noexcept {
@@ -1608,6 +1681,50 @@ void ReportUnpackers() noexcept {
         if (entry.name[0] == 0 || length <= 0 || length >= static_cast<int>(sizeof(line)) - 40) break;
         length += std::snprintf(line + length, sizeof(line) - length, " %s=%u", entry.name,
                                 entry.count.load(std::memory_order_relaxed));
+    }
+    if (length > 0 && length < static_cast<int>(sizeof(line)) - 1) {
+        line[length] = '\n';
+        line[length + 1] = 0;
+        Report(line);
+    }
+}
+
+void ReportH53() noexcept {
+    if (slot_trace_count == 0) return;
+    const std::uint32_t ms = NowMs(), now = NowS();
+    std::size_t hot_now = 0, back60 = 0, back10 = 0;
+    for (std::size_t slot = 0; slot < slot_trace_count; ++slot) {
+        hot_now += slot_hot_until[slot].load(std::memory_order_relaxed) > now;
+        const std::uint32_t u = slot_unpacked_ms[slot].load(std::memory_order_relaxed);
+        back60 += u != 0 && ms - u < 60000;
+        back10 += u != 0 && ms - u < 10000;
+    }
+    std::size_t largest = 0;
+#ifdef PS5_NATIVE
+    std::int64_t start = 0;
+    const auto total = sceKernelGetDirectMemorySize();
+    if (total <= 0 || &sceKernelAvailableDirectMemorySize == nullptr ||
+        sceKernelAvailableDirectMemorySize(0, total, SparseSlot, &start, &largest) != 0)
+        largest = 0;
+#endif
+    char line[1024];
+    int length = std::snprintf(line, sizeof(line),
+        "EDEN_CRAM_H53 guard=%d hot_now=%zu hot_marks=%llu hot_skips=%llu hot_packed=%llu slots_back_10s=%zu slots_back_60s=%zu"
+        " dmem_largest_mib=%zu repack=", HotGuard() ? 1 : 0, hot_now,
+        (unsigned long long)hot_marks.load(std::memory_order_relaxed),
+        (unsigned long long)hot_skips.load(std::memory_order_relaxed),
+        (unsigned long long)hot_packed.load(std::memory_order_relaxed), back10, back60, largest >> 20);
+    auto hist = [&](const std::atomic<std::uint64_t>* h) {
+        for (int i = 0; i < TraceBuckets && length > 0 && length < static_cast<int>(sizeof(line)) - 32; ++i)
+            length += std::snprintf(line + length, sizeof(line) - length, i ? "/%llu" : "%llu",
+                                    (unsigned long long)h[i].load(std::memory_order_relaxed));
+    };
+    hist(repack_hist);
+    static const char* const names[7] = {"scan", "r10", "r3", "r0", "w10", "w3", "w0"};
+    for (int p = 0; p < 7 && length > 0 && length < static_cast<int>(sizeof(line)) - 64; ++p) {
+        length += std::snprintf(line + length, sizeof(line) - length, " %s=%llu:", names[p],
+                                (unsigned long long)packs_by_path[p].load(std::memory_order_relaxed));
+        hist(back_hist[p]);
     }
     if (length > 0 && length < static_cast<int>(sizeof(line)) - 1) {
         line[length] = '\n';
@@ -1741,6 +1858,13 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
             if (pack_kept != nullptr)
                 for (std::size_t i = 0; i < slots; ++i) pack_kept[i] = -1;
         }
+        slot_packed_ms = new (std::nothrow) std::atomic<std::uint32_t>[slots]();
+        slot_unpacked_ms = new (std::nothrow) std::atomic<std::uint32_t>[slots]();
+        slot_unpacked_s = new (std::nothrow) std::atomic<std::uint32_t>[slots]();
+        slot_hot_until = new (std::nothrow) std::atomic<std::uint32_t>[slots]();
+        slot_pack_path = new (std::nothrow) std::atomic<std::uint8_t>[slots]();
+        if (slot_packed_ms && slot_unpacked_ms && slot_unpacked_s && slot_hot_until && slot_pack_path)
+            slot_trace_count = slots;
         packed_slots.store(table, std::memory_order_release);
         pack_times.assign(slots, 0);
         recover_order.reserve(slots);
@@ -1763,11 +1887,17 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
     const std::uint32_t now = ColdNow();
     std::vector<std::size_t>& ready = pack_ready;
     ready.clear();
-    for (const std::size_t slot : candidates)
-        if (now - cold_since[slot] >= (ColdSeconds << std::min<unsigned>(pack_times[slot], 4)) &&
+    for (const std::size_t slot : candidates) {
+        if (SlotHot(slot, now)) {
+            hot_skips.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        if (now - SlotTouch(slot) >= (ColdSeconds << std::min<unsigned>(pack_times[slot], 4)) &&
             !KnownIncompressible(slot, now))
             ready.push_back(slot);
-    std::sort(ready.begin(), ready.end(), [](std::size_t a, std::size_t b) { return cold_since[a] < cold_since[b]; });
+    }
+    std::sort(ready.begin(), ready.end(), [](std::size_t a, std::size_t b) { return SlotTouch(a) < SlotTouch(b); });
+    pack_path_now = 0;
     std::size_t done = 0;
     for (const std::size_t slot : ready) {
         if (done >= PackPerPass) break;
@@ -1917,6 +2047,7 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
             (unsigned long long)(net_shortfall.load(std::memory_order_relaxed) >> 20));
         if (pack_length > 0) Report(pack_line);
         ReportUnpackers();
+        ReportH53();
     }
 }
 
@@ -2308,12 +2439,24 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait, bool for_writer = false)
             if (freed >= bytes) break;
         }
         recover_order.clear();
-        for (std::size_t slot = 0; slot < cold_since.size(); ++slot)
-            if (SlotState(*range, slot) == SlotOwn && now - cold_since[slot] >= ages[pass] &&
-                (pass == 0 || now - cold_since[slot] < ages[pass - 1]) && !KnownIncompressible(slot, now))
-                recover_order.push_back(slot);
-        std::sort(recover_order.begin(), recover_order.end(),
-                  [](std::size_t a, std::size_t b) { return cold_since[a] < cold_since[b]; });
+        // H53: hot slots only in the last (any age) pass, after all others.
+        const bool last_pass = ages[pass] == 0;
+        for (std::size_t slot = 0; slot < cold_since.size(); ++slot) {
+            if (SlotState(*range, slot) != SlotOwn || KnownIncompressible(slot, now)) continue;
+            const std::uint32_t age = now - SlotTouch(slot);
+            if (SlotHot(slot, now)) {
+                if (last_pass) recover_order.push_back(slot);
+                else hot_skips.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            if (age >= ages[pass] && (pass == 0 || age < ages[pass - 1])) recover_order.push_back(slot);
+        }
+        std::sort(recover_order.begin(), recover_order.end(), [now](std::size_t a, std::size_t b) {
+            const std::uint64_t ka = (std::uint64_t{SlotHot(a, now)} << 32) | SlotTouch(a);
+            const std::uint64_t kb = (std::uint64_t{SlotHot(b, now)} << 32) | SlotTouch(b);
+            return ka < kb;
+        });
+        pack_path_now = static_cast<std::uint8_t>((for_writer ? 4 : 1) + pass);
         for (const std::size_t slot : recover_order) {
             if (freed >= bytes) break;
             const std::size_t store_before = store_held.load(std::memory_order_relaxed);
