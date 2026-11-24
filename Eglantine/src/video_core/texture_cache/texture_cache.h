@@ -199,7 +199,17 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         return value == nullptr || value[0] != '0';
     }();
     const bool memory_short = pool_gc && ::Eden::Performance::GraphicsMemoryIsShort();
-    const bool memory_critical = memory_short && ::Eden::Performance::GraphicsMemoryIsCritical();
+    // H54k (test switch): EDEN_NX2_TC_CRITICAL_GC=0 never treats the pool as critical, so a short
+    // pool keeps the short ages (600 frames / ShortMinAge) instead of the critical burst (everything
+    // 2-10 frames unused, costly images included, 128 a pass). Kirby Air Riders: the picture was
+    // there before that burst and black after it (k12c/k13a). Critical is read from the largest free
+    // run, which a fragmented pool keeps under 512 MiB with 4 GB free (k13b: 681 MiB of 4.4 GB).
+    static const bool critical_gc = [] {
+        const char* value = std::getenv("EDEN_NX2_TC_CRITICAL_GC");
+        return value == nullptr || value[0] != '0';
+    }();
+    const bool memory_critical =
+        memory_short && critical_gc && ::Eden::Performance::GraphicsMemoryIsCritical();
     const auto Configure = [&](bool allow_aggressive) {
         high_priority_mode = out_of_memory || total_used_memory >= expected_memory;
         aggressive_mode =
