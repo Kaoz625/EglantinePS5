@@ -13,6 +13,10 @@ namespace Vulkan {
 ResourcePool::ResourcePool(MasterSemaphore& master_semaphore_, size_t grow_step_)
     : master_semaphore{&master_semaphore_}, grow_step{grow_step_} {}
 
+u64 ResourcePool::PoolCurrentTick() const {
+    return master_semaphore->CurrentTick();
+}
+
 size_t ResourcePool::CommitResource() {
     const auto search = [this](size_t begin, size_t end, u64 gpu_tick) -> std::optional<size_t> {
         for (size_t iterator = begin; iterator < end; ++iterator) {

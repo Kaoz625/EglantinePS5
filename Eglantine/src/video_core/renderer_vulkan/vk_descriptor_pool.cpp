@@ -228,6 +228,11 @@ VkDescriptorSet DescriptorAllocator::Commit() {
     return sets[index / batch][index % batch];
 }
 
+DescriptorAllocator::TickSet DescriptorAllocator::CommitForTick() {
+    const size_t index = CommitResource();
+    return TickSet{sets[index / batch][index % batch], index, ResourceTick(index)};
+}
+
 void DescriptorAllocator::Allocate(size_t begin, size_t end) {
     sets.push_back(AllocateDescriptors(end - begin));
 }

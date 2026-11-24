@@ -53,6 +53,25 @@ public:
 
     VkDescriptorSet Commit();
 
+    /// A set committed for the current tick, so it can be bound again in this tick without a
+    /// new set (its payload's image and buffer handles cannot have been freed and reused yet:
+    /// those are freed only after a fence of an earlier tick).
+    struct TickSet {
+        VkDescriptorSet set{};
+        size_t index{};
+        u64 tick{};
+    };
+    TickSet CommitForTick();
+
+    /// The set of `committed` while it is still held for the current tick, else null.
+    [[nodiscard]] VkDescriptorSet SameTickSet(const TickSet& committed) const {
+        if (committed.set == VkDescriptorSet{} || committed.tick != PoolCurrentTick() ||
+            ResourceTick(committed.index) != committed.tick) {
+            return VkDescriptorSet{};
+        }
+        return committed.set;
+    }
+
 private:
     explicit DescriptorAllocator(const Device& device_, MasterSemaphore& master_semaphore_,
                                  DescriptorBank& bank_, VkDescriptorSetLayout layout_);

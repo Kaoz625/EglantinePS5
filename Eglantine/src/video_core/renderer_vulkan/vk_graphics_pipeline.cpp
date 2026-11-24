@@ -55,6 +55,41 @@
 
 namespace Vulkan {
 namespace {
+/// EDEN_DESC_SET_REUSE=0 turns the same-tick descriptor set reuse off (every re-bind writes a set).
+bool DescriptorSetReuseEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_DESC_SET_REUSE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+/// Worker thread only. Every 50,000 graphics sets bound: how many were written, how many were
+/// bound again, and how many re-binds with the same payload still had to write (tick moved on).
+void CountDescriptorSet(bool reused, bool candidate) {
+    static u64 written = 0, reused_count = 0, missed = 0, total_written = 0, total_reused = 0;
+    if (reused) {
+        ++reused_count;
+        ++total_reused;
+    } else {
+        ++written;
+        ++total_written;
+        missed += candidate ? 1 : 0;
+    }
+    if (written + reused_count >= 50000) {
+        std::fprintf(stderr,
+                     "EDEN_DESC_SETS written=%llu reused=%llu missed=%llu total_written=%llu "
+                     "total_reused=%llu reuse=%d\n",
+                     static_cast<unsigned long long>(written),
+                     static_cast<unsigned long long>(reused_count),
+                     static_cast<unsigned long long>(missed),
+                     static_cast<unsigned long long>(total_written),
+                     static_cast<unsigned long long>(total_reused),
+                     DescriptorSetReuseEnabled() ? 1 : 0);
+        written = reused_count = missed = 0;
+    }
+}
+
 using boost::container::small_vector;
 using boost::container::static_vector;
 using Shader::ImageBufferDescriptor;
@@ -1714,17 +1749,26 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     }
 
     bool update_descriptors = true;
+    // Re-binding this pipeline with the payload its last set holds: bind that set again (worker
+    // side, only while it is held for the same tick) instead of writing a new one. Kirby Air
+    // Riders writes ~700 sets of 2052 textures (197 KiB) a frame; its pools held 408-474 MiB.
+    bool reuse_set = false;
+    u64 recorded_serial = descriptor_payload_serial;
     if (descriptor_set_layout && !uses_push_descriptor && !uses_descriptor_buffer) {
         const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
-        update_descriptors =
-            bind_pipeline || last_descriptor_payload.size() != num_descriptor_entries ||
+        const bool same_payload =
+            last_descriptor_payload.size() == num_descriptor_entries &&
             std::memcmp(last_descriptor_payload.data(), entries,
-                        num_descriptor_entries * sizeof(DescriptorUpdateEntry)) != 0;
-        if (update_descriptors) {
+                        num_descriptor_entries * sizeof(DescriptorUpdateEntry)) == 0;
+        update_descriptors = bind_pipeline || !same_payload;
+        reuse_set = update_descriptors && same_payload && DescriptorSetReuseEnabled();
+        if (!same_payload) {
             last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
+            recorded_serial = ++descriptor_payload_serial;
         }
     }
-    scheduler.Record([this, descriptor_data, bind_pipeline, update_descriptors,
+    scheduler.Record([this, descriptor_data, bind_pipeline, update_descriptors, reuse_set,
+                      recorded_serial,
                       descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,
                       rescaling_data = rescaling.Data(), is_rescaling, update_rescaling,
                       uses_render_area = render_area.uses_render_area,
@@ -1779,9 +1823,21 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template, pipeline_layout,
                                                     0, descriptor_data);
         } else if (update_descriptors) {
-            const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
-            const vk::Device& dev{device.GetLogical()};
-            dev.UpdateDescriptorSet(descriptor_set, *descriptor_update_template, descriptor_data);
+            VkDescriptorSet descriptor_set{};
+            if (reuse_set && worker_set_serial == recorded_serial) {
+                descriptor_set = descriptor_allocator.SameTickSet(worker_set);
+            }
+            if (descriptor_set != VkDescriptorSet{}) {
+                CountDescriptorSet(true, reuse_set);
+            } else {
+                worker_set = descriptor_allocator.CommitForTick();
+                worker_set_serial = recorded_serial;
+                descriptor_set = worker_set.set;
+                const vk::Device& dev{device.GetLogical()};
+                dev.UpdateDescriptorSet(descriptor_set, *descriptor_update_template,
+                                        descriptor_data);
+                CountDescriptorSet(false, reuse_set);
+            }
             cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0,
                                       descriptor_set, nullptr);
         }

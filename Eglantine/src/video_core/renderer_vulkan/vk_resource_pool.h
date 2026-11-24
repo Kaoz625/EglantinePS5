@@ -30,6 +30,14 @@ public:
 protected:
     size_t CommitResource();
 
+    /// Tick the resource at `index` is held until (the tick its last commit was made in).
+    [[nodiscard]] u64 ResourceTick(size_t index) const {
+        return index < ticks.size() ? ticks[index] : 0;
+    }
+
+    /// The tick commands recorded now belong to.
+    [[nodiscard]] u64 PoolCurrentTick() const;
+
     /// Called when a chunk of resources have to be allocated.
     virtual void Allocate(size_t begin, size_t end) = 0;
 

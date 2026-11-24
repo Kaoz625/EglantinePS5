@@ -521,6 +521,12 @@ private:
 
     DescriptorBufferLayout descriptor_buffer_layout;
     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
+    /// Bumped (main thread) each time a new payload is recorded for a descriptor set.
+    u64 descriptor_payload_serial{};
+    /// Worker thread: the set holding payload `worker_set_serial`, bound again when the pipeline
+    /// is re-bound in the same tick with the same payload instead of writing a new set.
+    DescriptorAllocator::TickSet worker_set{};
+    u64 worker_set_serial{~u64{0}};
     VkDeviceSize last_descriptor_buffer_offset{};
     u32 last_descriptor_buffer_chunk{};
     u64 last_descriptor_buffer_generation{};
