@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <unistd.h>
@@ -79,9 +80,55 @@ static auto WithRecoveryWait(std::size_t size, Try&& attempt) {
     return result;
 }
 
+#ifdef PS5_NATIVE
+extern "C" std::int64_t sceKernelGetDirectMemorySize();
+extern "C" std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::int64_t, std::size_t, std::int64_t*,
+                                                           std::size_t*);
+#endif
+// H49: a block of its own needs ONE free piece of the pool that large. Mario Kart World (PHAT5 H47b S1, race-2
+// load) asked 11 times for 42-50 MiB blocks with the pool's largest free piece 2-4 MiB: each time the recovery
+// packed ~50 MiB of guest memory (in 2 MiB slots scattered over the pool, so it never made one piece that
+// large), then the request went to eden_heap_split_pages anyway, which recovers again. With no free piece as
+// large as the request, the recovery is skipped here (the split path's recovery stays).
+// EDEN_HEAP_PAGES_RECOVER=1 restores the H48 behaviour (always recover).
+static std::atomic<unsigned> heap_pages_skips{0};
+static bool PoolHasPieceFor(std::size_t size) noexcept {
+#ifdef PS5_NATIVE
+    static const bool always = [] {
+        const char* text = std::getenv("EDEN_HEAP_PAGES_RECOVER");
+        return text != nullptr && text[0] == '1';
+    }();
+    if (always) return true;
+    const std::int64_t total = sceKernelGetDirectMemorySize();
+    std::int64_t start = 0;
+    std::size_t largest = 0;
+    if (total <= 0 || sceKernelAvailableDirectMemorySize(0, total, std::size_t{2} << 20, &start, &largest) != 0)
+        return true; // not known: as before
+    // AllocatePagesAt adds one 2 MiB lead page to a large block.
+    return largest >= size + (std::size_t{2} << 20);
+#else
+    (void)size;
+    return true;
+#endif
+}
+
 // Reuse the qualified, owned direct-memory backend for the C mspace heap.
 extern "C" void* eden_heap_pages(std::size_t size) {
-    return WithRecovery(size, [&] { return Common::AllocateMemoryPages(size); });
+    void* result = Common::AllocateMemoryPages(size);
+    if (result != nullptr || &eden_memory_recover_try == nullptr) return result;
+    if (!PoolHasPieceFor(size)) {
+        const unsigned skips = heap_pages_skips.fetch_add(1, std::memory_order_relaxed);
+        if (skips < 32 || skips % 64 == 0) {
+            char line[112];
+            const int length = std::snprintf(line, sizeof(line),
+                                             "EDEN_HEAP_PAGES_NO_PIECE bytes=%zu skips=%u (no recovery, split pages next)\n",
+                                             size, skips + 1);
+            if (length > 0) sceKernelDebugOutText(0, line);
+        }
+        return nullptr;
+    }
+    if (eden_memory_recover_try(size + (std::size_t{8} << 20)) != 0) result = Common::AllocateMemoryPages(size);
+    return result;
 }
 extern "C" void eden_heap_pages_free(void* base, std::size_t size) {
     Common::FreeMemoryPages(base, size);

@@ -474,6 +474,72 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         }
     };
     Configure(false);
+    // H49: while the pool is short, sparse images (SparseTiles / SparseLayers: memory bound by
+    // block or layer) that no frame used for EDEN_NX2_TC_SPARSE_AGE frames (default 120, at most
+    // 4 s of wall time, at least 30) give their memory back first, largest first, costly or not.
+    // Mario Kart World (PHAT5 H47b S1): race 2 bound its sparse blocks while race 1's sparse images
+    // were still alive (sparse-page backing 616 -> 1032 MiB at the race-2 load), the pool ran out
+    // and the game's own memory was packed until it thrashed. Images the GPU wrote (their data
+    // lives only there) are left to the normal passes. EDEN_NX2_TC_SPARSE_AGE=0 turns this off.
+    if constexpr (requires(const Image& image) { image.SparseBoundBytes(); }) {
+        static const u64 sparse_age_setting = [] {
+            const char* value = std::getenv("EDEN_NX2_TC_SPARSE_AGE");
+            return value != nullptr ? std::strtoull(value, nullptr, 10) : 120ULL;
+        }();
+        static u64 sparse_checked_frame = 0;
+        static u64 sparse_released_images = 0;
+        static u64 sparse_released_bytes = 0;
+        static auto sparse_logged = std::chrono::steady_clock::time_point{};
+        if (memory_short && sparse_age_setting != 0 && frame_tick >= sparse_checked_frame + 15) {
+            sparse_checked_frame = frame_tick;
+            const u64 sparse_age = (std::max)(
+                (std::min)(sparse_age_setting, FramesWithin(std::chrono::seconds{4})), u64{30});
+            if (frame_tick > sparse_age) {
+                std::vector<std::pair<u64, ImageId>> sparse_candidates;
+                lru_cache.ForEachItemBelow(frame_tick - sparse_age, [&](ImageId image_id) {
+                    const Image& image = slot_images[image_id];
+                    const u64 bound = image.SparseBoundBytes();
+                    if (bound >= (u64{4} << 20) &&
+                        True(image.flags & (ImageFlagBits::SparseTiles | ImageFlagBits::SparseLayers)) &&
+                        False(image.flags & (ImageFlagBits::IsDecoding | ImageFlagBits::GpuModified)) &&
+                        !IsDownloadable(image)) {
+                        sparse_candidates.emplace_back(bound, image_id);
+                    }
+                    return false;
+                });
+                std::stable_sort(sparse_candidates.begin(), sparse_candidates.end(),
+                                 [](const auto& a, const auto& b) { return a.first > b.first; });
+                const size_t saved_iterations = num_iterations;
+                const bool saved_costly = evict_old_costly;
+                evict_old_costly = true;
+                u64 released = 0;
+                size_t count = 0;
+                for (const auto& [bound, image_id] : sparse_candidates) {
+                    if (count >= 8 || released >= (u64{768} << 20)) {
+                        break;
+                    }
+                    num_iterations = 1;
+                    Cleanup(image_id);
+                    if (num_iterations == 0) {
+                        released += bound;
+                        ++count;
+                    }
+                }
+                evict_old_costly = saved_costly;
+                num_iterations = saved_iterations;
+                sparse_released_images += count;
+                sparse_released_bytes += released;
+            }
+        }
+        if (sparse_released_images != 0) {
+            if (const auto now = std::chrono::steady_clock::now();
+                now - sparse_logged >= std::chrono::seconds{10}) {
+                sparse_logged = now;
+                LOG_INFO(HW_GPU, "EDEN_SPARSE_RELEASE {} sparse images unused gave {} MiB back so far",
+                         sparse_released_images, sparse_released_bytes >> 20);
+            }
+        }
+    }
     // Images newer ones partly overwrote (BadOverlap: their bytes belong to the newer images, so
     // they are dropped without a download) get the mode's age, not the retention floor. Ocarina
     // allocates each frame's render targets at shifting offsets of a transient heap: in the
@@ -1757,7 +1823,11 @@ void TextureCache<P>::TickFrame() {
         std::vector<std::pair<u64, const Image*>> largest;
         std::map<u32, std::pair<u64, u32>> by_format;
         for (const auto [image_id, image] : slot_images) {
-            const u64 bytes = GetScaledImageSizeBytes(*image);
+            // H49: unbacked (sparse) images by the memory bound to them, not their full size:
+            // Mario Kart World's 8.4-8.7 GB "images" here were ~3 GB of sparse virtual size.
+            const u64 bytes = True(image->flags & ImageFlagBits::Unbacked)
+                                  ? ImageMemoryBytes(*image)
+                                  : GetScaledImageSizeBytes(*image);
             image_bytes += bytes;
             ++images;
             if (debug_stats) {

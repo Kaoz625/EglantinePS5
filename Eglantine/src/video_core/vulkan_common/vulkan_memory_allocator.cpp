@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <array>
 #include <bit>
@@ -494,6 +495,25 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
                 VK_SUCCESS) {
                 memory = info.deviceMemory;
                 offset = info.offset;
+                // H49 diag: the sparse-page pool's blocks against what is allocated in them, every
+                // 10 s while sparse blocks are being bound (Mario Kart World: 1032 MiB of backing at
+                // the race-2 load against 578 MiB the texture cache counts bound).
+                static std::atomic<long long> pool_logged{0};
+                const long long now = std::chrono::duration_cast<std::chrono::seconds>(
+                                          std::chrono::steady_clock::now().time_since_epoch())
+                                          .count();
+                long long last = pool_logged.load(std::memory_order_relaxed);
+                if (now - last >= 10 &&
+                    pool_logged.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+                    VmaStatistics statistics{};
+                    vmaGetPoolStatistics(allocator, pool, &statistics);
+                    std::fprintf(stderr,
+                                 "EDEN_SPARSE_POOL blocks=%u block_mib=%llu used_mib=%llu allocations=%u\n",
+                                 statistics.blockCount,
+                                 static_cast<unsigned long long>(statistics.blockBytes >> 20),
+                                 static_cast<unsigned long long>(statistics.allocationBytes >> 20),
+                                 statistics.allocationCount);
+                }
                 return allocation;
             }
         }
