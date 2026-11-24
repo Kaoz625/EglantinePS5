@@ -211,6 +211,10 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     const bool memory_critical =
         memory_short && critical_gc && ::Eden::Performance::GraphicsMemoryIsCritical();
     const auto Configure = [&](bool allow_aggressive) {
+        // H54k2 (test): EDEN_NX2_TC_CRITICAL_GC=0 also keeps the collector out of aggressive mode
+        // over its own critical mark and after a failed image (k14b: with EDEN_NX2_TC_POOL_GC=0,
+        // 4,634 gc-aggressive deletes still ran in ~8 s at the load before the black).
+        allow_aggressive = allow_aggressive && critical_gc;
         high_priority_mode = out_of_memory || total_used_memory >= expected_memory;
         aggressive_mode =
             allow_aggressive && (out_of_memory || total_used_memory >= critical_memory);
