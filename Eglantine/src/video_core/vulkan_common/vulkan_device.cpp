@@ -1078,14 +1078,28 @@ VideoCommon::Fsr4PortDevice Device::Fsr4PortDevice() const {
     };
 }
 
+VkDeviceSize Device::SparseTileBlockSize() {
+    static const VkDeviceSize size = [] {
+        const char* value = std::getenv("EDEN_SPARSE_TILE_BLOCK_MIB");
+        const unsigned long long mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 2ULL;
+        return static_cast<VkDeviceSize>((std::min)(mib, 16ULL) << 20);
+    }();
+    return size;
+}
+
 VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
     std::scoped_lock lk{separate_pools_mutex};
     VmaPool& pool = separate_pools[static_cast<u32>(kind)][memory_type];
     if (pool == VK_NULL_HANDLE) {
+        const VkDeviceSize block_size =
+            kind == SeparatePool::SparseTiles ? SparseTileBlockSize() : SeparatePoolBlockSize;
+        if (block_size == 0) {
+            return VK_NULL_HANDLE;
+        }
         const VmaPoolCreateInfo ci{
             .memoryTypeIndex = memory_type,
             .flags = 0,
-            .blockSize = SeparatePoolBlockSize,
+            .blockSize = block_size,
             .minBlockCount = 0,
             .maxBlockCount = 0,
             .priority = 0.f,

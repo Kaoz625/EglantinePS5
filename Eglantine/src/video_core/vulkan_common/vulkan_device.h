@@ -292,11 +292,22 @@ public:
     enum class SeparatePool : u32 {
         SparsePages,
         DeviceBuffers,
+        // H50: single sparse tiles (64 KiB) in small blocks of their own (SparseTileBlockSize()),
+        // so a block empties and goes back once its few tiles are unbound.
+        SparseTiles,
     };
     static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
+    /// Block size of the SparseTiles pool: EDEN_SPARSE_TILE_BLOCK_MIB (default 2); 0 = no
+    /// SparseTiles pool (tiles share the SparsePages pool's 16 MiB blocks as in H49).
+    static VkDeviceSize SparseTileBlockSize();
 
     /// The pool of that kind for a memory type, created on first use (null if that failed).
     VmaPool GetSeparatePool(SeparatePool kind, u32 memory_type) const;
+    /// True when that pool exists already (never creates one).
+    bool HasSeparatePool(SeparatePool kind, u32 memory_type) const {
+        std::scoped_lock lk{separate_pools_mutex};
+        return separate_pools[static_cast<u32>(kind)][memory_type] != VK_NULL_HANDLE;
+    }
 
     /// Returns the logical device.
     const vk::Device& GetLogical() const {
@@ -1419,7 +1430,7 @@ private:
     VkInstance instance;         ///< Vulkan instance.
     VmaAllocator allocator{};    ///< VMA allocator.
     mutable std::mutex separate_pools_mutex;
-    mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 2> separate_pools{};
+    mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 3> separate_pools{};
     vk::DeviceDispatch dld;      ///< Device function pointers.
     vk::PhysicalDevice physical; ///< Physical device.
     vk::Device logical;          ///< Logical device.

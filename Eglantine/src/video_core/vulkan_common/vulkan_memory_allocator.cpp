@@ -487,17 +487,27 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
     if (requirements.size <= Device::SeparatePoolBlockSize / 2 &&
         vmaFindMemoryTypeIndex(allocator, requirements.memoryTypeBits, &alloc_ci, &memory_type) ==
             VK_SUCCESS) {
-        if (const VmaPool pool =
-                device.GetSeparatePool(Device::SeparatePool::SparsePages, memory_type)) {
+        // H50: a single tile (64 KiB) goes to the SparseTiles pool (2 MiB blocks, lowest offset
+        // first); mip tails, layers and zero blocks stay in the SparsePages pool (16 MiB blocks).
+        // MKW PHAT5 H49c T1: one sparse-page pool held 544-576 MiB of blocks with 136-177 MiB
+        // allocated in races 2-3 (scattered 64 KiB tiles kept every 16 MiB block alive), with the
+        // direct-memory pool's largest free piece at 1-4 MiB.
+        const VkDeviceSize tile_block = Device::SparseTileBlockSize();
+        const bool tile = tile_block != 0 && requirements.size <= (VkDeviceSize{64} << 10);
+        const Device::SeparatePool kind =
+            tile ? Device::SeparatePool::SparseTiles : Device::SeparatePool::SparsePages;
+        if (const VmaPool pool = device.GetSeparatePool(kind, memory_type)) {
             VmaAllocationCreateInfo pool_ci = alloc_ci;
             pool_ci.pool = pool;
+            if (tile) {
+                pool_ci.flags |= VMA_ALLOCATION_CREATE_STRATEGY_MIN_OFFSET_BIT;
+            }
             if (vmaAllocateMemory(allocator, &requirements, &pool_ci, &allocation, &info) ==
                 VK_SUCCESS) {
                 memory = info.deviceMemory;
                 offset = info.offset;
-                // H49 diag: the sparse-page pool's blocks against what is allocated in them, every
-                // 10 s while sparse blocks are being bound (Mario Kart World: 1032 MiB of backing at
-                // the race-2 load against 578 MiB the texture cache counts bound).
+                // H49/H50 diag: every sparse pool's blocks against what is allocated in them, every
+                // 10 s while sparse memory is being allocated (all pools in one go, by memory type).
                 static std::atomic<long long> pool_logged{0};
                 const long long now = std::chrono::duration_cast<std::chrono::seconds>(
                                           std::chrono::steady_clock::now().time_since_epoch())
@@ -505,14 +515,25 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
                 long long last = pool_logged.load(std::memory_order_relaxed);
                 if (now - last >= 10 &&
                     pool_logged.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
-                    VmaStatistics statistics{};
-                    vmaGetPoolStatistics(allocator, pool, &statistics);
-                    std::fprintf(stderr,
-                                 "EDEN_SPARSE_POOL blocks=%u block_mib=%llu used_mib=%llu allocations=%u\n",
-                                 statistics.blockCount,
-                                 static_cast<unsigned long long>(statistics.blockBytes >> 20),
-                                 static_cast<unsigned long long>(statistics.allocationBytes >> 20),
-                                 statistics.allocationCount);
+                    for (const auto [pool_kind, name] :
+                         {std::pair{Device::SeparatePool::SparsePages, "pages"},
+                          std::pair{Device::SeparatePool::SparseTiles, "tiles"}}) {
+                        for (u32 type = 0; type < VK_MAX_MEMORY_TYPES; ++type) {
+                            if (!device.HasSeparatePool(pool_kind, type)) {
+                                continue;
+                            }
+                            VmaStatistics statistics{};
+                            vmaGetPoolStatistics(allocator, device.GetSeparatePool(pool_kind, type),
+                                                 &statistics);
+                            std::fprintf(stderr,
+                                         "EDEN_SPARSE_POOL %s type=%u blocks=%u block_mib=%llu "
+                                         "used_mib=%llu allocations=%u\n",
+                                         name, type, statistics.blockCount,
+                                         static_cast<unsigned long long>(statistics.blockBytes >> 20),
+                                         static_cast<unsigned long long>(statistics.allocationBytes >> 20),
+                                         statistics.allocationCount);
+                        }
+                    }
                 }
                 return allocation;
             }
