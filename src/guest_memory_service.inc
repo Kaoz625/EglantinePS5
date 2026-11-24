@@ -191,6 +191,12 @@ std::int64_t* pack_kept = nullptr; // per slot: the block a packed slot kept, -1
 std::atomic<std::atomic<std::int32_t>*> gpu_cached_table{nullptr};
 std::size_t gpu_cached_slots = 0;
 std::atomic<std::uint64_t> pack_gpu_skips{0}, pack_gpu_marked{0};
+// H55k: whether slots the GPU's caches hold are packed for the running title (default yes, as MKW
+// needs). Kirby Air Riders (24 Nov 2026, k14c/k14d on DIGI5): with them packed, the picture went black
+// or blue once packing started (~2.5 GB free) and stayed black through the movies and title; with
+// EDEN_CRAM_PACK_GPU=0 the title, both attract movies and the demo stayed visible down to 262 MiB free,
+// through the texture collector's big bursts. Set from headless/main.cpp once the title is known.
+std::atomic<bool> title_gpu_pack{true};
 // Slots a GPU thread (the command reader "GPU", or "GPUBack") ever had to unpack: never packed again.
 // The caches' count misses what the command reader reads (command lists, draw arguments), and one
 // such unpack was enough for impossible draws.
@@ -934,6 +940,11 @@ bool WaitForBlock(Promote&& promote) noexcept {
 // while any is, the graphics caches are told no memory is free.
 // A page of the guest's memory the GPU's caches now hold (+1) or no longer hold (-1), from the core's
 // device memory manager. Counted per slot; packing skips slots with any (PackSlot).
+// H55k: the running title's choice for packing GPU-cached slots (see title_gpu_pack).
+extern "C" void eden_cram_title_gpu_pack(int on) noexcept {
+    title_gpu_pack.store(on != 0, std::memory_order_relaxed);
+}
+
 extern "C" void eden_guest_gpu_cached(const void* host, int delta) noexcept {
     SparseRange* const range = guest_range.load(std::memory_order_acquire);
     if (range == nullptr) return;
@@ -1382,10 +1393,13 @@ bool PackSlot(SparseRange& range, std::size_t slot) noexcept {
     PackedSlot* const table = packed_slots.load(std::memory_order_acquire);
     pack_last_rejected = false;
     if (table == nullptr) return false;
-    static const bool pack_gpu = [] {
+    // H55k: EDEN_CRAM_PACK_GPU unset = per title (eden_cram_title_gpu_pack, below); 0/1 force it.
+    static const int pack_gpu_env = [] {
         const char* value = std::getenv("EDEN_CRAM_PACK_GPU");
-        return value == nullptr || value[0] != '0';
+        return value == nullptr ? -1 : value[0] != '0' ? 1 : 0;
     }();
+    const bool pack_gpu = pack_gpu_env >= 0 ? pack_gpu_env == 1
+                                            : title_gpu_pack.load(std::memory_order_relaxed);
     if (auto* gpu_cached = gpu_cached_table.load(std::memory_order_acquire);
         !pack_gpu && gpu_cached != nullptr && slot < gpu_cached_slots &&
         gpu_cached[slot].load(std::memory_order_acquire) > 0) {

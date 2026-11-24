@@ -128,6 +128,7 @@ extern "C" std::int64_t sceKernelGetDirectMemorySize();
 #include "watch.h"
 #include "core/arm/debug.h"
 #include "core/memory.h"
+extern "C" void eden_cram_title_gpu_pack(int) noexcept __attribute__((weak));
 extern "C" bool eden_jit_shared;  // headless/dynarmic/jit_group_support.inc
 #endif
 #include "video_core/gpu.h"
@@ -1780,6 +1781,9 @@ int main(int argc, char** argv) {
                         code_end = info.m_address + info.m_size;
                     }
                     jit_list.Start(system.GetApplicationProcessProgramID(), build, code_start, code_end - code_start);
+                    // H55k: Kirby Air Riders keeps the slots the GPU's caches hold out of packing (black screen).
+                    if (eden_cram_title_gpu_pack)
+                        eden_cram_title_gpu_pack(system.GetApplicationProcessProgramID() != 0x040077201BE50000ULL);
 #ifdef PS5_NATIVE
                     // The 64-bit fastmem window's demoted sites from earlier sessions (fastmem-callback.cmake).
                     if (Eden::Fastmem::Window64Base() != 0 && eden_fastmem64_load_sites) {
