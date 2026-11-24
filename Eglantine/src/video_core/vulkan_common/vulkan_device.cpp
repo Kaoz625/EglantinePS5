@@ -1087,12 +1087,32 @@ VkDeviceSize Device::SparseTileBlockSize() {
     return size;
 }
 
+VkDeviceSize Device::SmallImageBlockSize() {
+    static const VkDeviceSize size = [] {
+        const char* value = std::getenv("EDEN_SMALL_IMAGE_BLOCK_MIB");
+        const unsigned long long mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 4ULL;
+        return static_cast<VkDeviceSize>((std::clamp)(mib, 1ULL, 16ULL) << 20);
+    }();
+    return size;
+}
+
+u64 Device::SmallImageTexels() {
+    static const u64 texels = [] {
+        const char* value = std::getenv("EDEN_SMALL_IMAGE_TEXELS");
+        return value != nullptr ? static_cast<u64>(std::strtoull(value, nullptr, 10))
+                                : u64{262144};
+    }();
+    return texels;
+}
+
 VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
     std::scoped_lock lk{separate_pools_mutex};
     VmaPool& pool = separate_pools[static_cast<u32>(kind)][memory_type];
     if (pool == VK_NULL_HANDLE) {
         const VkDeviceSize block_size =
-            kind == SeparatePool::SparseTiles ? SparseTileBlockSize() : SeparatePoolBlockSize;
+            kind == SeparatePool::SparseTiles   ? SparseTileBlockSize()
+            : kind == SeparatePool::SmallImages ? SmallImageBlockSize()
+                                                : SeparatePoolBlockSize;
         if (block_size == 0) {
             return VK_NULL_HANDLE;
         }

@@ -298,7 +298,8 @@ static void LogVmaPools(const Device& device, VmaAllocator allocator) {
     for (const auto [pool_kind, name] :
          {std::pair{Device::SeparatePool::SparsePages, "pages"},
           std::pair{Device::SeparatePool::SparseTiles, "tiles"},
-          std::pair{Device::SeparatePool::DeviceBuffers, "buffers"}}) {
+          std::pair{Device::SeparatePool::DeviceBuffers, "buffers"},
+          std::pair{Device::SeparatePool::SmallImages, "small_images"}}) {
         for (u32 type = 0; type < VK_MAX_MEMORY_TYPES; ++type) {
             if (!device.HasSeparatePool(pool_kind, type)) {
                 continue;
@@ -311,8 +312,10 @@ static void LogVmaPools(const Device& device, VmaAllocator allocator) {
             separate[type].allocationBytes += statistics.allocationBytes;
             std::fprintf(stderr,
                          "%s %s type=%u blocks=%u block_mib=%llu used_mib=%llu allocations=%u\n",
-                         pool_kind == Device::SeparatePool::DeviceBuffers ? "EDEN_VMA_POOL"
-                                                                          : "EDEN_SPARSE_POOL",
+                         pool_kind == Device::SeparatePool::DeviceBuffers ||
+                                 pool_kind == Device::SeparatePool::SmallImages
+                             ? "EDEN_VMA_POOL"
+                             : "EDEN_SPARSE_POOL",
                          name, type, statistics.blockCount,
                          static_cast<unsigned long long>(statistics.blockBytes >> 20),
                          static_cast<unsigned long long>(statistics.allocationBytes >> 20),
@@ -378,8 +381,49 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         }
     }
     const bool huge = IsTooLargeToBack(texels, bytes);
-    VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
-                           : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    bool small_pooled = false;
+    // H52: small images in a pool of small blocks of their own, lowest offset first (as the
+    // sparse tiles, H50). MKW PHAT5 H51 V1 (24 Nov), race 1: the default device-local blocks held
+    // 2.1-2.3 GB for 1.8-2.1 GB of allocations (130-330 MiB of holes, ~900 unused ranges), and
+    // the collector deletes thousands of small images a minute; their holes are refilled, but a
+    // 16 MiB block seldom empties to go back to the pool the guest's memory comes from.
+    if (!huge && !dedicated && Device::SmallImageTexels() != 0 &&
+        texels <= Device::SmallImageTexels()) {
+        static std::atomic<s32> small_type{-1};
+        s32 type = small_type.load(std::memory_order_relaxed);
+        if (type < 0) {
+            u32 found{};
+            if (vmaFindMemoryTypeIndexForImageInfo(allocator, &ci, &alloc_ci, &found) ==
+                VK_SUCCESS) {
+                type = static_cast<s32>(found);
+                small_type.store(type, std::memory_order_relaxed);
+            }
+        }
+        if (type >= 0) {
+            if (const VmaPool pool = device.GetSeparatePool(Device::SeparatePool::SmallImages,
+                                                            static_cast<u32>(type))) {
+                VmaAllocationCreateInfo pool_ci = alloc_ci;
+                pool_ci.pool = pool;
+                pool_ci.flags = (pool_ci.flags & ~static_cast<VmaAllocationCreateFlags>(
+                                                     VMA_ALLOCATION_CREATE_STRATEGY_MASK)) |
+                                static_cast<VmaAllocationCreateFlags>(
+                                    VMA_ALLOCATION_CREATE_STRATEGY_MIN_OFFSET_BIT);
+                result = vmaCreateImage(allocator, &ci, &pool_ci, &handle, &allocation,
+                                        &alloc_info);
+                small_pooled = result == VK_SUCCESS;
+                if (!small_pooled) {
+                    handle = VkImage{};
+                    allocation = VmaAllocation{};
+                }
+            }
+        }
+    }
+    if (!small_pooled) {
+        result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+                      : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation,
+                                       &alloc_info);
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.
@@ -620,6 +664,19 @@ bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, M
     VmaAllocationCreateInfo pool_ci = alloc_ci;
     pool_ci.pool = pool;
     pool_ci.memoryTypeBits = 0;
+    // H52: lowest offset first, as the sparse tiles (H50), so the pool's last blocks drain and go
+    // back to the driver. MKW PHAT5 H51 V1 (24 Nov), race 1: the buffer pool held 256-352 MiB of
+    // 16 MiB blocks for 99-172 MiB of buffers. EDEN_VMA_BUFFERS_MIN_OFFSET=0 = H51.
+    static const bool buffers_min_offset = [] {
+        const char* value = std::getenv("EDEN_VMA_BUFFERS_MIN_OFFSET");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (buffers_min_offset) {
+        pool_ci.flags = (pool_ci.flags & ~static_cast<VmaAllocationCreateFlags>(
+                                             VMA_ALLOCATION_CREATE_STRATEGY_MASK)) |
+                        static_cast<VmaAllocationCreateFlags>(
+                            VMA_ALLOCATION_CREATE_STRATEGY_MIN_OFFSET_BIT);
+    }
     return vmaCreateBuffer(allocator, &ci, &pool_ci, &handle, &allocation, &alloc_info) ==
            VK_SUCCESS;
 }

@@ -322,6 +322,19 @@ bool StoreCompactEnabled() noexcept {
     return on;
 }
 constexpr std::size_t CompactMinSlack = std::size_t{32} << 20, CompactMaxBytes = std::size_t{256} << 20;
+// H52: how full (percent) a store block may be and still be emptied into others. Half full left
+// MKW's store holding 160-330 MiB more blocks than packed data at race loads (H50 U1, 24 Nov:
+// store_held 540 -> 1018 MiB against stored 380 -> 691). EDEN_CRAM_COMPACT_FILL=50 = H51.
+std::uint32_t CompactVictimLimit() noexcept {
+    static const std::uint32_t limit = [] {
+        const char* value = std::getenv("EDEN_CRAM_COMPACT_FILL");
+        unsigned long percent = value != nullptr ? std::strtoul(value, nullptr, 10) : 75UL;
+        if (percent < 10) percent = 10;
+        if (percent > 90) percent = 90;
+        return static_cast<std::uint32_t>(StoreBlock / 100 * percent) + 1;
+    }();
+    return limit;
+}
 bool TryLockSlot(SparseRange& range, std::size_t slot) noexcept {
     std::uint8_t value = range.state[slot].load(std::memory_order_relaxed);
     return !(value & SlotLock) &&
@@ -352,9 +365,9 @@ void CompactStore(SparseRange& range, std::size_t slots) noexcept {
     for (std::size_t i = 0; i < StoreBlocks; ++i) compact_tried[i] = false;
     std::size_t moved = 0;
     while (moved < CompactMaxBytes) {
-        // The emptiest block at most half full not tried yet.
+        // The emptiest block at most CompactVictimLimit full not tried yet.
         std::size_t victim = StoreBlocks;
-        std::uint32_t least = StoreBlock / 2 + 1;
+        std::uint32_t least = CompactVictimLimit();
         for (std::size_t i = 0; i < StoreBlocks; ++i) {
             if (store_physical[i] < 0 || i == store_current || compact_tried[i]) continue;
             const std::uint32_t used = store_live[i].load(std::memory_order_acquire);

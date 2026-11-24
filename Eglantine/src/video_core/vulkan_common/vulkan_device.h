@@ -295,11 +295,20 @@ public:
         // H50: single sparse tiles (64 KiB) in small blocks of their own (SparseTileBlockSize()),
         // so a block empties and goes back once its few tiles are unbound.
         SparseTiles,
+        // H52: small images (SmallImageTexels()) in small blocks of their own
+        // (SmallImageBlockSize()), lowest offset first, so the blocks the collector empties go
+        // back instead of leaving holes in the default 16 MiB blocks.
+        SmallImages,
     };
     static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
     /// Block size of the SparseTiles pool: EDEN_SPARSE_TILE_BLOCK_MIB (default 2); 0 = no
     /// SparseTiles pool (tiles share the SparsePages pool's 16 MiB blocks as in H49).
     static VkDeviceSize SparseTileBlockSize();
+    /// H52: block size of the SmallImages pool, EDEN_SMALL_IMAGE_BLOCK_MIB (default 4).
+    static VkDeviceSize SmallImageBlockSize();
+    /// H52: images of at most this many texels (all layers, depth) go to the SmallImages pool:
+    /// EDEN_SMALL_IMAGE_TEXELS (default 262144 = 512x512); 0 = no SmallImages pool (H51).
+    static u64 SmallImageTexels();
 
     /// The pool of that kind for a memory type, created on first use (null if that failed).
     VmaPool GetSeparatePool(SeparatePool kind, u32 memory_type) const;
@@ -1430,7 +1439,7 @@ private:
     VkInstance instance;         ///< Vulkan instance.
     VmaAllocator allocator{};    ///< VMA allocator.
     mutable std::mutex separate_pools_mutex;
-    mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 3> separate_pools{};
+    mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 4> separate_pools{};
     vk::DeviceDispatch dld;      ///< Device function pointers.
     vk::PhysicalDevice physical; ///< Physical device.
     vk::Device logical;          ///< Logical device.
