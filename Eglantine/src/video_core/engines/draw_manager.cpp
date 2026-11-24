@@ -11,6 +11,7 @@
 
 #include "common/settings.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/draw_stats.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/render_trace.h"
@@ -357,6 +358,7 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
                 LOG_ERROR(HW_GPU, "Indexed draw dropped: first={:#x} count={:#x} reach {} MiB",
                           index_buffer.first, index_buffer.count, end >> 20);
             }
+            VideoCommon::DrawStats::Count(VideoCommon::DrawStats::Dropped);
             return;
         }
     }
@@ -392,6 +394,7 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
                              draw_state.inline_index_draw_indexes.size(), regs.draw.begin,
                              (unsigned long long)vs, (unsigned long long)ps);
             }
+            VideoCommon::DrawStats::Count(VideoCommon::DrawStats::Dropped);
             return;
         }
     }
@@ -399,6 +402,7 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
     if (maxwell3d.ShouldExecute()) {
         maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
     } else {
+        VideoCommon::DrawStats::Count(VideoCommon::DrawStats::NotExecuted);
         TraceSuppressedDraw(maxwell3d, false);
     }
 }
@@ -410,6 +414,7 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
     if (maxwell3d.ShouldExecute()) {
         maxwell3d.rasterizer->DrawIndirect();
     } else {
+        VideoCommon::DrawStats::Count(VideoCommon::DrawStats::NotExecuted);
         TraceSuppressedDraw(maxwell3d, true);
     }
 }

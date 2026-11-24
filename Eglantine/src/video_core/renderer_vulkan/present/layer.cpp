@@ -14,6 +14,7 @@
 
 #include "common/settings.h"
 #include "video_core/framebuffer_config.h"
+#include "video_core/draw_stats.h"
 #include "video_core/renderer_vulkan/present/fsr.h"
 #include "video_core/renderer_vulkan/present/fsr3.h"
 #include "video_core/renderer_vulkan/present/sgsr.h"
@@ -98,6 +99,12 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
     if (!framebuffer.cpu_pixels) {
         texture_info = rasterizer.AccelerateDisplay(
             framebuffer, framebuffer.address + framebuffer.offset, framebuffer.stride);
+    }
+    if (VideoCommon::DrawStats::Enabled()) {
+        VideoCommon::DrawStats::Count(VideoCommon::DrawStats::Presents);
+        VideoCommon::DrawStats::NoteLayer(framebuffer.address + framebuffer.offset, framebuffer.width,
+                                          framebuffer.height, static_cast<u32>(framebuffer.blending),
+                                          framebuffer.cpu_pixels != nullptr, texture_info.has_value());
     }
     const u32 texture_width = texture_info ? texture_info->width : framebuffer.width;
     const u32 texture_height = texture_info ? texture_info->height : framebuffer.height;

@@ -46,6 +46,7 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/buffer_cache/indirect_buffer.h"
 #include "video_core/native_query_trace.h"
+#include "video_core/draw_stats.h"
 #include "video_core/native_indirect_reset.h"
 #include "video_core/render_trace.h"
 #include "video_core/indirect_reset.h"
@@ -1600,8 +1601,27 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 }
 } // Anonymous namespace
 
+namespace {
+// EDEN_DRAW_STATS: colour target 0 of a draw, by device address (what a presented layer names).
+void NoteDrawStatsTarget(const Tegra::Engines::Maxwell3D& maxwell3d, const Tegra::MemoryManager& memory) {
+    const auto& regs = maxwell3d.regs;
+    const auto& rt = regs.rt[0];
+    u64 address = 0;
+    if (regs.rt_control.count != 0 && rt.Address() != 0) {
+        if (const auto device = memory.GpuToCpuAddress(rt.Address())) {
+            address = *device;
+        }
+    }
+    VideoCommon::DrawStats::NoteTarget(address, rt.width, rt.height, static_cast<u32>(rt.format));
+}
+} // namespace
+
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    if (VideoCommon::DrawStats::Enabled()) {
+        VideoCommon::DrawStats::Count(VideoCommon::DrawStats::Draws);
+        NoteDrawStatsTarget(*maxwell3d, *gpu_memory);
+    }
     {
         // A draw's first and count can come from memory a skipped (rejected) compute program
         // should have written. Past 16M vertices they are garbage: building the quad index
@@ -1617,6 +1637,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                 LOG_WARNING(HW_GPU, "Draw skipped: {} {} from {} (vertex/index count past {})",
                             count, is_indexed ? "indices" : "vertices", first, MaxVertices);
             }
+            VideoCommon::DrawStats::Count(VideoCommon::DrawStats::Skipped);
             return;
         }
     }
@@ -1850,6 +1871,10 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 
 void RasterizerVulkan::DrawIndirect() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    if (VideoCommon::DrawStats::Enabled()) {
+        VideoCommon::DrawStats::Count(VideoCommon::DrawStats::Indirect);
+        NoteDrawStatsTarget(*maxwell3d, *gpu_memory);
+    }
     const auto& params = maxwell3d->draw_manager.indirect_state;
     if (Common::DkbFrameTrace::Enabled()) {
         ++trace_indirect;
@@ -2258,6 +2283,7 @@ bool RasterizerVulkan::ClearVolumeSlices(const Framebuffer* framebuffer, u32 fir
 
 void RasterizerVulkan::Clear(u32 layer_count) {
     SCOPE_EXIT { SyncProbe(scheduler, "clear", nullptr); };
+    VideoCommon::DrawStats::Count(VideoCommon::DrawStats::Clears);
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Clear};
     if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
         const auto& regs = maxwell3d->regs;
@@ -2509,6 +2535,7 @@ constexpr VkPipelineStageFlags COMPUTE_CONSUMER_STAGES =
 
 void RasterizerVulkan::DispatchCompute() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
+    VideoCommon::DrawStats::Count(VideoCommon::DrawStats::Dispatches);
     FlushWork();
     gpu_memory->FlushCaching();
     if (frame_dump.Capturing()) {
