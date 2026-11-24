@@ -82,6 +82,15 @@ private:
     struct LoadedProgram {
         ProgramRecord record;
         std::shared_ptr<const LoweredNativeCode> code;
+        /// H45 (EDEN_SC_COMPACT, default on): `record.native` is dropped and checked by size and
+        /// hash instead; `code` is null and the lowered code is kept LZ4-compressed in `packed`
+        /// (`shell` holds everything else). A hit unpacks it once while anyone still uses it.
+        u64 native_hash{};
+        size_t native_count{};
+        std::shared_ptr<const LoweredNativeCode> shell;
+        std::vector<u8> packed;
+        size_t code_words{};
+        std::weak_ptr<const LoweredNativeCode> live;
     };
 
     struct ProgramCounts {
@@ -96,6 +105,9 @@ private:
     /// Written by LoadPrograms only before `loaded_ready` is set, then never changed
     std::unordered_map<u64, LoadedProgram> loaded;
     std::atomic<bool> loaded_ready{};
+    /// H45: guards LoadedProgram::live (compact records only)
+    std::mutex unpack_mutex;
+    std::atomic<u64> unpacks{};
     std::array<ProgramCounts, static_cast<size_t>(ProgramLookup::Count)> counts;
     CacheWriter writer;
 };

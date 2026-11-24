@@ -2,9 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "common/assert.h"
+#include "common/cityhash.h"
+#include "common/lz4_compression.h"
 #include "common/logging.h"
 #include "video_core/native_lowering.h"
 #include "video_core/nx2_stutter_trace.h"
@@ -17,16 +21,32 @@ namespace {
 
 /// Whether a record holds these inputs: a key that matches by chance never gives another
 /// program's code
-bool HoldsInputs(const ProgramRecord& record, const ProgramKeyInputs& inputs) {
+bool HoldsInputsExceptNative(const ProgramRecord& record, const ProgramKeyInputs& inputs) {
     return record.source == inputs.source && record.stage == inputs.stage &&
            record.header_size == inputs.header_size && record.geometry == inputs.geometry &&
            record.tessellation_stage == inputs.tessellation_stage &&
            record.native_code_address == inputs.native_code_address &&
            std::ranges::equal(record.sph, inputs.sph) &&
-           std::ranges::equal(record.verified_traps, inputs.verified_traps) &&
-           record.native.size() == inputs.native.size() &&
+           std::ranges::equal(record.verified_traps, inputs.verified_traps);
+}
+
+bool HoldsInputs(const ProgramRecord& record, const ProgramKeyInputs& inputs) {
+    return HoldsInputsExceptNative(record, inputs) && record.native.size() == inputs.native.size() &&
            std::memcmp(record.native.data(), inputs.native.data(), inputs.native.size_bytes()) ==
                0;
+}
+
+u64 NativeHash(std::span<const Shader::Ampere::Instruction> native) {
+    return Common::CityHash64(reinterpret_cast<const char*>(native.data()), native.size_bytes());
+}
+
+/// H45: EDEN_SC_COMPACT=0 keeps every loaded record whole (H44 and before)
+bool CompactLoaded() {
+    static const bool on = [] {
+        const char* text = std::getenv("EDEN_SC_COMPACT");
+        return !(text && text[0] == '0');
+    }();
+    return on;
 }
 
 } // Anonymous namespace
@@ -68,6 +88,10 @@ void Cache::AddProgram(u64 key, u64 lowering_stamp) {
 void Cache::LoadPrograms(std::span<const LogRecord> live) {
     ASSERT(!loaded_ready.load(std::memory_order_relaxed));
     std::unordered_map<u64, LoadedProgram> table;
+    const bool compact = CompactLoaded();
+    size_t native_bytes = 0;
+    size_t code_bytes = 0;
+    size_t packed_bytes = 0;
     for (const LogRecord& entry : live) {
         if (entry.kind != RecordKind::Program) {
             continue;
@@ -85,8 +109,33 @@ void Cache::LoadPrograms(std::span<const LogRecord> live) {
         if (!record || ProgramKey(*record) != entry.key) {
             continue;
         }
-        std::shared_ptr<const LoweredNativeCode> code = TakeProgramCode(*record);
-        table.insert_or_assign(entry.key, LoadedProgram{std::move(*record), std::move(code)});
+        std::shared_ptr<LoweredNativeCode> code = TakeProgramCode(*record);
+        if (!compact) {
+            table.insert_or_assign(entry.key, LoadedProgram{std::move(*record), std::move(code)});
+            continue;
+        }
+        LoadedProgram program{};
+        program.native_hash = NativeHash(record->native);
+        program.native_count = record->native.size();
+        native_bytes += record->native.size() * sizeof(Shader::Ampere::Instruction);
+        std::vector<Shader::Ampere::Instruction>{}.swap(record->native);
+        program.record = std::move(*record);
+        program.code_words = code->code.size();
+        code_bytes += code->code.size() * sizeof(u64);
+        program.packed = Common::Compression::CompressDataLZ4(
+            reinterpret_cast<const u8*>(code->code.data()), code->code.size() * sizeof(u64));
+        program.packed.shrink_to_fit();
+        packed_bytes += program.packed.size();
+        std::vector<u64>{}.swap(code->code);
+        program.shell = std::move(code);
+        table.insert_or_assign(entry.key, std::move(program));
+    }
+    if (compact) {
+        std::fprintf(stderr,
+                     "EDEN_SC_COMPACT programs=%zu native_dropped_mib=%.1f code_mib=%.1f "
+                     "packed_mib=%.1f (H45; EDEN_SC_COMPACT=0 = off)\n",
+                     table.size(), native_bytes / 1048576.0, code_bytes / 1048576.0,
+                     packed_bytes / 1048576.0);
     }
     loaded = std::move(table);
     loaded_ready.store(true, std::memory_order_release);
@@ -95,9 +144,38 @@ void Cache::LoadPrograms(std::span<const LogRecord> live) {
 FoundProgram Cache::FindProgram(const ProgramKeyInputs& inputs) {
     const u64 key = ProgramKey(inputs);
     if (loaded_ready.load(std::memory_order_acquire)) {
-        if (const auto it = loaded.find(key);
-            it != loaded.end() && HoldsInputs(it->second.record, inputs)) {
-            return {ProgramLookup::Hit, it->second.code};
+        if (const auto it = loaded.find(key); it != loaded.end()) {
+            LoadedProgram& program = it->second;
+            if (program.shell == nullptr) {
+                if (HoldsInputs(program.record, inputs)) {
+                    return {ProgramLookup::Hit, program.code};
+                }
+            } else if (HoldsInputsExceptNative(program.record, inputs) &&
+                       program.native_count == inputs.native.size() &&
+                       program.native_hash == NativeHash(inputs.native)) {
+                std::scoped_lock unpack_lock{unpack_mutex};
+                if (auto code = program.live.lock()) {
+                    return {ProgramLookup::Hit, std::move(code)};
+                }
+                auto code = std::make_shared<LoweredNativeCode>(*program.shell);
+                code->code.resize(program.code_words);
+                const size_t bytes = program.code_words * sizeof(u64);
+                if (bytes == 0 ||
+                    Common::Compression::DecompressDataLZ4(code->code.data(), bytes,
+                                                           program.packed.data(),
+                                                           program.packed.size()) ==
+                        static_cast<int>(bytes)) {
+                    program.live = code;
+                    const u64 n = unpacks.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (n <= 4 || (n & (n - 1)) == 0) {
+                        std::fprintf(stderr, "EDEN_SC_COMPACT unpacks=%llu\n",
+                                     static_cast<unsigned long long>(n));
+                    }
+                    return {ProgramLookup::Hit, std::move(code)};
+                }
+                std::fprintf(stderr, "EDEN_SC_COMPACT unpack failed key=%016llx\n",
+                             static_cast<unsigned long long>(key));
+            }
         }
     }
     std::scoped_lock lock{mutex};
