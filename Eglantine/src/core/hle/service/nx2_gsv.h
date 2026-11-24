@@ -3603,12 +3603,13 @@ private:
             }
             // Mario Kart World waits for returned images after a movie and acquires a frame for
             // each completed fence, so its released images need synthetic end-of-stream frames.
+            // Kirby Air Riders does the same after its attract movies: a completed fence with no
+            // output (213 empty) left it on the last frame for ~2 minutes.
             static const bool release_now = [] {
                 const char* env_value = std::getenv("EDEN_NX2_VDEC_EOS_RELEASE_NOW");
                 return env_value != nullptr && env_value[0] != '0';
             }();
-            const bool drain_eos =
-                system.GetApplicationProcessProgramID() == Settings::MarioKartWorldProgramId;
+            const bool drain_eos = DrainsEndOfStream();
             if ((drain_eos || release_now) && release_fence && m_stream_ended && m_inputs.Empty() &&
                 m_decoded.empty()) {
                 const u32 reached =
@@ -3927,8 +3928,7 @@ private:
                 }
                 system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
                 m_last_output = m_outputs.back();
-                if (frame.end && m_inputs.Empty() && m_decoded.empty() &&
-                    system.GetApplicationProcessProgramID() == Settings::MarioKartWorldProgramId) {
+                if (frame.end && m_inputs.Empty() && m_decoded.empty() && DrainsEndOfStream()) {
                     DrainFreeAsEndOfStream();
                 }
                 ++m_frames_out;
@@ -4016,6 +4016,20 @@ private:
                 }
             }
         }
+    }
+
+    // Titles that acquire one more frame per completed fence after end of stream.
+    // EDEN_NX2_VDEC_DRAIN_EOS=0 turns it off, =1 turns it on for every title.
+    bool DrainsEndOfStream() const {
+        static const int forced = [] {
+            const char* env_value = std::getenv("EDEN_NX2_VDEC_DRAIN_EOS");
+            return env_value == nullptr ? -1 : (env_value[0] != '0' ? 1 : 0);
+        }();
+        if (forced >= 0) {
+            return forced == 1;
+        }
+        const u64 id = system.GetApplicationProcessProgramID();
+        return id == Settings::MarioKartWorldProgramId || id == Settings::KirbyAirRidersProgramId;
     }
 
     u32 DrainFreeAsEndOfStream() {
