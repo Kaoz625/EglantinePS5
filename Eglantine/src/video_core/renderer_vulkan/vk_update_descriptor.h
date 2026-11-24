@@ -5,11 +5,13 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <span>
 #include <variant>
 #include <vector>
+#include "common/common_types.h"
 #include "video_core/renderer_vulkan/descriptor_payload_growth.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -143,14 +145,14 @@ private:
     size_t ticks_since_report = 0;
     DescriptorUpdateEntry* upload_start = nullptr;
     DescriptorUpdateEntry* chunk_end = nullptr;
-    std::unique_ptr<ChunkedDescriptorPayload<DescriptorUpdateEntry>> payload;
-    // H47: entries this frame in chunks already left, most chunks one frame used (frame + window)
+    std::unique_ptr<DescriptorChunkPool<DescriptorUpdateEntry>> payload;
+    // H47b: the worker stores the chunk sequence it passed (a command recorded after the chunk)
+    std::shared_ptr<std::atomic<u64>> worker_passed{std::make_shared<std::atomic<u64>>(0)};
+    u64 frame_sequence{}; ///< chunks retired so far
     size_t frame_entries_before{};
-    size_t frame_chunks{1};
-    size_t window_peak_chunks{1};
+    size_t window_peak_in_use{};
     size_t window_frames{};
-    size_t shrink_to_chunks{}; // > 0 = give back chunks at the next Acquire (after a drain)
-    size_t reported_extra_high{};
+    size_t reported_held_high{};
     size_t freed_total{};
     size_t drains{};
     bool growth_disabled{};

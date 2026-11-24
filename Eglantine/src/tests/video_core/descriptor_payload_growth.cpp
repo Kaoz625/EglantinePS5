@@ -83,89 +83,81 @@ TEST_CASE("Descriptor growth clips doubling to its configured ceiling", "[descri
                 }) == PayloadGrowthResult::AtLimit);
 }
 
-using Vulkan::ChunkedDescriptorPayload;
+using Vulkan::DescriptorChunkPool;
 
 namespace {
 auto AllocInts = [](size_t count) { return std::make_unique<int[]>(count); };
 }
 
-TEST_CASE("Chunked payload grows only the overflowing slot, one chunk at a time",
-          "[descriptor_payload]") {
-    ChunkedDescriptorPayload<int> payload(8, 4, 16);
-    REQUIRE(payload.Init(AllocInts));
-    REQUIRE(payload.HeldEntries() == 32);
-    int* const first = payload.Begin(2);
-    first[0] = 7;
-    int* const second = payload.Next(2, AllocInts);
+TEST_CASE("Descriptor pool reuses a chunk only after the worker passed it", "[descriptor_payload]") {
+    DescriptorChunkPool<int> pool(4, 64);
+    int* const first = pool.Take(1, 0, AllocInts);
+    REQUIRE(first != nullptr);
+    first[0] = 11;
+    pool.Retire(1);
+    int* const second = pool.Take(1, 0, AllocInts); // worker has not passed 1: a new chunk
     REQUIRE(second != nullptr);
     REQUIRE(second != first);
-    REQUIRE(first[0] == 7); // earlier chunk of the frame stays alive (queued work reads it)
-    REQUIRE(payload.CurrentChunk() == 1);
-    REQUIRE(payload.ExtraEntries() == 4);
-    REQUIRE(payload.HeldEntries() == 36);
-    REQUIRE(payload.SlotChunks(2) == 2);
-    REQUIRE(payload.SlotChunks(3) == 1);
+    REQUIRE(first[0] == 11);
+    REQUIRE(pool.HeldEntries() == 8);
+    pool.Retire(2);
+    int* const third = pool.Take(1, 1, AllocInts); // worker passed 1: the first chunk again
+    REQUIRE(third == first);
+    REQUIRE(pool.HeldEntries() == 8);
+    REQUIRE(pool.RecycledChunks() == 1);
+    REQUIRE(pool.InUseEntries() == 8); // chunk 2 retired (not passed) + the one in use
 }
 
-TEST_CASE("Chunked payload reuses chunks and stops at the slot ceiling", "[descriptor_payload]") {
-    ChunkedDescriptorPayload<int> payload(2, 4, 12);
-    REQUIRE(payload.Init(AllocInts));
-    payload.Begin(0);
-    REQUIRE(payload.Next(1, AllocInts) != nullptr);
-    REQUIRE(payload.Next(1, AllocInts) != nullptr);
-    REQUIRE(payload.Next(1, AllocInts) == nullptr); // 3 chunks x 4 = 12 = ceiling
-    REQUIRE_FALSE(payload.AllocationFailed());
-    REQUIRE(payload.Restart() != nullptr);
-    REQUIRE(payload.CurrentChunk() == 0);
+TEST_CASE("Descriptor pool stops at its ceiling; a drain frees every chunk", "[descriptor_payload]") {
+    DescriptorChunkPool<int> pool(4, 12);
+    REQUIRE(pool.Take(1, 0, AllocInts) != nullptr);
+    pool.Retire(1);
+    REQUIRE(pool.Take(1, 0, AllocInts) != nullptr);
+    pool.Retire(2);
+    REQUIRE(pool.Take(1, 0, AllocInts) != nullptr);
+    pool.Retire(3);
+    REQUIRE(pool.Take(1, 0, AllocInts) == nullptr);
+    REQUIRE_FALSE(pool.AllocationFailed());
+    pool.RecycleAfterDrain();
+    REQUIRE(pool.InUseEntries() == 0);
     unsigned allocations = 0;
-    REQUIRE(payload.Next(1, [&](size_t count) {
+    REQUIRE(pool.Take(1, 0, [&](size_t count) {
         ++allocations;
         return std::make_unique<int[]>(count);
     }) != nullptr);
-    REQUIRE(allocations == 0); // chunk 1 already there
+    REQUIRE(allocations == 0);
 }
 
-TEST_CASE("Chunked payload fits a reservation larger than a chunk", "[descriptor_payload]") {
-    ChunkedDescriptorPayload<int> payload(2, 4, 32);
-    REQUIRE(payload.Init(AllocInts));
-    payload.Begin(1);
-    REQUIRE(payload.Next(1, AllocInts) != nullptr);
-    REQUIRE(payload.CurrentChunkSize() == 4);
-    payload.Restart();
-    REQUIRE(payload.Next(10, AllocInts) != nullptr); // chunk 1 (4) too small -> replaced
-    REQUIRE(payload.CurrentChunkSize() == 10);
-    REQUIRE(payload.ExtraEntries() == 10);
+TEST_CASE("Descriptor pool fits a reservation larger than a chunk", "[descriptor_payload]") {
+    DescriptorChunkPool<int> pool(4, 64);
+    REQUIRE(pool.Take(1, 0, AllocInts) != nullptr);
+    pool.Retire(1);
+    REQUIRE(pool.Take(10, 1, AllocInts) != nullptr); // the free 4-entry chunk is too small
+    REQUIRE(pool.CurrentSize() == 10);
+    REQUIRE(pool.HeldEntries() == 14);
 }
 
-TEST_CASE("Chunked payload allocation failure leaves the slot usable", "[descriptor_payload]") {
-    ChunkedDescriptorPayload<int> payload(2, 4, 32);
-    REQUIRE(payload.Init(AllocInts));
-    int* const base = payload.Begin(0);
-    REQUIRE(payload.Next(1, [](size_t) -> std::unique_ptr<int[]> { throw std::bad_alloc{}; }) ==
+TEST_CASE("Descriptor pool allocation failure is reported", "[descriptor_payload]") {
+    DescriptorChunkPool<int> pool(4, 64);
+    REQUIRE(pool.Take(1, 0, [](size_t) -> std::unique_ptr<int[]> { throw std::bad_alloc{}; }) ==
             nullptr);
-    REQUIRE(payload.AllocationFailed());
-    REQUIRE(payload.ExtraEntries() == 0);
-    REQUIRE(payload.Restart() == base);
+    REQUIRE(pool.AllocationFailed());
+    REQUIRE(pool.HeldEntries() == 0);
 }
 
-TEST_CASE("Chunked payload shrink keeps chunk 0 and the chunks in use", "[descriptor_payload]") {
-    ChunkedDescriptorPayload<int> payload(3, 4, 64);
-    REQUIRE(payload.Init(AllocInts));
-    payload.Begin(0);
-    for (int i = 0; i < 3; ++i) {
-        REQUIRE(payload.Next(1, AllocInts) != nullptr);
+TEST_CASE("Descriptor pool trims only free chunks", "[descriptor_payload]") {
+    DescriptorChunkPool<int> pool(4, 64);
+    for (std::uint64_t sequence = 1; sequence <= 6; ++sequence) {
+        REQUIRE(pool.Take(1, 0, AllocInts) != nullptr);
+        pool.Retire(sequence);
     }
-    payload.Begin(1);
-    int* const in_use = payload.Next(1, AllocInts);
+    int* const in_use = pool.Take(1, 6, AllocInts); // all 6 passed: one reused, 5 free
     REQUIRE(in_use != nullptr);
-    in_use[0] = 5;
-    REQUIRE(payload.ExtraEntries() == 16);
-    REQUIRE(payload.Shrink(1) == 12); // slot 0 back to 1 chunk; slot 1 keeps its chunk in use
-    REQUIRE(payload.SlotChunks(0) == 1);
-    REQUIRE(payload.SlotChunks(1) == 2);
-    REQUIRE(in_use[0] == 5);
-    REQUIRE(payload.ExtraEntries() == 4);
-    payload.Begin(2);
-    REQUIRE(payload.Shrink(0) == 4); // keep_chunks 0 is read as 1
-    REQUIRE(payload.HeldEntries() == 12);
+    in_use[0] = 3;
+    REQUIRE(pool.HeldEntries() == 24);
+    REQUIRE(pool.Trim(8) == 16); // held 24 -> 8: four free chunks go
+    REQUIRE(pool.HeldEntries() == 8);
+    REQUIRE(pool.Trim(0) == 4); // the last free chunk; the one in use stays
+    REQUIRE(pool.HeldEntries() == 4);
+    REQUIRE(in_use[0] == 3);
 }

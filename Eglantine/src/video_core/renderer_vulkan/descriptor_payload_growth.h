@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <new>
@@ -46,143 +47,139 @@ PayloadGrowthResult GrowDescriptorPayload(std::unique_ptr<Entry[]>& storage, siz
     return PayloadGrowthResult::Grown;
 }
 
-/// H47: descriptor payload kept as chunks per frame slot. A frame that needs more entries moves to
-/// the next chunk of its own slot (allocated on first need, no drain, no big contiguous block), so
-/// only the slot that overflows grows, by one chunk at a time (= what the frame needs). Before H47 a
-/// load frame of Kirby Air Riders doubled ALL 8 slots at once: 96 -> 192 -> 384 MiB in one block,
-/// held for the rest of the session. Shrink() gives chunks back after a quiet stretch.
+/// H47b: descriptor payload as one pool of chunks shared by all frames. A frame takes chunks as it
+/// fills them; at its end they are retired with the frame's sequence number, and they go back to the
+/// free list once the scheduler's worker has run past that frame (the worker reads the payload when
+/// it executes the recorded commands; nothing reads it after that). Memory follows the frames the
+/// worker is behind (1-2), not 8 frame slots: Kirby Air Riders fills ~1.5 M entries (36 MiB) every
+/// frame, so 8 slots held 300-384 MiB (H45 doubling, H47 per-slot chunks).
 template <class Entry>
-class ChunkedDescriptorPayload {
+class DescriptorChunkPool {
 public:
     struct Chunk {
         std::unique_ptr<Entry[]> data;
         size_t size{};
     };
 
-    /// frames = slots (frames in flight), chunk_entries = the size of each normal chunk,
-    /// max_entries = the most entries one slot may hold (its chunks summed).
-    ChunkedDescriptorPayload(size_t frames, size_t chunk_entries_, size_t max_entries_)
-        : slots(frames), chunk_entries{chunk_entries_}, max_entries{max_entries_} {}
+    /// chunk_entries = the size of a normal chunk; max_entries = the most entries the pool holds.
+    DescriptorChunkPool(size_t chunk_entries_, size_t max_entries_)
+        : chunk_entries{chunk_entries_}, max_entries{max_entries_} {}
 
-    /// Allocates chunk 0 of every slot. False when an allocation failed.
+    /// A chunk for the current frame with room for `reserve` entries: a free one, one whose frame
+    /// the worker passed (sequence <= consumed), or a new one. nullptr = the pool is at its maximum
+    /// or the allocation failed (AllocationFailed()); the caller drains the worker and calls
+    /// RecycleAfterDrain().
     template <class Allocate>
-    bool Init(Allocate&& allocate) {
-        for (auto& slot : slots) {
-            if (!slot.empty()) {
-                continue;
-            }
-            Chunk chunk{TryAllocate(allocate, chunk_entries), chunk_entries};
-            if (!chunk.data) {
-                return false;
-            }
-            slot.push_back(std::move(chunk));
-        }
-        return true;
-    }
-
-    /// Start of a frame slot: its chunk 0.
-    Entry* Begin(size_t frame) {
-        current_slot = frame;
-        current_chunk = 0;
-        return slots[frame][0].data.get();
-    }
-
-    /// After a drain: back to chunk 0 of the current slot.
-    Entry* Restart() {
-        current_chunk = 0;
-        return slots[current_slot][0].data.get();
-    }
-
-    /// Moves the current slot to its next chunk with room for `reserve` entries, allocating it
-    /// when the slot has none yet. nullptr = the slot is at its maximum or the allocation failed
-    /// (allocation_failed tells which); the caller then drains and Restart()s.
-    template <class Allocate>
-    Entry* Next(size_t reserve, Allocate&& allocate) {
+    Entry* Take(size_t reserve, std::uint64_t consumed, Allocate&& allocate) {
         allocation_failed = false;
-        auto& slot = slots[current_slot];
-        const size_t next_index = current_chunk + 1;
+        Recycle(consumed);
         const size_t want = (std::max)(chunk_entries, reserve);
-        size_t before = 0;
-        for (size_t i = 0; i < next_index && i < slot.size(); ++i) {
-            before += slot[i].size;
+        for (size_t i = free.size(); i-- > 0;) {
+            if (free[i].size >= reserve) {
+                frame.push_back(std::move(free[i]));
+                free.erase(free.begin() + static_cast<std::ptrdiff_t>(i));
+                ++recycled;
+                return frame.back().data.get();
+            }
         }
-        if (before + want > max_entries) {
+        if (held + want > max_entries) {
             return nullptr;
         }
-        if (next_index < slot.size() && slot[next_index].size < want) {
-            // Too small for this reservation: its old entries are from an earlier frame.
-            held_entries -= slot[next_index].size;
-            slot.erase(slot.begin() + static_cast<std::ptrdiff_t>(next_index));
+        std::unique_ptr<Entry[]> data;
+        try {
+            data = allocate(want);
+        } catch (const std::bad_alloc&) {
         }
-        if (next_index >= slot.size()) {
-            Chunk chunk{TryAllocate(allocate, want), want};
-            if (!chunk.data) {
-                allocation_failed = true;
-                return nullptr;
-            }
-            held_entries += want;
-            slot.insert(slot.begin() + static_cast<std::ptrdiff_t>(next_index), std::move(chunk));
+        if (!data) {
+            allocation_failed = true;
+            return nullptr;
         }
-        current_chunk = next_index;
-        return slot[current_chunk].data.get();
+        held += want;
+        frame.push_back(Chunk{std::move(data), want});
+        return frame.back().data.get();
     }
 
-    /// Frees the chunks past `keep_chunks` in every slot, never chunk 0 and never a chunk of the
-    /// current slot at or before the one in use. Call only when no queued work reads the payload
-    /// (after the worker drained). Returns the entries freed.
-    size_t Shrink(size_t keep_chunks) {
-        keep_chunks = (std::max<size_t>)(keep_chunks, 1);
-        size_t freed = 0;
-        for (size_t s = 0; s < slots.size(); ++s) {
-            auto& slot = slots[s];
-            const size_t keep = s == current_slot ? (std::max)(keep_chunks, current_chunk + 1)
-                                                  : keep_chunks;
-            while (slot.size() > keep) {
-                freed += slot.back().size;
-                slot.pop_back();
-            }
+    /// End of a frame: its chunks wait for the worker to pass `sequence`.
+    void Retire(std::uint64_t sequence) {
+        if (frame.empty()) {
+            return;
         }
-        held_entries -= freed;
+        for (Chunk& chunk : frame) {
+            retired.push_back(Retired{std::move(chunk), sequence});
+        }
+        frame.clear();
+    }
+
+    /// After the worker drained: every chunk is free, the current frame's too (its entries were
+    /// read; the caller starts a new chunk).
+    void RecycleAfterDrain() {
+        for (Retired& entry : retired) {
+            free.push_back(std::move(entry.chunk));
+        }
+        retired.clear();
+        for (Chunk& chunk : frame) {
+            free.push_back(std::move(chunk));
+        }
+        frame.clear();
+    }
+
+    /// Frees free chunks while the pool holds more than `keep_entries`. Returns the entries freed.
+    size_t Trim(size_t keep_entries) {
+        size_t freed = 0;
+        while (!free.empty() && held > keep_entries) {
+            held -= free.back().size;
+            freed += free.back().size;
+            free.pop_back();
+        }
         return freed;
     }
 
-    size_t CurrentChunkSize() const {
-        return slots[current_slot][current_chunk].size;
+    size_t CurrentSize() const {
+        return frame.empty() ? 0 : frame.back().size;
     }
-    size_t CurrentChunk() const {
-        return current_chunk;
+    /// Entries in chunks the current frame or the worker may still read.
+    size_t InUseEntries() const {
+        size_t total = 0;
+        for (const Chunk& chunk : frame) {
+            total += chunk.size;
+        }
+        for (const Retired& entry : retired) {
+            total += entry.chunk.size;
+        }
+        return total;
     }
-    /// Entries held beyond chunk 0 of each slot (what growth added).
-    size_t ExtraEntries() const {
-        return held_entries;
-    }
-    /// All entries held (chunk 0 of every slot included).
     size_t HeldEntries() const {
-        return held_entries + slots.size() * chunk_entries;
+        return held;
     }
-    size_t SlotChunks(size_t slot) const {
-        return slots[slot].size();
+    size_t RecycledChunks() const {
+        return recycled;
     }
     bool AllocationFailed() const {
         return allocation_failed;
     }
 
 private:
-    template <class Allocate>
-    static std::unique_ptr<Entry[]> TryAllocate(Allocate& allocate, size_t count) {
-        try {
-            return allocate(count);
-        } catch (const std::bad_alloc&) {
-            return nullptr;
+    struct Retired {
+        Chunk chunk;
+        std::uint64_t sequence;
+    };
+
+    void Recycle(std::uint64_t consumed) {
+        size_t moved = 0;
+        while (moved < retired.size() && retired[moved].sequence <= consumed) {
+            free.push_back(std::move(retired[moved].chunk));
+            ++moved;
         }
+        retired.erase(retired.begin(), retired.begin() + static_cast<std::ptrdiff_t>(moved));
     }
 
-    std::vector<std::vector<Chunk>> slots;
     size_t chunk_entries;
     size_t max_entries;
-    size_t current_slot{};
-    size_t current_chunk{};
-    size_t held_entries{};
+    size_t held{};
+    size_t recycled{};
+    std::vector<Chunk> frame;
+    std::vector<Chunk> free;
+    std::vector<Retired> retired; ///< oldest first (sequences only grow)
     bool allocation_failed{};
 };
 
