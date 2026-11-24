@@ -3603,8 +3603,6 @@ private:
             }
             // Mario Kart World waits for returned images after a movie and acquires a frame for
             // each completed fence, so its released images need synthetic end-of-stream frames.
-            // Kirby Air Riders does the same after its attract movies: a completed fence with no
-            // output (213 empty) left it on the last frame for ~2 minutes.
             static const bool release_now = [] {
                 const char* env_value = std::getenv("EDEN_NX2_VDEC_EOS_RELEASE_NOW");
                 return env_value != nullptr && env_value[0] != '0';
@@ -4028,8 +4026,10 @@ private:
         if (forced >= 0) {
             return forced == 1;
         }
-        const u64 id = system.GetApplicationProcessProgramID();
-        return id == Settings::MarioKartWorldProgramId || id == Settings::KirbyAirRidersProgramId;
+        // Not Kirby Air Riders: with the drain (H52k, k12b) it held both images after the long
+        // movie and called Stop only on a button press; it ends normally when the fences of the
+        // images it returns after end of stream stay unreached (k11b).
+        return system.GetApplicationProcessProgramID() == Settings::MarioKartWorldProgramId;
     }
 
     u32 DrainFreeAsEndOfStream() {
