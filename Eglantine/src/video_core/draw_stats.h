@@ -63,6 +63,8 @@ struct State {
     std::array<Layer, 6> layers{};
     u64 other_layers{};
     std::chrono::steady_clock::time_point start{std::chrono::steady_clock::now()};
+    /// Raised each time a window line is printed (per-window samplers reset on it).
+    std::atomic<u64> window{};
 };
 
 inline State& Get() {
@@ -168,6 +170,7 @@ inline void NoteLayer(u64 address, u32 width, u32 height, u32 blending, bool cpu
     state.other_target_draws = 0;
     state.other_layers = 0;
     state.start = now;
+    state.window.fetch_add(1, std::memory_order_relaxed);
 }
 
 } // namespace VideoCommon::DrawStats

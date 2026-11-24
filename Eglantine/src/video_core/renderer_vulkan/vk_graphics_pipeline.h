@@ -424,6 +424,8 @@ private:
 
     void KeepImageDescriptors(size_t stage, size_t first_entry);
 
+    void TraceDrawTextures(std::span<const VideoCommon::ImageViewInOut> views,
+                           const std::array<bool, NUM_STAGES>& stages);
     void CheckColorFeedbackLoop(std::span<const VideoCommon::ImageViewInOut> views,
                                 const std::array<bool, NUM_STAGES>& stages, size_t fragment_entry);
 

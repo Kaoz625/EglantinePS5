@@ -44,6 +44,7 @@
 #include "shader_recompiler/exception.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/draw_stats.h"
 
 #if defined(__clang__) && defined(NDEBUG)
 #define LAMBDA_FORCEINLINE __attribute__((always_inline))
@@ -1295,6 +1296,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
         texture_cache.CheckFeedbackLoop(view_span);
         CheckColorFeedbackLoop(view_span, Spec::enabled_stages, fragment_entry);
+        if (VideoCommon::DrawStats::Enabled()) {
+            TraceDrawTextures(view_span, Spec::enabled_stages);
+        }
         if (scheduler.HasFragmentBarrier() &&
             (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
             scheduler.RequestOutsideRenderPassOperationContext();
@@ -1489,6 +1493,99 @@ void GraphicsPipeline::KeepImageDescriptors(size_t stage, size_t first_entry) {
                                 static_cast<u32>(end_entry - first_entry)};
     kept_image_entries.insert(kept_image_entries.end(), entries + first_entry,
                               entries + end_entry);
+}
+
+/// EDEN_DRAW_STATS: the first draw to each colour target in a 5 s window logs the pixel stage's
+/// sampled images: how many entries, how many null, and the GPU-written ones (render target
+/// outputs a post chain samples) plus a few others, each with address, size, format and flags.
+void GraphicsPipeline::TraceDrawTextures(std::span<const VideoCommon::ImageViewInOut> views,
+                                         const std::array<bool, NUM_STAGES>& stages) {
+    if (!stages[4]) {
+        return;
+    }
+    static u64 window = ~0ULL;
+    static std::array<std::pair<u64, u32>, 16> logged{};
+    static size_t logged_count = 0;
+    const u64 now_window = VideoCommon::DrawStats::Get().window.load(std::memory_order_relaxed);
+    if (now_window != window) {
+        window = now_window;
+        logged_count = 0;
+    }
+    const auto& regs{maxwell3d->regs};
+    const std::pair<u64, u32> key{regs.rt[0].Address(), regs.rt[0].width};
+    for (size_t i = 0; i < logged_count; ++i) {
+        if (logged[i] == key) {
+            return;
+        }
+    }
+    if (logged_count >= logged.size()) {
+        return;
+    }
+    logged[logged_count++] = key;
+    size_t view_index{};
+    for (size_t stage = 0; stage < 4; ++stage) {
+        if (!stages[stage]) {
+            continue;
+        }
+        const auto& info = stage_infos[stage];
+        view_index += Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                      Shader::NumDescriptors(info.image_buffer_descriptors) +
+                      Shader::NumDescriptors(info.texture_descriptors) +
+                      Shader::NumDescriptors(info.image_descriptors);
+    }
+    const auto& info = stage_infos[4];
+    view_index += Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                  Shader::NumDescriptors(info.image_buffer_descriptors);
+    const size_t first = view_index;
+    const size_t last = std::min(views.size(), first + Shader::NumDescriptors(info.texture_descriptors));
+    u32 entries = 0, nulls = 0, gpu_written = 0, distinct = 0;
+    std::array<VideoCommon::ImageViewId, 64> seen{};
+    std::string listed;
+    u32 listed_gpu = 0, listed_other = 0;
+    for (size_t index = first; index < last; ++index) {
+        ++entries;
+        const VideoCommon::ImageViewId id = views[index].id;
+        if (!id) {
+            ++nulls;
+            continue;
+        }
+        if (std::find(seen.begin(), seen.begin() + std::min<u32>(distinct, 64), id) !=
+            seen.begin() + std::min<u32>(distinct, 64)) {
+            continue;
+        }
+        if (distinct < 64) {
+            seen[distinct] = id;
+        }
+        ++distinct;
+        const ImageView& view = texture_cache.GetImageView(id);
+        const bool has_image = view.image_id != VideoCommon::NULL_IMAGE_ID;
+        u32 flags = 0;
+        u64 written_frame = 0;
+        if (has_image) {
+            const auto& image = texture_cache.GetImageForTrace(view.image_id);
+            flags = static_cast<u32>(image.flags);
+            written_frame = image.first_written_frame;
+        }
+        const bool gpu = (flags & static_cast<u32>(VideoCommon::ImageFlagBits::GpuModified)) != 0;
+        gpu_written += gpu ? 1 : 0;
+        if ((gpu && listed_gpu < 6) || (!gpu && listed_other < 3)) {
+            ++(gpu ? listed_gpu : listed_other);
+            listed += fmt::format(" [{}:{:#x} {}x{} f{} fl={:#x} img={} w1={}]", index - first,
+                                  view.gpu_addr, view.size.width, view.size.height,
+                                  static_cast<u32>(view.format), flags, has_image ? 1 : 0,
+                                  written_frame);
+        }
+    }
+    std::fprintf(stderr,
+                 "EDEN_DRAW_STATS textures rt0=%#llx %ux%u fmt=%#x vs=%#llx ps=%#llx entries=%u "
+                 "null=%u distinct=%u gpu_written=%u%s\n",
+                 (unsigned long long)key.first, regs.rt[0].width, regs.rt[0].height,
+                 static_cast<u32>(regs.rt[0].format),
+                 (unsigned long long)((u64{regs.pipelines[1].reserved[0] & 0xff} << 32) |
+                                      regs.pipelines[1].reserved[1]),
+                 (unsigned long long)((u64{regs.pipelines[5].reserved[0] & 0xff} << 32) |
+                                      regs.pipelines[5].reserved[1]),
+                 entries, nulls, distinct, gpu_written, listed.c_str());
 }
 
 void GraphicsPipeline::CheckColorFeedbackLoop(std::span<const VideoCommon::ImageViewInOut> views,
