@@ -3703,6 +3703,7 @@ private:
                 return;
             }
             m_stream_ended = false;
+            m_ready->ended.store(false, std::memory_order_relaxed);
             m_end_queued |= end;
             m_ready->room.store(!m_end_queued && m_inputs.HasRoom(), std::memory_order_relaxed);
             if (Nx2VideoTraceEnabled()) {
@@ -3739,6 +3740,7 @@ private:
             m_flush = true;
             m_stream_ended = false;
             m_end_queued = false;
+            m_ready->ended.store(false, std::memory_order_relaxed);
             m_clock.Reset();
             m_stream_start.reset();
             m_ready->room.store(true, std::memory_order_relaxed);
@@ -3923,6 +3925,12 @@ private:
                     m_stream_ended = true;
                     m_end_queued = false;
                     m_ready->room.store(false, std::memory_order_relaxed);
+                    if (EosReady()) {
+                        m_ready->ended.store(true, std::memory_order_relaxed);
+                        if (Nx2VideoTraceEnabled()) {
+                            LOG_INFO(Service, "nx2:vdec trace eos-ready syncpoint={}", m_syncpoint);
+                        }
+                    }
                 }
                 system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
                 m_last_output = m_outputs.back();
@@ -4014,6 +4022,15 @@ private:
                 }
             }
         }
+    }
+
+    // H57k: EDEN_NX2_VDEC_EOS_READY=1 keeps the ready event signalling after end of stream.
+    static bool EosReady() {
+        static const bool on = [] {
+            const char* env_value = std::getenv("EDEN_NX2_VDEC_EOS_READY");
+            return env_value != nullptr && env_value[0] != '0';
+        }();
+        return on;
     }
 
     // Titles that acquire one more frame per completed fence after end of stream.

@@ -13,7 +13,8 @@ namespace Service {
 struct Nx2VideoReadyState {
     void Signal(Kernel::KernelCore& kernel) {
         std::scoped_lock lk{mutex};
-        if (event != nullptr && running && room.load(std::memory_order_relaxed)) {
+        if (event != nullptr && running &&
+            (room.load(std::memory_order_relaxed) || ended.load(std::memory_order_relaxed))) {
             event->Signal(kernel);
         }
     }
@@ -29,6 +30,10 @@ struct Nx2VideoReadyState {
     std::mutex mutex;
     Kernel::KEvent* event{};
     std::atomic<bool> room{true};
+    // H57k experiment (EDEN_NX2_VDEC_EOS_READY=1): keep signalling after the end-of-stream
+    // frame went out, so a client that waits on the event once more after its last frame
+    // (Kirby Air Riders keeps the EOS image and never calls Stop in 2 of 3 runs) wakes up.
+    std::atomic<bool> ended{false};
 
 private:
     bool running{true};
