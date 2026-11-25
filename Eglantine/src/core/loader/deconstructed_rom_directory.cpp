@@ -8,6 +8,7 @@
 #include <cctype>
 #include <charconv>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -23,6 +24,7 @@
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/romfs_factory.h"
+#include "core/file_sys/vfs/vfs_layered.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/service/filesystem/filesystem.h"
@@ -104,11 +106,93 @@ FileSys::VirtualDir FindLooseRomFSDirectory(const FileSys::VirtualDir& parent) {
     return nullptr;
 }
 
+// Extracted dumps keep the game as <game>/base/{exefs,romfs} plus <game>/updates/<decimal version>/{exefs,romfs}.
+// The update is part of the installed game: on the console the program always runs at its newest version, with
+// the update's files over the base ones. The frontend boots <game>/base/exefs/main, so the loader layers the
+// versions here: newest update first, base last (files an update did not touch still come from base).
+// Without this a dumped game ran its 1.0 program against a save made by the newer version (Kirby Air Riders:
+// "A software update is required", OK spins). This was tools/eglantine-patches/0001-extracted-versioned-content
+// .patch, lost with the patch series in 7708a27c. EDEN_EXTRACTED_UPDATES=0 boots the base alone again.
+std::vector<FileSys::VirtualDir> ExtractedLayers(const FileSys::VirtualDir& exefs) {
+    if (const char* setting = std::getenv("EDEN_EXTRACTED_UPDATES"); setting && setting[0] == '0') {
+        return {};
+    }
+    const auto base = exefs ? exefs->GetParentDirectory() : nullptr;
+    if (!base || Common::ToLower(base->GetName()) != "base") {
+        return {};
+    }
+    const auto root = base->GetParentDirectory();
+    const auto updates = root ? root->GetSubdirectory("updates") : nullptr;
+    if (!updates) {
+        return {};
+    }
+    std::vector<std::pair<u64, FileSys::VirtualDir>> versions;
+    for (const auto& update : updates->GetSubdirectories()) {
+        const auto name = update->GetName();
+        u64 version{};
+        const auto parsed = std::from_chars(name.data(), name.data() + name.size(), version);
+        if (!name.empty() && parsed.ec == std::errc{} && parsed.ptr == name.data() + name.size()) {
+            versions.emplace_back(version, update);
+        }
+    }
+    if (versions.empty()) {
+        return {};
+    }
+    std::sort(versions.begin(), versions.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::vector<FileSys::VirtualDir> layers;
+    for (const auto& [version, update] : versions) {
+        layers.push_back(update);
+    }
+    layers.push_back(base);
+    return layers;
+}
+
+// The ExeFS of an extracted dump with its updates layered over it (or the folder itself).
+FileSys::VirtualDir ExtractedExeFS(const FileSys::VirtualDir& exefs) {
+    const auto layers = ExtractedLayers(exefs);
+    if (layers.empty()) {
+        return exefs;
+    }
+    std::vector<FileSys::VirtualDir> dirs;
+    for (const auto& layer : layers) {
+        if (auto dir = layer->GetSubdirectory("exefs")) {
+            dirs.push_back(std::move(dir));
+        }
+    }
+    if (dirs.size() < 2) {
+        return exefs;
+    }
+    LOG_INFO(Loader, "Extracted game: update {} layered over base ({} exefs layers)",
+             layers.front()->GetName(), dirs.size());
+    return FileSys::LayeredVfsDirectory::MakeLayeredDirectory(std::move(dirs), "exefs");
+}
+
 // RomFS for a loose ExeFS: the first .romfs file next to main, else a romfs/ directory next to
 // the exefs/ directory (the usual layout of an extracted title).
 FileSys::VirtualFile FindLooseRomFS(const FileSys::VirtualDir& exefs_dir) {
     if (exefs_dir == nullptr) {
         return nullptr;
+    }
+    if (const auto layers = ExtractedLayers(exefs_dir); !layers.empty()) {
+        std::vector<FileSys::VirtualDir> dirs;
+        for (const auto& layer : layers) {
+            if (auto dir = FindLooseRomFSDirectory(layer)) {
+                dirs.push_back(std::move(dir));
+            }
+        }
+        if (!dirs.empty()) {
+            LOG_INFO(Loader, "Extracted game: layered RomFS from {} directories (update {} first)",
+                     dirs.size(), layers.front()->GetName());
+            const auto started = std::chrono::steady_clock::now();
+            auto built = FileSys::CreateRomFS(
+                FileSys::LayeredVfsDirectory::MakeLayeredDirectory(std::move(dirs), "romfs"));
+            LOG_INFO(Loader, "Layered RomFS image ready: elapsed_ms={}",
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - started)
+                         .count());
+            return built;
+        }
     }
     for (const auto& f : exefs_dir->GetFiles()) {
         if (f->GetExtension() == "romfs") {
@@ -290,8 +374,9 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
     : AppLoader(std::move(file_))
     , override_update(override_update_)
 {
-    const auto file_dir = file->GetContainingDirectory();
-    const auto sidecar_dirs = FindSidecarDirs(file_dir);
+    const auto physical_dir = file->GetContainingDirectory();
+    const auto file_dir = ExtractedExeFS(physical_dir);
+    const auto sidecar_dirs = FindSidecarDirs(physical_dir);
 
     // Title ID
     const auto npdm = file_dir->GetFile("main.npdm");
@@ -357,8 +442,8 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
         name = sidecar_dirs.back()->GetName();
     }
 
-    romfs_exefs_dir = file_dir;
-    if (const auto title_dir = file_dir->GetParentDirectory()) {
+    romfs_exefs_dir = physical_dir;
+    if (const auto title_dir = physical_dir->GetParentDirectory()) {
         romfs_version = RomFSProductVersion(FindLooseRomFSDirectory(title_dir));
     }
 }
@@ -447,7 +532,7 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
             return {ResultStatus::ErrorNullFile, {}};
         }
 
-        dir = file->GetContainingDirectory();
+        dir = ExtractedExeFS(file->GetContainingDirectory());
     }
 
     if (!exact_modules) {
